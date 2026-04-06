@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 18 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 19 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 18 includes
+## What Phase 19 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -39,6 +39,7 @@ Phase 18 foundation for a local Python day-trading assistant focused on a Danish
 - Broker alert notifications for fills, rejections, and cancel confirmations
 - Per-kind delivery routing so digests and broker alerts can target different Slack webhooks or email recipient lists
 - Severity-based broker alert suppression so repeated low-signal events can be throttled without disabling higher-value alerts
+- Named route profiles so several digest or alert kinds can share one delivery destination without repeated config
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -99,6 +100,7 @@ The scheduler:
 - sends optional broker event alerts when fills, rejections, or confirmed cancellations appear in the local broker sync tables
 - supports per-kind routing overrides for daily/weekly/monthly/quarterly/YTD digests and broker alert types
 - suppresses repeated broker alerts per order scope using severity-specific cooldown windows
+- supports named route profiles plus per-kind overrides for Slack webhooks and email recipients
 - records scheduler activity in `audit_log`
 
 ## Deployment
@@ -182,6 +184,51 @@ Examples:
 
 The session cache is ignored by git and used by the live Saxo adapter to refresh access tokens automatically.
 
+## Slack webhooks
+
+Slack notifications use a Slack app with Incoming Webhooks.
+
+Current setup flow, matching Slack's official documentation:
+
+1. Go to [Slack apps](https://api.slack.com/apps).
+2. Create a new app `From scratch` and select your Slack workspace.
+3. In the app settings, open [Incoming Webhooks](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks).
+4. Turn `Activate Incoming Webhooks` on.
+5. Click `Add New Webhook to Workspace`.
+6. Choose the Slack channel that should receive notifications and authorize the app.
+7. Copy the generated webhook URL. It will look like `https://hooks.slack.com/services/...`.
+
+Add the webhook to your local `.env`:
+
+```env
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+```
+
+Then enable Slack delivery in `config.yaml`:
+
+```yaml
+notifications:
+  slack:
+    enabled: true
+    webhook_url: ENV:SLACK_WEBHOOK_URL
+```
+
+If you want different Slack destinations for different digests or broker alerts, use either per-kind routes or route profiles in `config.yaml`:
+
+```yaml
+notifications:
+  route_profiles:
+    ops:
+      slack_webhook_url: ENV:SLACK_WEBHOOK_URL
+  routes:
+    weekly:
+      profile: ops
+    alert_broker_reject:
+      profile: ops
+```
+
+Treat webhook URLs as secrets. Do not commit them to git. Slack's documentation notes that leaked webhook URLs are actively revoked.
+
 ## Repository safety
 
 Before pushing this project to GitHub:
@@ -194,10 +241,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 18 validation script:
+Run the Phase 19 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase18.py
+.venv/bin/python scripts/validate_phase19.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -209,12 +256,12 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 18 validation passed.
+Phase 19 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-First pass sent: 2
-Second pass suppressed/skipped: 1
-Slack success payloads: 3
+Profile-routed deliveries sent: 3
+Profile webhook calls: 2
+Override webhook calls: 1
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -240,6 +287,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase16.py
 .venv/bin/python scripts/validate_phase17.py
 .venv/bin/python scripts/validate_phase18.py
+.venv/bin/python scripts/validate_phase19.py
 ```
 
 ## Project layout
@@ -268,6 +316,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase16.py
 │   └── validate_phase17.py
 │   └── validate_phase18.py
+│   └── validate_phase19.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -292,5 +341,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add route inheritance or named route profiles so multiple kinds can share one destination without repeated config.
-2. Add alert grouping so several broker events for the same order can be collapsed into one delivery.
+1. Add alert grouping so several broker events for the same order can be collapsed into one delivery.
+2. Add per-profile templates or formatting so alert and digest families can share presentation settings as well as destinations.

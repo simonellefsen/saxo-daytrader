@@ -626,6 +626,7 @@ with tab_notifications:
             route_rows.append(
                 {
                     "Kind": summary_kind,
+                    "Profile": route_cfg.get("profile") or "",
                     "Slack Webhook Override": "Yes" if route_cfg.get("slack_webhook_url") else "No",
                     "Email Recipients Override": "Yes" if route_cfg.get("email_to_addresses_csv") else "No",
                 }
@@ -635,6 +636,22 @@ with tab_notifications:
         st.dataframe(route_rows, width="stretch", hide_index=True)
     else:
         st.caption("No per-kind delivery route overrides are configured.")
+
+    profile_rows = []
+    for profile_name, profile_cfg in sorted(config["notifications"].get("route_profiles", {}).items()):
+        if profile_cfg:
+            profile_rows.append(
+                {
+                    "Profile": profile_name,
+                    "Slack Webhook": "Yes" if profile_cfg.get("slack_webhook_url") else "No",
+                    "Email Recipients": "Yes" if profile_cfg.get("email_to_addresses_csv") else "No",
+                }
+            )
+    st.markdown("**Route Profiles**")
+    if profile_rows:
+        st.dataframe(profile_rows, width="stretch", hide_index=True)
+    else:
+        st.caption("No named route profiles are configured.")
 
     st.markdown("**Delivery History**")
     if notification_deliveries:

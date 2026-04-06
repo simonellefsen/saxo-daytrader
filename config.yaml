@@ -127,7 +127,7 @@ notifications:
   channel_cooldown_minutes: 240
   summary_style: structured
   slack:
-    enabled: false
+    enabled: true
     webhook_url: ENV:SLACK_WEBHOOK_URL
   email:
     enabled: false
@@ -147,6 +147,7 @@ notifications:
     low_cooldown_minutes: 240
     medium_cooldown_minutes: 60
     high_cooldown_minutes: 0
+  route_profiles: {}
   routes:
     daily: {}
     weekly: {}

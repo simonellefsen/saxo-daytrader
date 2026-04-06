@@ -366,7 +366,17 @@ def _channel_ready(
 def _route_config(config: dict[str, Any], summary_kind: str) -> dict[str, Any]:
     routes = config.get("notifications", {}).get("routes", {})
     route = routes.get(summary_kind, {})
-    return route if isinstance(route, dict) else {}
+    if not isinstance(route, dict):
+        return {}
+    profile_name = route.get("profile")
+    profile_cfg: dict[str, Any] = {}
+    if profile_name:
+        profiles = config.get("notifications", {}).get("route_profiles", {})
+        candidate = profiles.get(profile_name, {})
+        if isinstance(candidate, dict):
+            profile_cfg = candidate
+    route_overrides = {key: value for key, value in route.items() if key != "profile"}
+    return {**profile_cfg, **route_overrides}
 
 
 def _resolve_slack_webhook(config: dict[str, Any], summary_kind: str) -> str:
