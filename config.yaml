@@ -3,6 +3,7 @@ app:
   environment: local
   dry_run: true
   simulation_mode: true
+  launch_scheduler_with_dashboard: true
 
 portfolio:
   base_currency: DKK
@@ -147,6 +148,9 @@ notifications:
     low_cooldown_minutes: 240
     medium_cooldown_minutes: 60
     high_cooldown_minutes: 0
+  alert_grouping:
+    enabled: true
+    max_items_per_group: 5
   route_profiles: {}
   routes:
     daily: {}
@@ -157,3 +161,4 @@ notifications:
     alert_broker_fill: {}
     alert_broker_reject: {}
     alert_broker_cancel: {}
+    alert_broker_grouped: {}

@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 19 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 21 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 19 includes
+## What Phase 21 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -40,6 +40,8 @@ Phase 19 foundation for a local Python day-trading assistant focused on a Danish
 - Per-kind delivery routing so digests and broker alerts can target different Slack webhooks or email recipient lists
 - Severity-based broker alert suppression so repeated low-signal events can be throttled without disabling higher-value alerts
 - Named route profiles so several digest or alert kinds can share one delivery destination without repeated config
+- Grouped broker alerts so several broker updates for the same order can be collapsed into one delivery
+- Autonomous app launcher mode that starts the dashboard and background scheduler together for hands-off simulation trading
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -68,11 +70,25 @@ Phase 19 foundation for a local Python day-trading assistant focused on a Danish
 Useful options:
 
 ```bash
+.venv/bin/python main.py --with-scheduler
+.venv/bin/python main.py --no-scheduler
 .venv/bin/python main.py --sync-only
 .venv/bin/python main.py --headless --port 8501 --no-browser
 ```
 
 `main.py` imports the CSV into `ledger.db` before launching Streamlit.
+
+By default, this project is now set up for autonomous simulation mode:
+
+- `make run` starts both the Streamlit dashboard and the background scheduler
+- the scheduler generates decisions during active analysis windows
+- in simulation mode with `execution.auto_execute_simulation: true`, queued trades are executed automatically
+
+If you only want the UI without autonomous execution, use:
+
+```bash
+make run-ui-only
+```
 
 ## Scheduler
 
@@ -101,6 +117,7 @@ The scheduler:
 - supports per-kind routing overrides for daily/weekly/monthly/quarterly/YTD digests and broker alert types
 - suppresses repeated broker alerts per order scope using severity-specific cooldown windows
 - supports named route profiles plus per-kind overrides for Slack webhooks and email recipients
+- can group several broker updates for one execution order into a single notification payload
 - records scheduler activity in `audit_log`
 
 ## Deployment
@@ -241,10 +258,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 19 validation script:
+Run the Phase 21 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase19.py
+.venv/bin/python scripts/validate_phase21.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -256,12 +273,10 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 19 validation passed.
-Imported source positions: 20
-Excluded positions: 2
-Profile-routed deliveries sent: 3
-Profile webhook calls: 2
-Override webhook calls: 1
+Phase 21 validation passed.
+Scheduler launched by default: True
+Scheduler disabled explicitly: True
+Explicit with-scheduler flag: True
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -288,6 +303,8 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase17.py
 .venv/bin/python scripts/validate_phase18.py
 .venv/bin/python scripts/validate_phase19.py
+.venv/bin/python scripts/validate_phase20.py
+.venv/bin/python scripts/validate_phase21.py
 ```
 
 ## Project layout
@@ -317,6 +334,8 @@ Earlier validation scripts remain available:
 │   └── validate_phase17.py
 │   └── validate_phase18.py
 │   └── validate_phase19.py
+│   └── validate_phase20.py
+│   └── validate_phase21.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -341,5 +360,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add alert grouping so several broker events for the same order can be collapsed into one delivery.
-2. Add per-profile templates or formatting so alert and digest families can share presentation settings as well as destinations.
+1. Add per-profile templates or formatting so alert and digest families can share presentation settings as well as destinations.
+2. Add dashboard-visible status for the launcher-managed scheduler process and its most recent cycle result.

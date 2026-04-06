@@ -28,6 +28,38 @@ def _open_browser_later(port: int, delay_seconds: float = 1.5) -> None:
     threading.Thread(target=opener, daemon=True).start()
 
 
+def _terminate_process_group(process: subprocess.Popen[bytes] | None, *, sig: int) -> None:
+    if process is None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, sig)
+
+
+def _wait_for_children(
+    dashboard_process: subprocess.Popen[bytes],
+    scheduler_process: subprocess.Popen[bytes] | None,
+) -> int:
+    while True:
+        dashboard_code = dashboard_process.poll()
+        scheduler_code = scheduler_process.poll() if scheduler_process is not None else None
+
+        if dashboard_code is not None:
+            if scheduler_process is not None and scheduler_code is None:
+                _terminate_process_group(scheduler_process, sig=signal.SIGTERM)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    scheduler_process.wait(timeout=5)
+            return int(dashboard_code)
+
+        if scheduler_process is not None and scheduler_code not in (None, 0):
+            print("Scheduler exited unexpectedly; stopping dashboard...", file=sys.stderr)
+            _terminate_process_group(dashboard_process, sig=signal.SIGTERM)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                dashboard_process.wait(timeout=5)
+            return int(scheduler_code)
+
+        time.sleep(0.2)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Launch the Saxo day trader dashboard.")
     parser.add_argument("--config", default="config.yaml", help="Path to the YAML config file.")
@@ -35,6 +67,8 @@ def main() -> int:
     parser.add_argument("--headless", action="store_true", help="Run Streamlit in headless mode.")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open a browser window.")
     parser.add_argument("--sync-only", action="store_true", help="Import the CSV into SQLite and exit.")
+    parser.add_argument("--with-scheduler", action="store_true", help="Launch the background scheduler alongside Streamlit.")
+    parser.add_argument("--no-scheduler", action="store_true", help="Do not launch the background scheduler alongside Streamlit.")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -52,7 +86,7 @@ def main() -> int:
         _open_browser_later(args.port)
 
     app_path = ROOT / "src" / "saxo_daytrader_xai" / "ui" / "app.py"
-    cmd = [
+    dashboard_cmd = [
         sys.executable,
         "-m",
         "streamlit",
@@ -65,19 +99,44 @@ def main() -> int:
         "--browser.gatherUsageStats",
         "false",
     ]
-    process = subprocess.Popen(cmd, start_new_session=True)
+    launch_scheduler = (
+        bool(args.with_scheduler or config.get("app", {}).get("launch_scheduler_with_dashboard", False))
+        and not args.no_scheduler
+    )
+    scheduler_process = None
+    if launch_scheduler:
+        scheduler_cmd = [
+            sys.executable,
+            str(ROOT / "scripts" / "run_scheduler.py"),
+            "--config",
+            str(Path(args.config).resolve()),
+        ]
+        print("Launching background scheduler alongside dashboard...")
+        scheduler_process = subprocess.Popen(scheduler_cmd, start_new_session=True)
+
+    dashboard_process = subprocess.Popen(dashboard_cmd, start_new_session=True)
     try:
-        return process.wait()
+        return _wait_for_children(dashboard_process, scheduler_process)
     except KeyboardInterrupt:
         print("\nStopping dashboard...", file=sys.stderr)
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGTERM)
+        _terminate_process_group(dashboard_process, sig=signal.SIGTERM)
+        if scheduler_process is not None:
+            print("Stopping scheduler...", file=sys.stderr)
+            _terminate_process_group(scheduler_process, sig=signal.SIGTERM)
         try:
-            return process.wait(timeout=5)
+            dashboard_process.wait(timeout=5)
+            if scheduler_process is not None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    scheduler_process.wait(timeout=5)
+            return 130
         except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            _terminate_process_group(dashboard_process, sig=signal.SIGKILL)
+            if scheduler_process is not None:
+                _terminate_process_group(scheduler_process, sig=signal.SIGKILL)
+            dashboard_process.wait()
+            if scheduler_process is not None:
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    scheduler_process.wait(timeout=2)
             return 130
 
 

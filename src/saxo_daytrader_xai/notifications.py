@@ -465,6 +465,7 @@ def _alert_severity(summary_kind: str) -> str:
         "alert_broker_fill": "medium",
         "alert_broker_reject": "high",
         "alert_broker_cancel": "low",
+        "alert_broker_grouped": "medium",
     }.get(summary_kind, "medium")
 
 
@@ -554,7 +555,11 @@ def _alerts_enabled(config: dict[str, Any]) -> bool:
     )
 
 
-def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
+def _severity_rank(severity: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get(severity, 2)
+
+
+def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     alerts_by_scope: dict[str, dict[str, Any]] = {}
 
@@ -579,6 +584,7 @@ def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) 
                 "summary_kind": "alert_broker_fill",
                 "severity": _alert_severity("alert_broker_fill"),
                 "scope_key": scope_key,
+                "execution_order_id": record["execution_order_id"],
                 "subject": f"Broker fill confirmed for {record['symbol']}",
                 "message_text": "\n".join(
                     [
@@ -631,6 +637,7 @@ def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) 
                 "summary_kind": summary_kind,
                 "severity": _alert_severity(summary_kind),
                 "scope_key": scope_key,
+                "execution_order_id": record["execution_order_id"],
                 "subject": f"{subject_prefix} for order {record['execution_order_id']}",
                 "message_text": "\n".join(
                     [
@@ -653,6 +660,73 @@ def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) 
     alerts = list(alerts_by_scope.values())
     alerts.sort(key=lambda item: item["alert_key"])
     return alerts[:limit]
+
+
+def _group_broker_alert_candidates(config: dict[str, Any], alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouping_cfg = config.get("notifications", {}).get("alert_grouping", {})
+    if not bool(grouping_cfg.get("enabled", True)):
+        return alerts
+
+    grouped_by_order: dict[int, list[dict[str, Any]]] = {}
+    for alert in alerts:
+        grouped_by_order.setdefault(int(alert["execution_order_id"]), []).append(alert)
+
+    max_items = int(grouping_cfg.get("max_items_per_group", 5))
+    output: list[dict[str, Any]] = []
+    for execution_order_id, items in grouped_by_order.items():
+        items.sort(key=lambda item: item["alert_key"])
+        if len(items) == 1:
+            output.extend(items)
+            continue
+        highest = max(items, key=lambda item: _severity_rank(str(item["severity"])))
+        preview_items = items[:max_items]
+        preview_lines = []
+        for item in preview_items:
+            preview_lines.append(f"- {item['summary_kind']}: {item['subject']}")
+        if len(items) > max_items:
+            preview_lines.append(f"- ... and {len(items) - max_items} more broker updates")
+        output.append(
+            {
+                "alert_key": f"group:{execution_order_id}:{items[-1]['alert_key']}",
+                "summary_kind": "alert_broker_grouped",
+                "severity": highest["severity"],
+                "scope_key": f"alert_broker_grouped:order:{execution_order_id}",
+                "execution_order_id": execution_order_id,
+                "subject": f"Broker updates for order {execution_order_id}",
+                "message_text": "\n".join(
+                    [
+                        f"Broker updates for execution order {execution_order_id}",
+                        "",
+                        f"Grouped events: {len(items)}",
+                        f"Highest severity: {highest['severity']}",
+                        "",
+                        *preview_lines,
+                    ]
+                ),
+                "payload": {
+                    "alert_type": "broker_grouped",
+                    "execution_order_id": execution_order_id,
+                    "grouped_items": [
+                        {
+                            "alert_key": item["alert_key"],
+                            "summary_kind": item["summary_kind"],
+                            "severity": item["severity"],
+                            "subject": item["subject"],
+                            "payload": item["payload"],
+                        }
+                        for item in items
+                    ],
+                },
+            }
+        )
+    output.sort(key=lambda item: item["alert_key"])
+    return output
+
+
+def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
+    candidates = _build_broker_alert_candidates(connection, config, limit=limit)
+    grouped = _group_broker_alert_candidates(config, candidates)
+    return grouped[:limit]
 
 
 def _summary_due(config: dict[str, Any], summary_kind: str, local_now: datetime, *, force: bool) -> bool:

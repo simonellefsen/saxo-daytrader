@@ -119,7 +119,16 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 15 dashboard with decision automation, live broker workflow, and multi-period notifications.")
+st.caption("Phase 21 dashboard with autonomous simulation support, live broker workflow, and multi-period notifications.")
+
+autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
+    config.get("scheduler", {}).get("enabled", True)
+)
+if config["execution"]["mode"] == "simulation" and config["execution"].get("auto_execute_simulation", False):
+    if autonomous_scheduler:
+        st.success("Autonomous simulation is enabled. Running the app normally also launches the scheduler that makes decisions and executes simulation trades.")
+    else:
+        st.warning("Simulation auto-execution is enabled, but autonomous scheduling is off. Run `make scheduler` or enable `app.launch_scheduler_with_dashboard` to execute trades without the manual queue button.")
 
 excluded_symbols = config.get("risk", {}).get("excluded_symbols", [])
 if excluded_symbols:
@@ -583,6 +592,11 @@ with tab_notifications:
     suppress_col2.metric("Low Cooldown", f"{int(suppression_cfg.get('low_cooldown_minutes', 240))}m")
     suppress_col3.metric("Medium Cooldown", f"{int(suppression_cfg.get('medium_cooldown_minutes', 60))}m")
     suppress_col4.metric("High Cooldown", f"{int(suppression_cfg.get('high_cooldown_minutes', 0))}m")
+
+    grouping_cfg = config["notifications"].get("alert_grouping", {})
+    grouping_col1, grouping_col2 = st.columns(2)
+    grouping_col1.metric("Grouping Enabled", "Yes" if grouping_cfg.get("enabled", True) else "No")
+    grouping_col2.metric("Max Items Per Group", int(grouping_cfg.get("max_items_per_group", 5)))
 
     action_col1, action_col2 = st.columns(2)
     if action_col1.button("Send All Digests Now"):
