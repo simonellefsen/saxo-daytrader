@@ -167,6 +167,27 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_execution_orders_report
         ON execution_orders(report_id, status);
 
+        CREATE TABLE IF NOT EXISTS execution_fills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            execution_order_id INTEGER NOT NULL,
+            broker_order_id TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            fill_status TEXT NOT NULL,
+            cumulative_quantity REAL NOT NULL,
+            delta_quantity REAL NOT NULL,
+            average_price_local REAL NOT NULL,
+            currency TEXT NOT NULL,
+            ledger_id INTEGER,
+            raw_payload_json TEXT NOT NULL,
+            FOREIGN KEY(execution_order_id) REFERENCES execution_orders(id),
+            FOREIGN KEY(ledger_id) REFERENCES trade_ledger(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_execution_fills_order
+        ON execution_fills(execution_order_id, cumulative_quantity, created_at);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -181,6 +202,7 @@ def init_db(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "trade_ledger", "cost_basis_sold_dkk", "REAL NOT NULL DEFAULT 0")
     _ensure_column(connection, "trade_ledger", "tax_year", "INTEGER")
     _ensure_column(connection, "trade_ledger", "batch_id", "TEXT")
+    _ensure_column(connection, "execution_orders", "broker_order_id", "TEXT")
     connection.commit()
 
 

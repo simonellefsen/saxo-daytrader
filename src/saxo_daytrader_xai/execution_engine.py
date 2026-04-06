@@ -347,16 +347,85 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     return {"ledger_id": ledger_id, "lot_id": lot_id}
 
 
-def _sync_filled_live_order(connection, config: dict[str, Any], order: dict[str, Any], activity: dict[str, Any]) -> dict[str, Any]:
+def _synced_fill_quantity(connection, execution_order_id: int) -> float:
+    row = connection.execute(
+        """
+        SELECT COALESCE(SUM(delta_quantity), 0) AS synced_quantity
+        FROM execution_fills
+        WHERE execution_order_id = ?
+        """,
+        (execution_order_id,),
+    ).fetchone()
+    return float(row["synced_quantity"]) if row else 0.0
+
+
+def _record_execution_fill(
+    connection,
+    *,
+    order: dict[str, Any],
+    broker_order_id: str | None,
+    fill_status: str,
+    cumulative_quantity: float,
+    delta_quantity: float,
+    average_price_local: float,
+    currency: str,
+    ledger_id: int | None,
+    payload: dict[str, Any],
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO execution_fills (
+            created_at, execution_order_id, broker_order_id, symbol, side, fill_status,
+            cumulative_quantity, delta_quantity, average_price_local, currency, ledger_id, raw_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(UTC).isoformat(timespec="seconds"),
+            order["id"],
+            broker_order_id,
+            order["symbol"],
+            order["action"],
+            fill_status,
+            cumulative_quantity,
+            delta_quantity,
+            average_price_local,
+            currency,
+            ledger_id,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _sync_incremental_live_fill(
+    connection,
+    config: dict[str, Any],
+    order: dict[str, Any],
+    activity: dict[str, Any],
+    *,
+    broker_order_id: str | None,
+    fill_status: str,
+) -> dict[str, Any]:
     batch_id = fetch_latest_batch_id(connection)
     filled_quantity = float(activity.get("FilledAmount") or order["quantity"])
     average_price = float(activity.get("AveragePrice") or order["price_local"])
-    synced_order = {**order, "quantity": filled_quantity, "price_local": average_price}
+    already_synced = _synced_fill_quantity(connection, int(order["id"]))
+    delta_quantity = max(filled_quantity - already_synced, 0.0)
+    if delta_quantity <= 1e-9:
+        return {
+            "ledger_id": None,
+            "fill_id": None,
+            "delta_quantity": 0.0,
+            "cumulative_quantity": filled_quantity,
+            "status": "no_new_fill",
+        }
+
+    synced_order = {**order, "quantity": delta_quantity, "price_local": average_price}
 
     if order["action"] == "SELL":
         trade = calculate_sell_outcome(
             order["symbol"],
-            filled_quantity,
+            delta_quantity,
             average_price,
             config=config,
             connection=connection,
@@ -365,7 +434,7 @@ def _sync_filled_live_order(connection, config: dict[str, Any], order: dict[str,
         )
         trade["mode"] = order["mode"]
         trade["status"] = "executed"
-        trade["notes"] = "Saxo broker fill sync"
+        trade["notes"] = f"Saxo broker {fill_status.lower()} sync"
         trade["decision_context"] = activity
         result = update_ledger(trade, config=config, connection=connection)
     else:
@@ -377,13 +446,31 @@ def _sync_filled_live_order(connection, config: dict[str, Any], order: dict[str,
             WHERE id = ?
             """,
             (
-                "Saxo broker fill sync",
+                f"Saxo broker {fill_status.lower()} sync",
                 json.dumps(activity, ensure_ascii=False, sort_keys=True),
                 result["ledger_id"],
             ),
         )
         connection.commit()
-    return result
+    fill_id = _record_execution_fill(
+        connection,
+        order=order,
+        broker_order_id=broker_order_id,
+        fill_status=fill_status,
+        cumulative_quantity=filled_quantity,
+        delta_quantity=delta_quantity,
+        average_price_local=average_price,
+        currency=str(order["currency"]),
+        ledger_id=result["ledger_id"],
+        payload=activity,
+    )
+    connection.commit()
+    return {
+        **result,
+        "fill_id": fill_id,
+        "delta_quantity": delta_quantity,
+        "cumulative_quantity": filled_quantity,
+    }
 
 
 def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connection=None, limit: int = 25) -> dict[str, Any]:
@@ -408,8 +495,6 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
 
         for row in rows:
             order = dict(row)
-            if order.get("ledger_id"):
-                continue
             execution_result = json.loads(order["execution_result_json"]) if order.get("execution_result_json") else {}
             broker_result = execution_result.get("broker_result", {})
             broker_order_id = broker_result.get("OrderId")
@@ -453,11 +538,18 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             }
 
             if activity_status == "FinalFill" and activity_substatus == "Confirmed":
-                result = _sync_filled_live_order(resolved_connection, resolved_config, order, activity)
+                result = _sync_incremental_live_fill(
+                    resolved_connection,
+                    resolved_config,
+                    order,
+                    activity,
+                    broker_order_id=str(broker_order_id),
+                    fill_status="FinalFill",
+                )
                 resolved_connection.execute(
                     """
                     UPDATE execution_orders
-                    SET status = ?, ledger_id = ?, execution_result_json = ?
+                    SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
                     WHERE id = ?
                     """,
                     ("executed", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
@@ -465,19 +557,51 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                 append_audit_log(
                     resolved_connection,
                     "execution_order_fill_synced",
-                    {"order_id": order["id"], "ledger_id": result["ledger_id"], "broker_order_id": broker_order_id},
+                    {
+                        "order_id": order["id"],
+                        "ledger_id": result["ledger_id"],
+                        "broker_order_id": broker_order_id,
+                        "delta_quantity": result["delta_quantity"],
+                        "cumulative_quantity": result["cumulative_quantity"],
+                    },
                 )
                 updates.append({"order_id": order["id"], "status": "executed", "ledger_id": result["ledger_id"]})
             elif activity_status == "Fill" and activity_substatus == "Confirmed":
+                result = _sync_incremental_live_fill(
+                    resolved_connection,
+                    resolved_config,
+                    order,
+                    activity,
+                    broker_order_id=str(broker_order_id),
+                    fill_status="Fill",
+                )
                 resolved_connection.execute(
                     """
                     UPDATE execution_orders
-                    SET status = ?, execution_result_json = ?
+                    SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
                     WHERE id = ?
                     """,
-                    ("broker_partially_filled", json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                    ("broker_partially_filled", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
                 )
-                updates.append({"order_id": order["id"], "status": "broker_partially_filled"})
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_partial_fill_synced",
+                    {
+                        "order_id": order["id"],
+                        "ledger_id": result["ledger_id"],
+                        "broker_order_id": broker_order_id,
+                        "delta_quantity": result["delta_quantity"],
+                        "cumulative_quantity": result["cumulative_quantity"],
+                    },
+                )
+                updates.append(
+                    {
+                        "order_id": order["id"],
+                        "status": "broker_partially_filled",
+                        "ledger_id": result["ledger_id"],
+                        "delta_quantity": result["delta_quantity"],
+                    }
+                )
             elif activity_status in {"Cancelled", "Expired"} and activity_substatus == "Confirmed":
                 new_status = "broker_cancelled" if activity_status == "Cancelled" else "broker_expired"
                 resolved_connection.execute(
@@ -569,12 +693,13 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 resolved_connection.execute(
                     """
                     UPDATE execution_orders
-                    SET status = ?, approved_at = ?, execution_result_json = ?
+                    SET status = ?, approved_at = ?, broker_order_id = ?, execution_result_json = ?
                     WHERE id = ?
                     """,
                     (
                         "submitted_to_broker",
                         datetime.now(UTC).isoformat(timespec="seconds"),
+                        str(broker_result.get("OrderId", "")) or None,
                         json.dumps(
                             {"precheck": precheck, "payload": payload, "broker_result": broker_result},
                             ensure_ascii=False,
@@ -697,6 +822,19 @@ def fetch_execution_orders(connection, limit: int = 100) -> list[dict[str, Any]]
     return [dict(row) for row in rows]
 
 
+def fetch_execution_fills(connection, limit: int = 100) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM execution_fills
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def export_audit_bundle(output_dir: str, *, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
     import csv
 
@@ -709,6 +847,7 @@ def export_audit_bundle(output_dir: str, *, config: dict[str, Any] | None = None
             "lot_realizations": out / "lot_realizations.csv",
             "decision_reports": out / "decision_reports.csv",
             "execution_orders": out / "execution_orders.csv",
+            "execution_fills": out / "execution_fills.csv",
             "audit_log": out / "audit_log.csv",
         }
         for table_name, path in exports.items():

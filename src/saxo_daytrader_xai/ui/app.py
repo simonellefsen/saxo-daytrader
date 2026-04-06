@@ -16,6 +16,7 @@ from saxo_daytrader_xai.db import connect, init_db
 from saxo_daytrader_xai.execution_engine import (
     execute_order,
     export_audit_bundle,
+    fetch_execution_fills,
     fetch_execution_orders,
     queue_and_maybe_execute_latest_report,
     sync_broker_order_statuses,
@@ -361,6 +362,7 @@ with tab_decision:
 with tab_execution:
     st.subheader("Execution Queue")
     execution_orders = fetch_execution_orders(connection, limit=100)
+    execution_fills = fetch_execution_fills(connection, limit=100)
     pending_approvals = [row for row in execution_orders if row["status"] == "pending_approval"]
     executed_orders = [row for row in execution_orders if row["status"] == "executed"]
 
@@ -368,7 +370,7 @@ with tab_execution:
     mode_col1.metric("Execution Mode", str(config["execution"]["mode"]).upper())
     mode_col2.metric("Queued Orders", len(execution_orders))
     mode_col3.metric("Pending Approval", len(pending_approvals))
-    mode_col4.metric("Executed Orders", len(executed_orders))
+    mode_col4.metric("Fill Records", len(execution_fills))
 
     st.caption(
         f"Adapter={config['execution']['adapter']} | dry_run={config['app']['dry_run']} | "
@@ -423,6 +425,7 @@ with tab_execution:
                     "Quantity": row["quantity"],
                     "Price": _format_money(row["price_local"], row["currency"]),
                     "Estimated Value DKK": _format_dkk(row["estimated_value_dkk"]),
+                    "Broker Order ID": row["broker_order_id"],
                     "Ledger ID": row["ledger_id"],
                     "Error": row["error_text"],
                 }
@@ -433,5 +436,29 @@ with tab_execution:
         )
     else:
         st.caption("No execution orders have been created yet.")
+
+    st.markdown("**Broker Fill Records**")
+    if execution_fills:
+        st.dataframe(
+            [
+                {
+                    "ID": row["id"],
+                    "Order ID": row["execution_order_id"],
+                    "Broker Order ID": row["broker_order_id"],
+                    "Symbol": row["symbol"],
+                    "Side": row["side"],
+                    "Fill Status": row["fill_status"],
+                    "Cumulative Qty": row["cumulative_quantity"],
+                    "Delta Qty": row["delta_quantity"],
+                    "Avg Price": _format_money(row["average_price_local"], row["currency"]),
+                    "Ledger ID": row["ledger_id"],
+                }
+                for row in execution_fills
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No broker fill records have been synchronized yet.")
 
 connection.close()
