@@ -146,9 +146,9 @@ def _history_resample_rule(view_name: str, span_days: int | None) -> tuple[str |
     if view_name == "Daily":
         return None, "5 min"
     if view_name == "Weekly":
-        return "1H", "Hourly"
+        return "1h", "Hourly"
     if view_name == "Monthly":
-        return "4H", "4 hours"
+        return "4h", "4 hours"
     if view_name in {"Yearly", "Year to date", "All time"}:
         return "1D", "Daily"
     if span_days is None:
@@ -156,9 +156,9 @@ def _history_resample_rule(view_name: str, span_days: int | None) -> tuple[str |
     if span_days <= 2:
         return None, "Raw"
     if span_days <= 14:
-        return "1H", "Hourly"
+        return "1h", "Hourly"
     if span_days <= 90:
-        return "4H", "4 hours"
+        return "4h", "4 hours"
     return "1D", "Daily"
 
 
