@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 24 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 25 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -45,6 +45,7 @@ Phase 24 foundation for a local Python day-trading assistant focused on a Danish
 - Scheduler heartbeat and last-cycle status persisted to SQLite and shown in the dashboard
 - One-click scheduler cycle controls in the dashboard for live or mock manual runs
 - Route-profile formatting so subject prefixes, message preambles, and summary style can be shared across notification kinds
+- Immutable scheduler cycle history with recent-cycle visibility in the dashboard
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -279,10 +280,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 24 validation script:
+Run the Phase 25 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase24.py
+.venv/bin/python scripts/validate_phase25.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -294,11 +295,11 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 24 validation passed.
-Formatted deliveries sent: 2
-Subject prefix applied: True
-Message preamble applied: True
-Profile style applied: True
+Phase 25 validation passed.
+Scheduler status row present: True
+Recent cycle rows: 2
+Newest cycle status: ok
+Cycle JSON recorded: True
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -330,6 +331,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase22.py
 .venv/bin/python scripts/validate_phase23.py
 .venv/bin/python scripts/validate_phase24.py
+.venv/bin/python scripts/validate_phase25.py
 ```
 
 ## Project layout
@@ -364,6 +366,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase22.py
 │   └── validate_phase23.py
 │   └── validate_phase24.py
+│   └── validate_phase25.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -388,5 +391,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add a dashboard-visible history table of recent scheduler cycles and their top-level outcomes.
-2. Add scheduler-side stale-worker detection so autonomous mode can flag or recover a dead background process.
+1. Add scheduler-side stale-worker detection so autonomous mode can flag or recover a dead background process.
+2. Add pruning and retention settings for scheduler cycle history so the SQLite file stays bounded over long runtimes.

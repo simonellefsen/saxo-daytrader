@@ -254,6 +254,22 @@ def init_db(connection: sqlite3.Connection) -> None:
             scheduler_pid INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS scheduler_cycle_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            status TEXT NOT NULL,
+            analysis_window_active INTEGER NOT NULL DEFAULT 0,
+            generated_decision INTEGER NOT NULL DEFAULT 0,
+            queue_status TEXT,
+            notifications_status TEXT,
+            broker_alerts_status TEXT,
+            cycle_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_scheduler_cycle_history_started
+        ON scheduler_cycle_history(started_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -360,3 +376,57 @@ def fetch_scheduler_status(connection: sqlite3.Connection) -> dict[str, Any] | N
     record = dict(row)
     record["last_cycle_json"] = json.loads(record["last_cycle_json"]) if record.get("last_cycle_json") else None
     return record
+
+
+def record_scheduler_cycle(
+    connection: sqlite3.Connection,
+    *,
+    started_at: str,
+    completed_at: str | None,
+    status: str,
+    analysis_window_active: bool,
+    generated_decision: bool,
+    queue_status: str | None,
+    notifications_status: str | None,
+    broker_alerts_status: str | None,
+    cycle_json: dict[str, Any],
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO scheduler_cycle_history (
+            started_at, completed_at, status, analysis_window_active, generated_decision,
+            queue_status, notifications_status, broker_alerts_status, cycle_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            started_at,
+            completed_at,
+            status,
+            1 if analysis_window_active else 0,
+            1 if generated_decision else 0,
+            queue_status,
+            notifications_status,
+            broker_alerts_status,
+            json.dumps(cycle_json, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
+
+
+def fetch_scheduler_cycles(connection: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM scheduler_cycle_history
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        record["cycle_json"] = json.loads(record["cycle_json"]) if record.get("cycle_json") else None
+        output.append(record)
+    return output

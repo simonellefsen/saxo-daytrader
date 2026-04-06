@@ -9,7 +9,7 @@ from typing import Any
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import append_audit_log, connect, init_db, update_scheduler_status
+from saxo_daytrader_xai.db import append_audit_log, connect, init_db, record_scheduler_cycle, update_scheduler_status
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
@@ -93,6 +93,18 @@ def run_scheduler_cycle(
             last_cycle_json=outcome,
             scheduler_pid=os.getpid(),
         )
+        record_scheduler_cycle(
+            resolved_connection,
+            started_at=cycle_started_at,
+            completed_at=outcome["timestamp"],
+            status="ok",
+            analysis_window_active=bool(analysis_summary["analysis_window_active"]),
+            generated_decision=decision_result is not None,
+            queue_status=queue_result.get("status"),
+            notifications_status=notification_result.get("status"),
+            broker_alerts_status=broker_alert_result.get("status"),
+            cycle_json=outcome,
+        )
         append_audit_log(resolved_connection, "scheduler_cycle_completed", outcome)
         return outcome
     except Exception as exc:  # noqa: BLE001
@@ -108,6 +120,18 @@ def run_scheduler_cycle(
             last_cycle_status="failed",
             last_cycle_json=payload,
             scheduler_pid=os.getpid(),
+        )
+        record_scheduler_cycle(
+            resolved_connection,
+            started_at=cycle_started_at if "cycle_started_at" in locals() else payload["timestamp"],
+            completed_at=payload["timestamp"],
+            status="failed",
+            analysis_window_active=False,
+            generated_decision=False,
+            queue_status=None,
+            notifications_status=None,
+            broker_alerts_status=None,
+            cycle_json=payload,
         )
         append_audit_log(resolved_connection, "scheduler_cycle_failed", payload)
         return payload

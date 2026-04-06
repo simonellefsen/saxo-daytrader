@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import connect, fetch_scheduler_status, init_db
+from saxo_daytrader_xai.db import connect, fetch_scheduler_cycles, fetch_scheduler_status, init_db
 from saxo_daytrader_xai.execution_engine import (
     execute_order,
     export_audit_bundle,
@@ -118,6 +118,7 @@ analysis_summary = summarize_analysis_window(market_status_rows)
 latest_decision_report = fetch_latest_decision_report(connection)
 notification_deliveries = fetch_notification_deliveries(connection, limit=50)
 scheduler_status = fetch_scheduler_status(connection)
+scheduler_cycles = fetch_scheduler_cycles(connection, limit=15)
 daily_summary_preview = build_summary(connection, config, summary_kind="daily")
 weekly_summary_preview = build_summary(connection, config, summary_kind="weekly")
 monthly_summary_preview = build_summary(connection, config, summary_kind="monthly")
@@ -132,7 +133,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 24 dashboard with autonomous simulation support, live broker workflow, scheduler controls, and route-aware notifications.")
+st.caption("Phase 25 dashboard with autonomous simulation support, live broker workflow, scheduler controls, route-aware notifications, and scheduler cycle history.")
 
 autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
     config.get("scheduler", {}).get("enabled", True)
@@ -335,6 +336,31 @@ with tab_market:
     if scheduler_status and scheduler_status.get("last_cycle_json"):
         with st.expander("Latest Scheduler Cycle"):
             st.json(scheduler_status["last_cycle_json"])
+
+    st.markdown("**Recent Scheduler Cycles**")
+    if scheduler_cycles:
+        st.dataframe(
+            [
+                {
+                    "ID": row["id"],
+                    "Started": row["started_at"],
+                    "Completed": row["completed_at"],
+                    "Status": row["status"],
+                    "Analysis Window": bool(row["analysis_window_active"]),
+                    "Generated Decision": bool(row["generated_decision"]),
+                    "Queue": row["queue_status"] or "",
+                    "Notifications": row["notifications_status"] or "",
+                    "Broker Alerts": row["broker_alerts_status"] or "",
+                }
+                for row in scheduler_cycles
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        with st.expander("Most Recent Scheduler Cycle Payload"):
+            st.json(scheduler_cycles[0]["cycle_json"])
+    else:
+        st.caption("No scheduler cycles have been recorded yet.")
 
     st.dataframe(
         [
