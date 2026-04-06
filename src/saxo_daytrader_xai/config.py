@@ -48,6 +48,9 @@ def load_config(config_path: str | os.PathLike[str] = "config.yaml") -> dict[str
     portfolio_cfg = config.setdefault("portfolio", {})
     portfolio_cfg["database_path"] = str((path.parent / portfolio_cfg.get("database_path", "ledger.db")).resolve())
     portfolio_cfg["source_csv"] = str((path.parent / portfolio_cfg["source_csv"]).resolve())
+    saxo_cfg = config.setdefault("saxo", {})
+    if saxo_cfg.get("session_path"):
+        saxo_cfg["session_path"] = str((path.parent / saxo_cfg["session_path"]).resolve())
     config["_meta"] = {
         "config_path": str(path),
         "config_dir": str(path.parent),

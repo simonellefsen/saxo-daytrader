@@ -9,6 +9,7 @@ __all__ = [
     "market_schedule",
     "market_symbols",
     "portfolio",
+    "saxo_openapi",
     "scheduler_service",
     "tax_engine",
     "watchlists",

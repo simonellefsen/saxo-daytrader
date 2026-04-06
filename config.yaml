@@ -98,7 +98,9 @@ saxo:
   environment: SIM
   client_id: ENV:SAXO_CLIENT_ID
   client_secret: ENV:SAXO_CLIENT_SECRET
+  client_key: ENV:SAXO_CLIENT_KEY
   account_key: ENV:SAXO_ACCOUNT_KEY
+  session_path: .secrets/saxo_session.json
 
 tradingview:
   username: ENV:TRADINGVIEW_USERNAME

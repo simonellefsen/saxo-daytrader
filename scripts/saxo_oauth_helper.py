@@ -22,6 +22,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from saxo_daytrader_xai.config import load_dotenv
+from saxo_daytrader_xai.saxo_openapi import default_session_path, save_session
 
 
 ENVIRONMENT_SETTINGS = {
@@ -154,6 +155,7 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int, default=180)
     parser.add_argument("--no-browser", action="store_true", help="Print the authorize URL instead of opening it automatically.")
     parser.add_argument("--write-env", action="store_true", help="Write SAXO_ACCOUNT_KEY and SAXO_CLIENT_KEY back into .env if found.")
+    parser.add_argument("--write-session", action="store_true", help="Write a refreshable Saxo session cache to .secrets/saxo_session.json.")
     args = parser.parse_args()
 
     if not args.client_id:
@@ -253,7 +255,42 @@ def main() -> int:
         )
         print(f"Updated {env_path} with SAXO_ENVIRONMENT, SAXO_CLIENT_KEY, and SAXO_ACCOUNT_KEY.")
 
+    if args.write_session:
+        session_payload = {
+            "environment": args.environment,
+            "auth_mode": args.auth_mode,
+            "client_id": args.client_id,
+            "redirect_uri": args.redirect_uri,
+            "code_verifier": code_verifier,
+            "client_key": client_key,
+            "account_key": default_account_key,
+            "access_token": token_response.get("access_token"),
+            "refresh_token": token_response.get("refresh_token"),
+            "token_type": token_response.get("token_type", "Bearer"),
+            "access_token_expires_at": _expires_at(token_response.get("expires_in")),
+            "refresh_token_expires_at": _expires_at(token_response.get("refresh_token_expires_in")),
+            "created_at": _now_iso(),
+        }
+        session_path = default_session_path(load_config_for_session())
+        save_session(session_path, session_payload)
+        print(f"Updated {session_path} with Saxo access and refresh tokens.")
+
     return 0
+
+
+def _expires_at(expires_in: Any) -> str:
+    seconds = int(expires_in or 0)
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + seconds))
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+
+
+def load_config_for_session() -> dict[str, Any]:
+    from saxo_daytrader_xai.config import load_config
+
+    return load_config(ROOT / "config.yaml")
 
 
 def write_env_values(env_path: Path, values: dict[str, str]) -> None:

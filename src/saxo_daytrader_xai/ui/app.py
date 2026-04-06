@@ -373,6 +373,8 @@ with tab_execution:
         f"Adapter={config['execution']['adapter']} | dry_run={config['app']['dry_run']} | "
         f"max_daily_orders={config['execution']['max_daily_orders']}"
     )
+    if config["execution"]["mode"] == "live":
+        st.info("Approved live orders are submitted to Saxo and stored as broker submissions. They are not booked into the local trade ledger as executed fills yet.")
 
     action_col1, action_col2 = st.columns(2)
     if action_col1.button("Run Queue Processor"):

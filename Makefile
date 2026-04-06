@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 PORT ?= 8501
 
-.PHONY: help install run run-headless scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 saxo-sim saxo-live
+.PHONY: help install run run-headless scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 saxo-sim saxo-live saxo-sim-session saxo-live-session
 
 help:
 	@printf "%s\n" \
@@ -20,8 +20,11 @@ help:
 		"  make validate-phase4    Run Phase 4 validation in mock mode" \
 		"  make validate-phase4-live Run Phase 4 validation using the live xAI API" \
 		"  make validate-phase5    Run Phase 5 validation" \
+		"  make validate-phase6    Run Phase 6 Saxo live-adapter validation" \
 		"  make saxo-sim           Run Saxo OAuth helper against SIM using PKCE" \
-		"  make saxo-live          Run Saxo OAuth helper against LIVE using app secret"
+		"  make saxo-live          Run Saxo OAuth helper against LIVE using app secret" \
+		"  make saxo-sim-session   Run Saxo OAuth helper against SIM and write the session cache" \
+		"  make saxo-live-session  Run Saxo OAuth helper against LIVE and write the session cache"
 
 install:
 	$(PIP) install -r requirements.txt
@@ -61,8 +64,17 @@ validate-phase4-live:
 validate-phase5:
 	$(PYTHON) scripts/validate_phase5.py
 
+validate-phase6:
+	$(PYTHON) scripts/validate_phase6.py
+
 saxo-sim:
 	$(PYTHON) scripts/saxo_oauth_helper.py --environment sim --auth-mode pkce
 
 saxo-live:
 	$(PYTHON) scripts/saxo_oauth_helper.py --environment live --auth-mode secret
+
+saxo-sim-session:
+	$(PYTHON) scripts/saxo_oauth_helper.py --environment sim --auth-mode pkce --write-env --write-session
+
+saxo-live-session:
+	$(PYTHON) scripts/saxo_oauth_helper.py --environment live --auth-mode secret --write-env --write-session

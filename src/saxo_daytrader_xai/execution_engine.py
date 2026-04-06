@@ -5,10 +5,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import requests
+
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
 from saxo_daytrader_xai.market_data import fetch_live_prices
+from saxo_daytrader_xai.saxo_openapi import (
+    SaxoSessionError,
+    build_market_order_payload,
+    ensure_access_token,
+    place_order,
+    precheck_order,
+)
 from saxo_daytrader_xai.market_symbols import saxo_to_yahoo
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
@@ -364,31 +373,88 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
             resolved_connection.commit()
             return {"status": "blocked_by_dry_run", "order_id": order_id}
         if order["mode"] == "live":
-            error_text = (
-                f"Live adapter '{order['adapter']}' is not implemented yet. "
-                "Keep app.dry_run enabled or use simulation mode."
-            )
-            resolved_connection.execute(
-                """
-                UPDATE execution_orders
-                SET status = ?, approved_at = ?, error_text = ?, execution_result_json = ?
-                WHERE id = ?
-                """,
-                (
-                    "execution_failed",
-                    datetime.now(UTC).isoformat(timespec="seconds") if approved else None,
-                    error_text,
-                    json.dumps({"adapter": order["adapter"], "implemented": False}, ensure_ascii=False, sort_keys=True),
-                    order_id,
-                ),
-            )
-            resolved_connection.commit()
-            append_audit_log(
-                resolved_connection,
-                "execution_order_failed",
-                {"order_id": order_id, "mode": order["mode"], "adapter": order["adapter"], "error": error_text},
-            )
-            return {"status": "execution_failed", "order_id": order_id, "error": error_text}
+            if order["adapter"] != "saxo":
+                error_text = f"Unsupported live adapter '{order['adapter']}'"
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, approved_at = ?, error_text = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "execution_failed",
+                        datetime.now(UTC).isoformat(timespec="seconds") if approved else None,
+                        error_text,
+                        json.dumps({"adapter": order["adapter"]}, ensure_ascii=False, sort_keys=True),
+                        order_id,
+                    ),
+                )
+                resolved_connection.commit()
+                return {"status": "execution_failed", "order_id": order_id, "error": error_text}
+            try:
+                session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+                payload = build_market_order_payload(
+                    symbol=order["symbol"],
+                    action=order["action"],
+                    quantity=float(order["quantity"]),
+                    external_reference=f"saxo-daytrader:{order_id}",
+                    config=resolved_config,
+                    session=session,
+                )
+                precheck = precheck_order(payload, resolved_config, session)
+                broker_result = place_order(payload, resolved_config, session)
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, approved_at = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "submitted_to_broker",
+                        datetime.now(UTC).isoformat(timespec="seconds"),
+                        json.dumps(
+                            {"precheck": precheck, "payload": payload, "broker_result": broker_result},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        order_id,
+                    ),
+                )
+                resolved_connection.commit()
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_submitted",
+                    {"order_id": order_id, "mode": order["mode"], "adapter": order["adapter"], "payload": payload},
+                )
+                return {
+                    "status": "submitted_to_broker",
+                    "order_id": order_id,
+                    "broker_result": broker_result,
+                    "precheck": precheck,
+                }
+            except (SaxoSessionError, requests.RequestException, ValueError) as exc:  # type: ignore[name-defined]
+                error_text = str(exc)
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, approved_at = ?, error_text = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "execution_failed",
+                        datetime.now(UTC).isoformat(timespec="seconds") if approved else None,
+                        error_text,
+                        json.dumps({"adapter": order["adapter"], "error": error_text}, ensure_ascii=False, sort_keys=True),
+                        order_id,
+                    ),
+                )
+                resolved_connection.commit()
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_failed",
+                    {"order_id": order_id, "mode": order["mode"], "adapter": order["adapter"], "error": error_text},
+                )
+                return {"status": "execution_failed", "order_id": order_id, "error": error_text}
 
         batch_id = fetch_latest_batch_id(resolved_connection)
         if order["action"] == "SELL":

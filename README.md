@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 5 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 6 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 5 includes
+## What Phase 6 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -19,6 +19,8 @@ Phase 5 foundation for a local Python day-trading assistant focused on a Danish 
 - APScheduler-based background worker for recurring analysis cycles
 - Simulation execution queue with immutable ledger updates
 - Live-mode approval queue with dry-run protection
+- Saxo OpenAPI session cache with refresh-token reuse
+- Saxo instrument lookup, precheck, and order submission for approved live orders
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -28,7 +30,7 @@ Phase 5 foundation for a local Python day-trading assistant focused on a Danish 
   - market status and analysis-window detection
   - realised gain / tax summary from the trade ledger
   - a Decision Report tab that can auto-run during analysis windows or run on demand
-  - an Execution tab for queued orders, live approvals, and audit export
+  - an Execution tab for queued orders, live approvals, Saxo submission status, and audit export
 
 ## Install
 
@@ -96,6 +98,16 @@ Notes:
 - Your app must have a redirect URI that matches `SAXO_REDIRECT_URI` in `.env`.
 - For local use, set a localhost redirect such as `http://localhost:8765/callback`.
 - Use `--write-env` if you want the helper to write `SAXO_ENVIRONMENT`, `SAXO_CLIENT_KEY`, and `SAXO_ACCOUNT_KEY` back into `.env`.
+- Use `--write-session` if you want the helper to persist a refreshable local session cache at `.secrets/saxo_session.json`.
+
+Examples:
+
+```bash
+.venv/bin/python scripts/saxo_oauth_helper.py --environment sim --auth-mode pkce --write-env --write-session
+.venv/bin/python scripts/saxo_oauth_helper.py --environment live --auth-mode secret --write-env --write-session
+```
+
+The session cache is ignored by git and used by the live Saxo adapter to refresh access tokens automatically.
 
 ## Repository safety
 
@@ -109,13 +121,13 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 5 validation script:
+Run the Phase 6 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase5.py
+.venv/bin/python scripts/validate_phase6.py
 ```
 
-Phase 4 validation remains available. To validate against the live xAI API:
+Earlier phase validations remain available. To validate against the live xAI API:
 
 ```bash
 .venv/bin/python scripts/validate_phase4.py --live
@@ -124,15 +136,15 @@ Phase 4 validation remains available. To validate against the live xAI API:
 Expected output shape:
 
 ```text
-Phase 5 validation passed.
+Phase 6 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-Execution orders created: 1
-Executed simulation orders: 3
-Trade ledger rows: 3
+Approval status: approval_required
+Dry-run status: blocked_by_dry_run
+Live submission status: submitted_to_broker
 ```
 
-The exact queued-order count can vary slightly with the imported portfolio snapshot.
+The exact order id values can vary slightly with the imported portfolio snapshot.
 
 Earlier validation scripts remain available:
 
@@ -141,6 +153,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase2.py
 .venv/bin/python scripts/validate_phase3.py
 .venv/bin/python scripts/validate_phase4.py
+.venv/bin/python scripts/validate_phase5.py
 ```
 
 ## Project layout
@@ -156,6 +169,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase3.py
 │   └── validate_phase4.py
 │   └── validate_phase5.py
+│   └── validate_phase6.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -168,6 +182,7 @@ Earlier validation scripts remain available:
         ├── market_schedule.py
         ├── market_symbols.py
         ├── portfolio.py
+        ├── saxo_openapi.py
         ├── scheduler_service.py
         ├── tax_engine.py
         ├── watchlists.py
@@ -178,6 +193,6 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Wire approved live orders to the Saxo OpenAPI order endpoints once OAuth access-token storage is in place.
+1. Add order-status and fill synchronization from Saxo so submitted live orders can update the local trade ledger when actually filled.
 2. Add optional Slack or email daily summaries from the scheduler worker.
 3. Add systemd and launchd service examples for unattended local deployment.
