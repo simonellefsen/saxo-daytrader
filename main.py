@@ -172,7 +172,7 @@ def main() -> int:
             if scheduler_process is not None:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     scheduler_process.wait(timeout=5)
-            return 130
+            return 0
         except subprocess.TimeoutExpired:
             _terminate_process_group(dashboard_process, sig=signal.SIGKILL)
             if scheduler_process is not None:
@@ -181,7 +181,7 @@ def main() -> int:
             if scheduler_process is not None:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     scheduler_process.wait(timeout=2)
-            return 130
+            return 0
 
 
 if __name__ == "__main__":
