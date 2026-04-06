@@ -12,7 +12,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -35,6 +35,23 @@ ENVIRONMENT_SETTINGS = {
         "openapi_base_url": "https://gateway.saxobank.com/openapi",
     },
 }
+
+
+def normalize_redirect_uri(redirect_uri: str, default_port: int = 8765) -> str:
+    parsed = urlparse(redirect_uri)
+    if parsed.hostname not in {"127.0.0.1", "localhost"}:
+        return redirect_uri
+    if parsed.port is not None:
+        return redirect_uri
+
+    netloc = parsed.hostname or "localhost"
+    if parsed.username or parsed.password:
+        auth = parsed.username or ""
+        if parsed.password:
+            auth = f"{auth}:{parsed.password}"
+        netloc = f"{auth}@{netloc}"
+    netloc = f"{netloc}:{default_port}"
+    return urlunparse((parsed.scheme or "http", netloc, parsed.path or "/", parsed.params, parsed.query, parsed.fragment))
 
 
 class CallbackHandler(BaseHTTPRequestHandler):
@@ -157,6 +174,10 @@ def main() -> int:
     parser.add_argument("--write-env", action="store_true", help="Write SAXO_ACCOUNT_KEY and SAXO_CLIENT_KEY back into .env if found.")
     parser.add_argument("--write-session", action="store_true", help="Write a refreshable Saxo session cache to .secrets/saxo_session.json.")
     args = parser.parse_args()
+    normalized_redirect_uri = normalize_redirect_uri(args.redirect_uri)
+    if normalized_redirect_uri != args.redirect_uri:
+        print(f"Normalized redirect URI to {normalized_redirect_uri} for local callback handling.")
+        args.redirect_uri = normalized_redirect_uri
 
     if not args.client_id:
         raise SystemExit("Missing SAXO_CLIENT_ID / --client-id")
