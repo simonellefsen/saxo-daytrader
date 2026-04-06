@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 import pytz
 import streamlit as st
+import streamlit.components.v1 as components
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
@@ -102,6 +103,26 @@ def _sent_alert_count(alert_result: dict | None) -> int:
     return sum(1 for row in alert_result.get("sent", []) if row.get("status") == "sent")
 
 
+def _enable_auto_refresh(interval_ms: int) -> None:
+    if interval_ms <= 0:
+        return
+    components.html(
+        f"""
+        <script>
+        const parentWin = window.parent;
+        if (parentWin.__saxoDaytraderAutoRefreshTimer) {{
+          clearTimeout(parentWin.__saxoDaytraderAutoRefreshTimer);
+        }}
+        parentWin.__saxoDaytraderAutoRefreshTimer = setTimeout(() => {{
+          parentWin.location.reload();
+        }}, {int(interval_ms)});
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def _history_timezone_name(config: dict) -> str:
     return str(config.get("price_monitor", {}).get("timezone", "Europe/Copenhagen"))
 
@@ -183,6 +204,9 @@ st.set_page_config(page_title="saxo-daytrader-xai", layout="wide")
 config_path = str(ROOT / "config.yaml")
 config = load_config(config_path)
 database_path = config["portfolio"]["database_path"]
+auto_refresh_minutes = int(config.get("price_monitor", {}).get("poll_interval_minutes", 5) or 0)
+if bool(config.get("price_monitor", {}).get("enabled", True)) and auto_refresh_minutes > 0:
+    _enable_auto_refresh(auto_refresh_minutes * 60 * 1000)
 
 connection = connect(database_path)
 init_db(connection)
