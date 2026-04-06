@@ -132,7 +132,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 21 dashboard with autonomous simulation support, live broker workflow, and multi-period notifications.")
+st.caption("Phase 24 dashboard with autonomous simulation support, live broker workflow, scheduler controls, and route-aware notifications.")
 
 autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
     config.get("scheduler", {}).get("enabled", True)
@@ -696,6 +696,9 @@ with tab_notifications:
                     "Profile": route_cfg.get("profile") or "",
                     "Slack Webhook Override": "Yes" if route_cfg.get("slack_webhook_url") else "No",
                     "Email Recipients Override": "Yes" if route_cfg.get("email_to_addresses_csv") else "No",
+                    "Subject Prefix": route_cfg.get("subject_prefix") or "",
+                    "Message Preamble": "Yes" if route_cfg.get("message_preamble") else "No",
+                    "Summary Style": route_cfg.get("summary_style") or "",
                 }
             )
     st.markdown("**Route Overrides**")
@@ -712,6 +715,9 @@ with tab_notifications:
                     "Profile": profile_name,
                     "Slack Webhook": "Yes" if profile_cfg.get("slack_webhook_url") else "No",
                     "Email Recipients": "Yes" if profile_cfg.get("email_to_addresses_csv") else "No",
+                    "Subject Prefix": profile_cfg.get("subject_prefix") or "",
+                    "Message Preamble": "Yes" if profile_cfg.get("message_preamble") else "No",
+                    "Summary Style": profile_cfg.get("summary_style") or "",
                 }
             )
     st.markdown("**Route Profiles**")

@@ -171,7 +171,7 @@ def build_summary(
         ],
     }
     subject = f"saxo-daytrader-xai {summary_kind} summary {summary_label}"
-    style = str(config.get("notifications", {}).get("summary_style", "structured")).lower()
+    style = _summary_style(config, summary_kind)
     if style == "compact":
         lines = [
             subject,
@@ -215,10 +215,11 @@ def build_summary(
                     ],
                 ]
             )
+    formatted_subject, formatted_message = _format_delivery_content(config, summary_kind, subject, "\n".join(lines))
     return {
         "summary_date": payload["summary_date"],
-        "subject": subject,
-        "message_text": "\n".join(lines),
+        "subject": formatted_subject,
+        "message_text": formatted_message,
         "payload": payload,
     }
 
@@ -377,6 +378,26 @@ def _route_config(config: dict[str, Any], summary_kind: str) -> dict[str, Any]:
             profile_cfg = candidate
     route_overrides = {key: value for key, value in route.items() if key != "profile"}
     return {**profile_cfg, **route_overrides}
+
+
+def _summary_style(config: dict[str, Any], summary_kind: str) -> str:
+    route_cfg = _route_config(config, summary_kind)
+    return str(route_cfg.get("summary_style") or config.get("notifications", {}).get("summary_style", "structured")).lower()
+
+
+def _format_delivery_content(
+    config: dict[str, Any],
+    summary_kind: str,
+    subject: str,
+    message_text: str,
+) -> tuple[str, str]:
+    route_cfg = _route_config(config, summary_kind)
+    subject_prefix = str(route_cfg.get("subject_prefix") or "").strip()
+    message_preamble = str(route_cfg.get("message_preamble") or "").strip()
+
+    formatted_subject = f"{subject_prefix} {subject}".strip() if subject_prefix else subject
+    formatted_message = f"{message_preamble}\n\n{message_text}" if message_preamble else message_text
+    return formatted_subject, formatted_message
 
 
 def _resolve_slack_webhook(config: dict[str, Any], summary_kind: str) -> str:
@@ -972,20 +993,26 @@ def dispatch_broker_alerts_if_due(
                 continue
             previous_state = _notification_state(connection, alert["summary_kind"], channel) or {}
             attempt_count = int(previous_state.get("attempt_count") or 0) + 1
+            formatted_subject, formatted_message = _format_delivery_content(
+                config,
+                alert["summary_kind"],
+                alert["subject"],
+                alert["message_text"],
+            )
             try:
                 if channel == "slack":
                     delivery_meta = _send_slack(
                         config,
-                        alert["subject"],
-                        alert["message_text"],
+                        formatted_subject,
+                        formatted_message,
                         alert["payload"],
                         summary_kind=alert["summary_kind"],
                     )
                 elif channel == "email":
                     delivery_meta = _send_email(
                         config,
-                        alert["subject"],
-                        alert["message_text"],
+                        formatted_subject,
+                        formatted_message,
                         summary_kind=alert["summary_kind"],
                     )
                 else:
@@ -996,8 +1023,8 @@ def dispatch_broker_alerts_if_due(
                     summary_kind=alert["summary_kind"],
                     channel=channel,
                     status="sent",
-                    subject=alert["subject"],
-                    message_text=alert["message_text"],
+                    subject=formatted_subject,
+                    message_text=formatted_message,
                     payload={**alert["payload"], "delivery_meta": delivery_meta},
                 )
                 _upsert_notification_state(
@@ -1048,8 +1075,8 @@ def dispatch_broker_alerts_if_due(
                     summary_kind=alert["summary_kind"],
                     channel=channel,
                     status="failed",
-                    subject=alert["subject"],
-                    message_text=alert["message_text"],
+                    subject=formatted_subject,
+                    message_text=formatted_message,
                     payload=alert["payload"],
                     error_text=str(exc),
                 )

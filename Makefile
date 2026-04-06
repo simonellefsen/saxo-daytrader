@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 PORT ?= 8501
 
-.PHONY: help install run run-headless run-ui-only scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
+.PHONY: help install run run-headless run-ui-only scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
 
 help:
 	@printf "%s\n" \
@@ -14,7 +14,7 @@ help:
 		"  make scheduler          Run the APScheduler worker continuously" \
 		"  make scheduler-once     Run one scheduler cycle in mock-decision mode" \
 		"  make sync               Import the CSV into ledger.db without starting Streamlit" \
-		"  make validate           Run the latest phase validation (Phase 23)" \
+		"  make validate           Run the latest phase validation (Phase 24)" \
 		"  make validate-phase1    Run Phase 1 validation" \
 		"  make validate-phase2    Run Phase 2 validation" \
 		"  make validate-phase3    Run Phase 3 validation" \
@@ -39,6 +39,7 @@ help:
 		"  make validate-phase21   Run Phase 21 autonomous launcher validation" \
 		"  make validate-phase22   Run Phase 22 scheduler heartbeat validation" \
 		"  make validate-phase23   Run Phase 23 manual scheduler-cycle control validation" \
+		"  make validate-phase24   Run Phase 24 route-profile formatting validation" \
 		"  make render-services    Render systemd and launchd service examples into deploy/rendered" \
 		"  make saxo-sim           Run Saxo OAuth helper against SIM using PKCE" \
 		"  make saxo-live          Run Saxo OAuth helper against LIVE using app secret" \
@@ -66,7 +67,7 @@ scheduler-once:
 sync:
 	$(PYTHON) main.py --sync-only
 
-validate: validate-phase23
+validate: validate-phase24
 
 validate-phase1:
 	$(PYTHON) scripts/validate_phase1.py
@@ -139,6 +140,9 @@ validate-phase22:
 
 validate-phase23:
 	$(PYTHON) scripts/validate_phase23.py
+
+validate-phase24:
+	$(PYTHON) scripts/validate_phase24.py
 
 render-services:
 	$(PYTHON) scripts/render_service_templates.py

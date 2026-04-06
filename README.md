@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 23 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 24 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -44,6 +44,7 @@ Phase 23 foundation for a local Python day-trading assistant focused on a Danish
 - Autonomous app launcher mode that starts the dashboard and background scheduler together for hands-off simulation trading
 - Scheduler heartbeat and last-cycle status persisted to SQLite and shown in the dashboard
 - One-click scheduler cycle controls in the dashboard for live or mock manual runs
+- Route-profile formatting so subject prefixes, message preambles, and summary style can be shared across notification kinds
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -119,6 +120,7 @@ The scheduler:
 - supports per-kind routing overrides for daily/weekly/monthly/quarterly/YTD digests and broker alert types
 - suppresses repeated broker alerts per order scope using severity-specific cooldown windows
 - supports named route profiles plus per-kind overrides for Slack webhooks and email recipients
+- supports route-profile formatting for subject prefixes, message preambles, and compact vs structured summary rendering
 - can group several broker updates for one execution order into a single notification payload
 - records scheduler activity in `audit_log`
 
@@ -246,6 +248,23 @@ notifications:
       profile: ops
 ```
 
+Route profiles can also share formatting across multiple delivery kinds:
+
+```yaml
+notifications:
+  route_profiles:
+    ops:
+      slack_webhook_url: ENV:SLACK_WEBHOOK_URL
+      subject_prefix: "[OPS]"
+      message_preamble: "Shared profile preamble"
+      summary_style: compact
+  routes:
+    weekly:
+      profile: ops
+    alert_broker_fill:
+      profile: ops
+```
+
 Treat webhook URLs as secrets. Do not commit them to git. Slack's documentation notes that leaked webhook URLs are actively revoked.
 
 ## Repository safety
@@ -260,10 +279,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 23 validation script:
+Run the Phase 24 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase23.py
+.venv/bin/python scripts/validate_phase24.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -275,10 +294,11 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 23 validation passed.
-Manual live cycle status: ok
-Manual mock cycle status: ok
-Mock generate flag observed: True
+Phase 24 validation passed.
+Formatted deliveries sent: 2
+Subject prefix applied: True
+Message preamble applied: True
+Profile style applied: True
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -309,6 +329,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase21.py
 .venv/bin/python scripts/validate_phase22.py
 .venv/bin/python scripts/validate_phase23.py
+.venv/bin/python scripts/validate_phase24.py
 ```
 
 ## Project layout
@@ -340,6 +361,9 @@ Earlier validation scripts remain available:
 │   └── validate_phase19.py
 │   └── validate_phase20.py
 │   └── validate_phase21.py
+│   └── validate_phase22.py
+│   └── validate_phase23.py
+│   └── validate_phase24.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -364,5 +388,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add per-profile templates or formatting so alert and digest families can share presentation settings as well as destinations.
-2. Add a dashboard-visible history table of recent scheduler cycles and their top-level outcomes.
+1. Add a dashboard-visible history table of recent scheduler cycles and their top-level outcomes.
+2. Add scheduler-side stale-worker detection so autonomous mode can flag or recover a dead background process.
