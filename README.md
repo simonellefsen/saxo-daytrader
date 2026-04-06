@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 10 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 11 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 10 includes
+## What Phase 11 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -31,6 +31,7 @@ Phase 10 foundation for a local Python day-trading assistant focused on a Danish
 - Scheduler-driven daily performance summary generation
 - Optional Slack webhook and SMTP email delivery for daily summaries
 - Immutable `notification_deliveries` records and notification history in the UI
+- Renderable `systemd` and `launchd` service templates for unattended local deployment
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -88,6 +89,53 @@ The scheduler:
 - sends one daily summary per configured channel after the local dispatch time
 - records scheduler activity in `audit_log`
 
+## Deployment
+
+Render `systemd` and `launchd` service examples for the current workspace:
+
+```bash
+.venv/bin/python scripts/render_service_templates.py
+```
+
+Or:
+
+```bash
+make render-services
+```
+
+This writes rendered files into `deploy/rendered/` using the current repo path and `.venv/bin/python`.
+
+Rendered files:
+
+- `deploy/rendered/systemd/saxo-daytrader-scheduler.service`
+- `deploy/rendered/systemd/saxo-daytrader-dashboard.service`
+- `deploy/rendered/launchd/com.saxo-daytrader.scheduler.plist`
+- `deploy/rendered/launchd/com.saxo-daytrader.dashboard.plist`
+
+Typical install flow:
+
+1. Render the templates.
+2. Review the generated paths, user, and port.
+3. Copy the chosen service file into your OS service directory.
+4. Enable the scheduler service first.
+5. Optionally enable the dashboard service if you want the Streamlit UI always running.
+
+Example `systemd` commands:
+
+```bash
+sudo cp deploy/rendered/systemd/saxo-daytrader-scheduler.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now saxo-daytrader-scheduler.service
+```
+
+Example `launchd` commands:
+
+```bash
+cp deploy/rendered/launchd/com.saxo-daytrader.scheduler.plist ~/Library/LaunchAgents/
+launchctl unload ~/Library/LaunchAgents/com.saxo-daytrader.scheduler.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.saxo-daytrader.scheduler.plist
+```
+
 ## Saxo OAuth helper
 
 The project now auto-loads `.env` from the workspace root.
@@ -134,10 +182,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 10 validation script:
+Run the Phase 11 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase10.py
+.venv/bin/python scripts/validate_phase11.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -149,12 +197,13 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 10 validation passed.
-Imported source positions: 20
-Excluded positions: 2
-Notifications sent: 1
-Slack calls captured: 1
-Scheduler notification status: ok
+Phase 11 validation passed.
+Rendered output dir: /tmp/saxo_daytrader_phase11_<id>
+Rendered files:
+- /tmp/.../systemd/saxo-daytrader-scheduler.service
+- /tmp/.../systemd/saxo-daytrader-dashboard.service
+- /tmp/.../launchd/com.saxo-daytrader.scheduler.plist
+- /tmp/.../launchd/com.saxo-daytrader.dashboard.plist
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -172,6 +221,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase8.py
 .venv/bin/python scripts/validate_phase9.py
 .venv/bin/python scripts/validate_phase10.py
+.venv/bin/python scripts/validate_phase11.py
 ```
 
 ## Project layout
@@ -192,6 +242,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase8.py
 │   └── validate_phase9.py
 │   └── validate_phase10.py
+│   └── validate_phase11.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -216,6 +267,6 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add systemd and launchd service examples for unattended local deployment.
-2. Add broker-side order replacement support so the app can submit controlled modify/cancel-replace actions, not only reconcile them after the fact.
+1. Add broker-side order replacement support so the app can submit controlled modify/cancel-replace actions, not only reconcile them after the fact.
+2. Add per-channel delivery throttling/backoff and richer notification templates.
 3. Add per-channel delivery throttling/backoff and richer notification templates.
