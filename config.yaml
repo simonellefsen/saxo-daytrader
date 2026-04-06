@@ -12,6 +12,7 @@ portfolio:
   base_currency: DKK
   source_csv: Positioner_05-apr-2026_12_16_34.csv
   database_path: ledger.db
+  initial_cash_dkk: 25000.0
 
 market_data:
   refresh_interval_seconds: 300
@@ -35,14 +36,14 @@ market_data:
 
 analysis_windows:
   offset_minutes_after_open: 60
-  duration_minutes: 30
+  duration_minutes: 45
   calendar_refresh_interval_minutes: 360
   calendar_lookback_days: 7
   calendar_lookahead_days: 45
 
 scheduler:
   enabled: true
-  poll_interval_minutes: 15
+  poll_interval_minutes: 10
   startup_run: true
   history_max_rows: 250
   history_retention_days: 30

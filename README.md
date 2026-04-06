@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 32 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 33 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -98,6 +98,135 @@ If you only want the UI without autonomous execution, use:
 make run-ui-only
 ```
 
+## Config Reference
+
+The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml). Values written as `ENV:NAME` are loaded from `.env`.
+
+### `app`
+
+- `project_name`: display name used in the UI.
+- `environment`: free-form environment label such as `local`.
+- `dry_run`: when `true`, live broker submission and live broker management are blocked even if `execution.mode` is `live`.
+- `simulation_mode`: legacy convenience flag; execution behavior is primarily controlled by `execution.mode`.
+- `launch_scheduler_with_dashboard`: when `true`, `main.py` starts the background scheduler together with Streamlit.
+- `scheduler_restart_on_failure`: if the launcher-managed scheduler dies or becomes stale, `main.py` may restart it.
+- `scheduler_max_restarts`: maximum restart attempts per app run.
+- `scheduler_restart_delay_seconds`: wait time before each restart attempt.
+
+### `portfolio`
+
+- `base_currency`: reporting currency. The project assumes `DKK`.
+- `source_csv`: Saxo export used for the latest imported holdings baseline.
+- `database_path`: SQLite database path, usually `ledger.db`.
+- `initial_cash_dkk`: starting cash balance used for cash-aware portfolio value and buy-side limits. Buys reduce it, sells increase it through recorded `net_amount_dkk`.
+
+### `market_data`
+
+- `refresh_interval_seconds`: general UI/data refresh cadence for quote-oriented functions.
+- `request_timeout_seconds`: timeout for market-data HTTP calls.
+- `watchlists.nordic_limit`: number of Nordic names shown in the watchlist.
+- `watchlists.global_limit`: number of US/Europe names shown in the watchlist.
+- `rss.market_feeds`: RSS feeds for company/market headlines.
+- `rss.macro_feeds`: RSS feeds for macro and central-bank headlines.
+
+### `analysis_windows`
+
+- `offset_minutes_after_open`: how long after an exchange open the system starts considering that market eligible for analysis.
+- `duration_minutes`: how long the analysis window stays active after the offset.
+- `calendar_refresh_interval_minutes`: how often exchange session calendars are refreshed.
+- `calendar_lookback_days`: how much recent session history is cached.
+- `calendar_lookahead_days`: how far future holiday/session data is cached.
+
+Example: with `offset_minutes_after_open: 60` and `duration_minutes: 45`, a market that opens at `09:00` local will have an analysis window from `10:00` to `10:45` local.
+
+### `scheduler`
+
+- `enabled`: enables the scheduler worker.
+- `poll_interval_minutes`: how often the worker wakes up and runs one scheduler cycle.
+- `startup_run`: when `true`, a cycle runs immediately when the scheduler starts instead of waiting for the first interval boundary.
+- `history_max_rows`: maximum scheduler-cycle history rows to retain.
+- `history_retention_days`: maximum age of scheduler-cycle history rows.
+
+### `execution`
+
+- `mode`: `simulation` for local paper execution, `live` for Saxo broker submission/management.
+- `adapter`: currently `saxo`.
+- `auto_execute_simulation`: when `true`, simulation orders are executed automatically after queueing.
+- `require_approval_live`: when `true`, live orders stay in approval state until manually approved.
+- `min_trade_value_dkk`: ignores tiny orders below this estimated DKK size.
+- `max_daily_orders`: daily cap on created execution orders.
+
+### `risk`
+
+- `excluded_symbols`: repo-safe list of blocked symbols.
+- `excluded_symbols_csv`: optional comma-separated override loaded from environment.
+- `max_position_weight`: maximum post-trade position weight as a fraction of total portfolio value.
+- `allow_shorting`: should remain `false` for this project.
+
+### `taxation`
+
+- `share_income.currency`: tax reporting currency, expected to be `DKK`.
+- `share_income.brackets`: Danish share-income brackets used by the sell calculator.
+
+### `commissions`
+
+- `default_rate`: percentage commission rate, e.g. `0.0008` for `0.08%`.
+- `fx_conversion_rate`: FX conversion markup applied when trade currency is not `DKK`.
+- `minimums`: per-exchange commission minima by currency and amount.
+
+### `xai`
+
+- `api_key`: xAI API key from `.env`.
+- `base_url`: xAI API base URL.
+- `model`: Grok model used for decision generation.
+- `goal`: embedded objective included in every trading prompt.
+- `timeout_seconds`: HTTP timeout for xAI calls.
+- `auto_run_interval_minutes`: minimum spacing between automatic decision reports.
+- `include_encrypted_reasoning`: when `true`, requests encrypted reasoning content from xAI.
+
+### `saxo`
+
+- `environment`: `SIM` or `LIVE`.
+- `client_id`: Saxo app key.
+- `client_secret`: Saxo app secret for secret-based auth flows.
+- `client_key`: Saxo `ClientKey`, typically written by the OAuth helper.
+- `account_key`: Saxo `AccountKey`, typically written by the OAuth helper.
+- `session_path`: refreshable local Saxo session cache written by `--write-session`.
+
+### `tradingview`
+
+- `username`: TradingView username.
+- `encrypted_password`: TradingView password secret.
+- `totp_secret`: TOTP secret for 2FA automation.
+
+### `notifications`
+
+- `daily_summary_enabled`, `weekly_summary_enabled`, `monthly_summary_enabled`, `quarterly_summary_enabled`, `ytd_summary_enabled`: enable the corresponding digest types.
+- `timezone`: local timezone for dispatch timing.
+- `dispatch_hour_local`, `dispatch_minute_local`: local daily dispatch time.
+- `weekly_dispatch_weekday_local`: weekday index for weekly digest dispatch.
+- `monthly_dispatch_day_local`, `quarterly_dispatch_day_local`, `ytd_dispatch_day_local`: day-of-period dispatch points.
+- `retry_backoff_minutes`: retry delay after a failed notification send.
+- `max_attempts_per_day`: per-channel retry cap.
+- `channel_cooldown_minutes`: minimum spacing between repeated sends of the same summary kind on the same channel.
+- `summary_style`: default digest rendering style, e.g. `structured` or `compact`.
+- `slack.enabled`: enable Slack delivery.
+- `slack.webhook_url`: Slack webhook URL, normally from `.env`.
+- `email.*`: SMTP configuration for email delivery.
+- `alerts.broker_fill_enabled`: alerts for confirmed broker fills.
+- `alerts.broker_reject_enabled`: alerts for broker rejections.
+- `alerts.broker_cancel_enabled`: alerts for broker cancels/expirations.
+- `alerts.execution_failure_enabled`: alerts when an execution order fails locally, e.g. session or lookup failure.
+- `alerts.broker_management_failure_enabled`: alerts when a live cancel/replace request fails.
+- `alert_suppression.*`: cooldown rules by severity.
+- `alert_grouping.enabled`: group several broker updates for one order into one notification.
+- `alert_grouping.max_items_per_group`: cap on grouped alert preview items.
+- `route_profiles`: reusable delivery profiles.
+- `routes`: per-summary-kind and per-alert-kind overrides, including:
+  - `daily`, `weekly`, `monthly`, `quarterly`, `ytd`
+  - `alert_broker_fill`, `alert_broker_reject`, `alert_broker_cancel`, `alert_broker_grouped`
+  - `alert_execution_failed`, `alert_broker_management_failed`
+
 ## Scheduler
 
 Run the always-on background worker:
@@ -136,6 +265,81 @@ The scheduler:
 - resolves Saxo instruments by Saxo's own symbol and exchange aliases, so `SBUX:xnas` and `MU:xnas` map correctly during broker submission
 - pushes notification alerts when live execution fails, including session, lookup, and broker submission errors
 - handles broker-side cancel/replace failures cleanly in the UI and pushes notifications for management failures without crashing Streamlit
+- supports configurable starting cash in DKK, shows live cash balance in the portfolio summary, and adjusts cash automatically as trades execute
+
+### What One Scheduler Cycle Does
+
+Each scheduler cycle does the following in order:
+
+1. Updates scheduler heartbeat and status in SQLite.
+2. Refreshes exchange calendars if their refresh interval has elapsed.
+3. Computes current market status and whether any analysis window is active.
+4. Decides whether a new xAI decision report should be generated.
+5. If eligible, generates a decision report.
+6. Queues trades from the latest completed decision report.
+7. If `execution.mode: simulation` and `execution.auto_execute_simulation: true`, executes queued simulation orders immediately.
+8. Synchronizes broker order status for live orders.
+9. Dispatches due digests and broker alerts.
+10. Records cycle history and prunes old scheduler history rows.
+
+### What `poll_interval_minutes: 10` Means
+
+`scheduler.poll_interval_minutes: 10` means the background worker wakes up every 10 minutes and runs exactly one scheduler cycle.
+
+It does not mean:
+
+- the app waits 10 minutes before every single trade inside a cycle
+- the app trades exactly every 10 minutes
+- the app generates a new xAI report every 10 minutes regardless of market state
+
+What it really means in practice:
+
+- the worker checks conditions every 10 minutes
+- if no analysis window is active, the cycle mostly updates status and exits
+- if an analysis window is active, the cycle may generate a new decision report if `xai.auto_run_interval_minutes` also allows it
+- if a completed report exists, orders may be queued and simulation orders may execute in that same cycle
+
+### Poll Interval vs Analysis Window
+
+These settings interact:
+
+- `analysis_windows.offset_minutes_after_open`
+- `analysis_windows.duration_minutes`
+- `scheduler.poll_interval_minutes`
+- `xai.auto_run_interval_minutes`
+
+Example with the current defaults:
+
+- exchange opens at `09:00`
+- analysis window starts at `10:00`
+- analysis window ends at `10:45`
+- scheduler polls at `09:50`, `10:00`, `10:10`, `10:20`, `10:30`, `10:40`, `10:50`
+
+In that case:
+
+- `09:50`: no analysis yet
+- `10:00`: eligible
+- `10:10`: still eligible
+- `10:20`: still eligible
+- `10:30`: still eligible
+- `10:40`: still eligible
+- `10:50`: too late
+
+So a 10-minute poll interval gives you roughly 5 chances to catch a 45-minute analysis window.
+
+If you make `poll_interval_minutes` too large relative to `duration_minutes`, you can miss windows entirely. For example:
+
+- `poll_interval_minutes: 30`
+- `duration_minutes: 45`
+
+would be much easier to miss if the scheduler happens to poll just before the window opens and then only again after it closes.
+
+### Recommended Scheduler Settings
+
+- `poll_interval_minutes: 10` is a reasonable default for a lightweight always-on process.
+- Use `5` if you want tighter reaction time and are comfortable with more frequent API/database activity.
+- Avoid setting it higher than the analysis window duration unless you are comfortable occasionally missing an opportunity window.
+- Keep `startup_run: true` so a restart immediately re-evaluates the system instead of waiting for the next 15-minute boundary.
 
 ## Deployment
 
@@ -292,10 +496,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 32 validation script:
+Run the Phase 33 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase32.py
+.venv/bin/python scripts/validate_phase33.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -307,9 +511,10 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 32 validation passed.
-Management failure alerts sent: 1
-Slack success payloads: 1
+Phase 33 validation passed.
+Starting cash DKK: 10000.00
+Cash after buy DKK: 9xxx.xx
+Insufficient-cash status: execution_failed
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
