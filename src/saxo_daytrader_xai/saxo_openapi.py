@@ -55,6 +55,10 @@ class SaxoInstrument:
     currency_code: str | None
 
 
+class SaxoOrderNotFoundError(SaxoSessionError):
+    pass
+
+
 def default_session_path(config: dict[str, Any]) -> Path:
     config_dir = Path(config["_meta"]["config_dir"])
     return config_dir / ".secrets" / "saxo_session.json"
@@ -173,6 +177,13 @@ def _account_key(config: dict[str, Any], session: dict[str, Any]) -> str:
     return str(account_key)
 
 
+def _client_key(config: dict[str, Any], session: dict[str, Any]) -> str:
+    client_key = config["saxo"].get("client_key") or session.get("client_key")
+    if not client_key:
+        raise SaxoSessionError("SAXO_CLIENT_KEY is missing. Re-run the Saxo OAuth helper with --write-env or --write-session.")
+    return str(client_key)
+
+
 def _symbol_parts(symbol: str) -> tuple[str, str]:
     base, _, exchange = symbol.partition(":")
     return base.strip().upper(), exchange.strip().lower()
@@ -269,3 +280,42 @@ def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[s
     )
     response.raise_for_status()
     return response.json()
+
+
+def get_open_order(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.get(
+        f"{base_url}/port/v1/orders/{_client_key(config, session)}/{order_id}",
+        params={"FieldGroups": "DisplayAndFormat"},
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    if response.status_code == 404:
+        raise SaxoOrderNotFoundError(f"Saxo open order {order_id} was not found in open orders")
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("Data", [])
+    if not data:
+        raise SaxoOrderNotFoundError(f"Saxo open order {order_id} returned no rows")
+    return data[0]
+
+
+def get_order_activity_last(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.get(
+        f"{base_url}/cs/v1/audit/orderactivities",
+        params={
+            "AccountKey": _account_key(config, session),
+            "ClientKey": _client_key(config, session),
+            "EntryType": "Last",
+            "OrderId": order_id,
+        },
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("Data", [])
+    if not data:
+        raise SaxoOrderNotFoundError(f"Saxo order activity {order_id} returned no rows")
+    return data[0]

@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 6 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 7 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 6 includes
+## What Phase 7 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -21,6 +21,8 @@ Phase 6 foundation for a local Python day-trading assistant focused on a Danish 
 - Live-mode approval queue with dry-run protection
 - Saxo OpenAPI session cache with refresh-token reuse
 - Saxo instrument lookup, precheck, and order submission for approved live orders
+- Saxo broker-status synchronization for submitted live orders
+- Local ledger reconciliation when Saxo reports a confirmed final fill
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -30,7 +32,7 @@ Phase 6 foundation for a local Python day-trading assistant focused on a Danish 
   - market status and analysis-window detection
   - realised gain / tax summary from the trade ledger
   - a Decision Report tab that can auto-run during analysis windows or run on demand
-  - an Execution tab for queued orders, live approvals, Saxo submission status, and audit export
+  - an Execution tab for queued orders, live approvals, Saxo submission status, broker sync, and audit export
 
 ## Install
 
@@ -121,10 +123,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 6 validation script:
+Run the Phase 7 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase6.py
+.venv/bin/python scripts/validate_phase7.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -136,12 +138,12 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 6 validation passed.
+Phase 7 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-Approval status: approval_required
-Dry-run status: blocked_by_dry_run
-Live submission status: submitted_to_broker
+Working order status: broker_working
+Filled order status: executed
+Trade ledger rows: 1
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -154,6 +156,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase3.py
 .venv/bin/python scripts/validate_phase4.py
 .venv/bin/python scripts/validate_phase5.py
+.venv/bin/python scripts/validate_phase6.py
 ```
 
 ## Project layout
@@ -170,6 +173,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase4.py
 │   └── validate_phase5.py
 │   └── validate_phase6.py
+│   └── validate_phase7.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -193,6 +197,6 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add order-status and fill synchronization from Saxo so submitted live orders can update the local trade ledger when actually filled.
+1. Add partial-fill reconciliation so partially filled live orders can book incremental local ledger updates instead of waiting for `FinalFill`.
 2. Add optional Slack or email daily summaries from the scheduler worker.
 3. Add systemd and launchd service examples for unattended local deployment.

@@ -12,9 +12,12 @@ from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.saxo_openapi import (
+    SaxoOrderNotFoundError,
     SaxoSessionError,
     build_market_order_payload,
     ensure_access_token,
+    get_open_order,
+    get_order_activity_last,
     place_order,
     precheck_order,
 )
@@ -344,6 +347,166 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     return {"ledger_id": ledger_id, "lot_id": lot_id}
 
 
+def _sync_filled_live_order(connection, config: dict[str, Any], order: dict[str, Any], activity: dict[str, Any]) -> dict[str, Any]:
+    batch_id = fetch_latest_batch_id(connection)
+    filled_quantity = float(activity.get("FilledAmount") or order["quantity"])
+    average_price = float(activity.get("AveragePrice") or order["price_local"])
+    synced_order = {**order, "quantity": filled_quantity, "price_local": average_price}
+
+    if order["action"] == "SELL":
+        trade = calculate_sell_outcome(
+            order["symbol"],
+            filled_quantity,
+            average_price,
+            config=config,
+            connection=connection,
+            batch_id=batch_id,
+            tax_year=datetime.now(UTC).year,
+        )
+        trade["mode"] = order["mode"]
+        trade["status"] = "executed"
+        trade["notes"] = "Saxo broker fill sync"
+        trade["decision_context"] = activity
+        result = update_ledger(trade, config=config, connection=connection)
+    else:
+        result = _record_buy_trade(connection, config, synced_order, batch_id)
+        connection.execute(
+            """
+            UPDATE trade_ledger
+            SET notes = ?, decision_context_json = ?
+            WHERE id = ?
+            """,
+            (
+                "Saxo broker fill sync",
+                json.dumps(activity, ensure_ascii=False, sort_keys=True),
+                result["ledger_id"],
+            ),
+        )
+        connection.commit()
+    return result
+
+
+def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connection=None, limit: int = 25) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        rows = resolved_connection.execute(
+            """
+            SELECT *
+            FROM execution_orders
+            WHERE mode = 'live'
+              AND status IN ('submitted_to_broker', 'broker_working', 'broker_partially_filled')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return {"status": "ok", "updated": 0, "orders": []}
+
+        session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+        updates: list[dict[str, Any]] = []
+
+        for row in rows:
+            order = dict(row)
+            if order.get("ledger_id"):
+                continue
+            execution_result = json.loads(order["execution_result_json"]) if order.get("execution_result_json") else {}
+            broker_result = execution_result.get("broker_result", {})
+            broker_order_id = broker_result.get("OrderId")
+            if not broker_order_id:
+                updates.append({"order_id": order["id"], "status": order["status"], "skipped": "missing_order_id"})
+                continue
+
+            try:
+                open_order = get_open_order(str(broker_order_id), resolved_config, session)
+                broker_status = str(open_order.get("Status") or "Working")
+                if broker_status.lower() in {"working", "placed"}:
+                    new_status = "broker_working"
+                elif broker_status.lower() == "fill":
+                    new_status = "broker_partially_filled"
+                else:
+                    new_status = order["status"]
+                payload = {
+                    **execution_result,
+                    "open_order": open_order,
+                    "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                }
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                )
+                updates.append({"order_id": order["id"], "status": new_status})
+                continue
+            except SaxoOrderNotFoundError:
+                activity = get_order_activity_last(str(broker_order_id), resolved_config, session)
+
+            activity_status = str(activity.get("Status") or "")
+            activity_substatus = str(activity.get("SubStatus") or "")
+            payload = {
+                **execution_result,
+                "last_activity": activity,
+                "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+
+            if activity_status == "FinalFill" and activity_substatus == "Confirmed":
+                result = _sync_filled_live_order(resolved_connection, resolved_config, order, activity)
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, ledger_id = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    ("executed", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                )
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_fill_synced",
+                    {"order_id": order["id"], "ledger_id": result["ledger_id"], "broker_order_id": broker_order_id},
+                )
+                updates.append({"order_id": order["id"], "status": "executed", "ledger_id": result["ledger_id"]})
+            elif activity_status == "Fill" and activity_substatus == "Confirmed":
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    ("broker_partially_filled", json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                )
+                updates.append({"order_id": order["id"], "status": "broker_partially_filled"})
+            elif activity_status in {"Cancelled", "Expired"} and activity_substatus == "Confirmed":
+                new_status = "broker_cancelled" if activity_status == "Cancelled" else "broker_expired"
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                )
+                updates.append({"order_id": order["id"], "status": new_status})
+            else:
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                )
+                updates.append({"order_id": order["id"], "status": order["status"]})
+
+        resolved_connection.commit()
+        return {"status": "ok", "updated": len(updates), "orders": updates}
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
 def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connection=None, approved: bool = False) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
@@ -514,7 +677,8 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
             for order in orders:
                 if order["status"] == "pending_execution":
                     executed.append(execute_order(order["id"], config=resolved_config, connection=resolved_connection))
-        return {"status": "ok", "orders": orders, "executed": executed}
+        broker_sync = sync_broker_order_statuses(config=resolved_config, connection=resolved_connection)
+        return {"status": "ok", "orders": orders, "executed": executed, "broker_sync": broker_sync}
     finally:
         if should_close:
             resolved_connection.close()

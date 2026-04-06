@@ -18,6 +18,7 @@ from saxo_daytrader_xai.execution_engine import (
     export_audit_bundle,
     fetch_execution_orders,
     queue_and_maybe_execute_latest_report,
+    sync_broker_order_statuses,
 )
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
@@ -103,7 +104,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 5 dashboard with decision automation, simulation execution, approval gating, and audit exports.")
+st.caption("Phase 7 dashboard with decision automation, simulation execution, Saxo live submission, broker sync, and audit exports.")
 
 excluded_symbols = ", ".join(config.get("risk", {}).get("excluded_symbols", []))
 st.info(f"Excluded symbols enforced globally: {excluded_symbols}")
@@ -376,7 +377,7 @@ with tab_execution:
     if config["execution"]["mode"] == "live":
         st.info("Approved live orders are submitted to Saxo and stored as broker submissions. They are not booked into the local trade ledger as executed fills yet.")
 
-    action_col1, action_col2 = st.columns(2)
+    action_col1, action_col2, action_col3 = st.columns(3)
     if action_col1.button("Run Queue Processor"):
         with st.spinner("Processing queued execution orders..."):
             queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
@@ -387,6 +388,12 @@ with tab_execution:
         export_dir = ROOT / "exports" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         export_result = export_audit_bundle(str(export_dir), config=config, connection=connection)
         st.success(f"Audit bundle exported to {export_result['output_dir']}")
+
+    if action_col3.button("Sync Broker Status"):
+        with st.spinner("Synchronizing Saxo broker order statuses..."):
+            sync_result = sync_broker_order_statuses(config=config, connection=connection)
+        st.success(f"Broker sync updated {sync_result['updated']} orders")
+        st.rerun()
 
     if config["execution"]["mode"] == "live" and pending_approvals:
         st.markdown("**Pending Live Approvals**")
