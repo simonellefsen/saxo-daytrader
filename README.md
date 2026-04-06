@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 9 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 10 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 9 includes
+## What Phase 10 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -28,6 +28,9 @@ Phase 9 foundation for a local Python day-trading assistant focused on a Danish 
 - Immutable `execution_fills` records for broker fill history and deduplication
 - Immutable `execution_order_events` records for broker-side amendments, cancellations, rejections, and working-order state changes
 - Broker-side amendment reconciliation that updates local working order quantity and price from Saxo
+- Scheduler-driven daily performance summary generation
+- Optional Slack webhook and SMTP email delivery for daily summaries
+- Immutable `notification_deliveries` records and notification history in the UI
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -38,6 +41,7 @@ Phase 9 foundation for a local Python day-trading assistant focused on a Danish 
   - realised gain / tax summary from the trade ledger
   - a Decision Report tab that can auto-run during analysis windows or run on demand
   - an Execution tab for queued orders, live approvals, Saxo submission status, broker sync, and audit export
+  - a Notifications tab with summary preview and delivery history
 
 ## Install
 
@@ -81,6 +85,7 @@ The scheduler:
 - generates xAI decision reports during eligible windows
 - queues suggested trades
 - auto-executes queued trades in simulation mode
+- sends one daily summary per configured channel after the local dispatch time
 - records scheduler activity in `audit_log`
 
 ## Saxo OAuth helper
@@ -129,10 +134,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 9 validation script:
+Run the Phase 10 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase9.py
+.venv/bin/python scripts/validate_phase10.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -144,12 +149,12 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 9 validation passed.
+Phase 10 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-Amended order status: broker_amended
-Cancelled order status: broker_cancelled
-Broker event rows: 2
+Notifications sent: 1
+Slack calls captured: 1
+Scheduler notification status: ok
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -166,6 +171,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase7.py
 .venv/bin/python scripts/validate_phase8.py
 .venv/bin/python scripts/validate_phase9.py
+.venv/bin/python scripts/validate_phase10.py
 ```
 
 ## Project layout
@@ -185,6 +191,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase7.py
 │   └── validate_phase8.py
 │   └── validate_phase9.py
+│   └── validate_phase10.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -196,6 +203,7 @@ Earlier validation scripts remain available:
         ├── market_news.py
         ├── market_schedule.py
         ├── market_symbols.py
+        ├── notifications.py
         ├── portfolio.py
         ├── saxo_openapi.py
         ├── scheduler_service.py
@@ -208,6 +216,6 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add optional Slack or email daily summaries from the scheduler worker.
-2. Add systemd and launchd service examples for unattended local deployment.
-3. Add broker-side order replacement support so the app can submit controlled modify/cancel-replace actions, not only reconcile them after the fact.
+1. Add systemd and launchd service examples for unattended local deployment.
+2. Add broker-side order replacement support so the app can submit controlled modify/cancel-replace actions, not only reconcile them after the fact.
+3. Add per-channel delivery throttling/backoff and richer notification templates.

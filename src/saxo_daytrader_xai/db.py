@@ -209,6 +209,21 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_execution_order_events_order
         ON execution_order_events(execution_order_id, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS notification_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            summary_date TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            status TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            message_text TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            error_text TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_notification_deliveries_summary
+        ON notification_deliveries(summary_date, channel, status, created_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

@@ -1135,6 +1135,7 @@ def export_audit_bundle(output_dir: str, *, config: dict[str, Any] | None = None
             "execution_orders": out / "execution_orders.csv",
             "execution_fills": out / "execution_fills.csv",
             "execution_order_events": out / "execution_order_events.csv",
+            "notification_deliveries": out / "notification_deliveries.csv",
             "audit_log": out / "audit_log.csv",
         }
         for table_name, path in exports.items():

@@ -25,6 +25,7 @@ from saxo_daytrader_xai.execution_engine import (
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
+from saxo_daytrader_xai.notifications import build_daily_summary, dispatch_daily_summary_if_due, fetch_notification_deliveries
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -97,6 +98,8 @@ market_intelligence = _load_market_intelligence(config_path, tuple(portfolio_sym
 market_status_rows = get_market_status(config)
 analysis_summary = summarize_analysis_window(market_status_rows)
 latest_decision_report = fetch_latest_decision_report(connection)
+notification_deliveries = fetch_notification_deliveries(connection, limit=50)
+daily_summary_preview = build_daily_summary(connection, config)
 
 if should_auto_run_decision_report(connection, config, analysis_summary["analysis_window_active"]):
     with st.spinner("Generating xAI decision report..."):
@@ -122,8 +125,8 @@ col2.metric("Portfolio Value", _format_dkk(summary["total_market_value_dkk"]))
 col3.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
 col4.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
 
-tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution = st.tabs(
-    ["Portfolio", "Watchlist", "News", "Market Status", "Decision Report", "Execution"]
+tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution, tab_notifications = st.tabs(
+    ["Portfolio", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
 )
 
 with tab_portfolio:
@@ -491,5 +494,43 @@ with tab_execution:
         )
     else:
         st.caption("No broker lifecycle events have been synchronized yet.")
+
+with tab_notifications:
+    st.subheader("Daily Summary Notifications")
+    notif_col1, notif_col2, notif_col3 = st.columns(3)
+    notif_col1.metric("Daily Summary Enabled", "Yes" if config["notifications"]["daily_summary_enabled"] else "No")
+    notif_col2.metric("Recent Deliveries", len(notification_deliveries))
+    notif_col3.metric("Slack Enabled", "Yes" if config["notifications"]["slack"]["enabled"] else "No")
+
+    if st.button("Send Daily Summary Now"):
+        with st.spinner("Dispatching daily summary..."):
+            summary_result = dispatch_daily_summary_if_due(connection, config, force=True)
+        st.success(f"Summary dispatch status: {summary_result['status']}")
+        st.rerun()
+
+    st.markdown("**Current Summary Preview**")
+    st.caption(daily_summary_preview["subject"])
+    st.code(daily_summary_preview["message_text"], language="text")
+
+    st.markdown("**Delivery History**")
+    if notification_deliveries:
+        st.dataframe(
+            [
+                {
+                    "ID": row["id"],
+                    "Created": row["created_at"],
+                    "Summary Date": row["summary_date"],
+                    "Channel": row["channel"],
+                    "Status": row["status"],
+                    "Subject": row["subject"],
+                    "Error": row["error_text"],
+                }
+                for row in notification_deliveries
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("No notification deliveries have been recorded yet.")
 
 connection.close()

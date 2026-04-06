@@ -112,3 +112,18 @@ tradingview:
 
 notifications:
   daily_summary_enabled: false
+  timezone: Europe/Copenhagen
+  dispatch_hour_local: 18
+  dispatch_minute_local: 15
+  slack:
+    enabled: false
+    webhook_url: ENV:SLACK_WEBHOOK_URL
+  email:
+    enabled: false
+    smtp_host: ENV:SMTP_HOST
+    smtp_port: ENV:SMTP_PORT
+    use_starttls: true
+    username: ENV:SMTP_USERNAME
+    password: ENV:SMTP_PASSWORD
+    from_address: ENV:SMTP_FROM_ADDRESS
+    to_addresses_csv: ENV:SMTP_TO_ADDRESSES
