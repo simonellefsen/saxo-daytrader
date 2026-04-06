@@ -37,6 +37,7 @@ market_data:
 price_monitor:
   enabled: true
   poll_interval_minutes: 1
+  post_close_grace_minutes: 15
   reset_hour_local: 6
   timezone: Europe/Copenhagen
   history_max_rows: 0

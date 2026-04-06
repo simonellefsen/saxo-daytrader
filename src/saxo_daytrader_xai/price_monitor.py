@@ -10,6 +10,7 @@ from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
 from saxo_daytrader_xai.market_data import fetch_live_prices
+from saxo_daytrader_xai.market_schedule import get_market_status
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -38,6 +39,67 @@ def _baseline_session_date(config: dict[str, Any], reference_time: datetime | No
     return session_date.isoformat()
 
 
+def price_monitor_window_status(
+    config: dict[str, Any],
+    *,
+    reference_time: datetime | None = None,
+) -> dict[str, Any]:
+    now_utc = (reference_time or datetime.now(UTC)).astimezone(UTC)
+    grace_minutes = int(config.get("price_monitor", {}).get("post_close_grace_minutes", 15) or 15)
+    market_status_rows = get_market_status(config, reference_time=now_utc)
+
+    active_markets = [row["market"] for row in market_status_rows if bool(row.get("is_open"))]
+    if active_markets:
+        return {
+            "polling_active": True,
+            "status": "open",
+            "active_markets": active_markets,
+            "grace_markets": [],
+            "reason": "Markets currently open.",
+            "next_resume_at": None,
+        }
+
+    grace_markets: list[str] = []
+    grace_until: datetime | None = None
+    for row in market_status_rows:
+        close_at = row.get("session_close_at_utc")
+        if not close_at:
+            continue
+        close_dt = datetime.fromisoformat(str(close_at)).astimezone(UTC)
+        grace_end = close_dt + timedelta(minutes=grace_minutes)
+        if close_dt <= now_utc <= grace_end:
+            grace_markets.append(str(row["market"]))
+            if grace_until is None or grace_end > grace_until:
+                grace_until = grace_end
+
+    next_open_candidates = [
+        datetime.fromisoformat(str(row["next_open_at_utc"])).astimezone(UTC)
+        for row in market_status_rows
+        if row.get("next_open_at_utc")
+    ]
+    next_resume_at = min(next_open_candidates).isoformat(timespec="seconds") if next_open_candidates else None
+
+    if grace_markets:
+        return {
+            "polling_active": True,
+            "status": "post_close_grace",
+            "active_markets": [],
+            "grace_markets": grace_markets,
+            "reason": f"Within {grace_minutes}-minute post-close grace window.",
+            "grace_until": grace_until.isoformat(timespec="seconds") if grace_until is not None else None,
+            "next_resume_at": next_resume_at,
+        }
+
+    return {
+        "polling_active": False,
+        "status": "closed",
+        "active_markets": [],
+        "grace_markets": [],
+        "reason": "All tracked exchanges are closed outside the post-close grace window.",
+        "next_resume_at": next_resume_at,
+    }
+
+
 def refresh_portfolio_price_state(
     *,
     config: dict[str, Any] | None = None,
@@ -53,6 +115,15 @@ def refresh_portfolio_price_state(
     try:
         if not bool(resolved_config.get("price_monitor", {}).get("enabled", True)):
             return {"status": "disabled", "updated": 0, "baseline_session_date": None}
+        monitor_window = price_monitor_window_status(resolved_config, reference_time=reference_time)
+        if not monitor_window["polling_active"]:
+            return {
+                "status": "outside_trading_hours",
+                "updated": 0,
+                "baseline_session_date": None,
+                "monitor_window": monitor_window,
+                "next_resume_at": monitor_window.get("next_resume_at"),
+            }
 
         batch_id = fetch_latest_batch_id(resolved_connection)
         initial_cash_dkk = float(resolved_config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
@@ -179,6 +250,7 @@ def refresh_portfolio_price_state(
             "symbols": symbols,
             "portfolio_snapshot_id": snapshot_id,
             "portfolio_history_pruned_rows": pruned_history_rows,
+            "monitor_window": monitor_window,
         }
         append_audit_log(resolved_connection, "portfolio_price_state_refreshed", payload)
         return payload

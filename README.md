@@ -132,13 +132,14 @@ The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml
 ### `price_monitor`
 
 - `enabled`: enables persisted portfolio quote polling in the background worker.
-- `poll_interval_minutes`: how often the scheduler refreshes latest portfolio prices. Current default is `5`.
+- `poll_interval_minutes`: how often the scheduler refreshes latest portfolio prices while the price monitor is active. Current default is `1`.
+- `post_close_grace_minutes`: how long quote polling continues after the final tracked exchange closes before it pauses until the next exchange open. Current default is `15`.
 - `reset_hour_local`: local hour used as the daily baseline reset point. Current default is `6`.
 - `timezone`: timezone used for the reset boundary. Default is `Europe/Copenhagen`.
 - `history_max_rows`: optional cap on stored portfolio-value history points. `0` means unlimited.
 - `history_retention_days`: optional max age for stored portfolio-value history points. `0` means unlimited.
 
-The price monitor stores latest portfolio quotes in SQLite, appends portfolio-value history points for the Performance tab, and uses the first quote after the configured reset hour as the baseline for that day. Daily P/L in the UI is then calculated relative to that baseline instead of relying only on the CSV import.
+The price monitor stores latest portfolio quotes in SQLite, appends portfolio-value history points for the Performance tab, and uses the first quote after the configured reset hour as the baseline for that day. Daily P/L in the UI is then calculated relative to that baseline instead of relying only on the CSV import. Quote polling runs while at least one tracked exchange is open, and keeps running for the configured post-close grace period after the last close. After that it pauses until the next tracked exchange opens.
 
 ### `analysis_windows`
 
@@ -267,7 +268,7 @@ Run one mock scheduler cycle for smoke testing:
 The scheduler:
 
 - checks the configured exchange analysis windows
-- refreshes portfolio quotes every `price_monitor.poll_interval_minutes`
+- refreshes portfolio quotes every `price_monitor.poll_interval_minutes` while at least one tracked exchange is open, then continues for `price_monitor.post_close_grace_minutes` after the final close before pausing until the next open
 - refreshes the exchange-calendar cache on a recurring interval
 - generates xAI decision reports during eligible windows
 - queues suggested trades

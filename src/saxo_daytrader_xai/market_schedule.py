@@ -373,6 +373,8 @@ def get_market_status(config: dict[str, Any], reference_time: datetime | None = 
                 "session_close_local": close_dt.strftime("%Y-%m-%d %H:%M") if close_dt is not None else "n/a",
                 "session_open_utc": open_dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M") if open_dt is not None else "n/a",
                 "session_close_utc": close_dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M") if close_dt is not None else "n/a",
+                "session_open_at_utc": open_dt.astimezone(UTC).isoformat(timespec="seconds") if open_dt is not None else None,
+                "session_close_at_utc": close_dt.astimezone(UTC).isoformat(timespec="seconds") if close_dt is not None else None,
                 "calendar_source": entry.source,
                 "calendar_last_checked": entry.fetched_at.strftime("%Y-%m-%d %H:%M UTC"),
                 "is_open": is_open,
@@ -380,6 +382,7 @@ def get_market_status(config: dict[str, Any], reference_time: datetime | None = 
                 "analysis_window_start": analysis_start.strftime("%Y-%m-%d %H:%M") if analysis_start is not None else "n/a",
                 "analysis_window_end": analysis_end.strftime("%Y-%m-%d %H:%M") if analysis_end is not None else "n/a",
                 "next_open": next_open.strftime("%Y-%m-%d %H:%M"),
+                "next_open_at_utc": next_open.astimezone(UTC).isoformat(timespec="seconds"),
             }
         )
     return rows
