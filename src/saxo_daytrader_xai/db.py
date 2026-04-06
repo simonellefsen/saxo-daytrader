@@ -270,6 +270,25 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_scheduler_cycle_history_started
         ON scheduler_cycle_history(started_at DESC);
 
+        CREATE TABLE IF NOT EXISTS portfolio_price_snapshots (
+            symbol TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            baseline_session_date TEXT NOT NULL,
+            baseline_at TEXT,
+            current_price_local REAL,
+            current_fx_rate_to_dkk REAL,
+            previous_close_local REAL,
+            change_pct REAL,
+            currency TEXT,
+            source TEXT,
+            status TEXT,
+            baseline_price_local REAL,
+            baseline_fx_rate_to_dkk REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_portfolio_price_snapshots_baseline
+        ON portfolio_price_snapshots(baseline_session_date, updated_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

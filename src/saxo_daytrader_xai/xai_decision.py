@@ -165,8 +165,9 @@ def _summarize_market_regime(
 
 def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     batch_id = fetch_latest_batch_id(connection)
-    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id)
-    portfolio_positions = fetch_portfolio_positions(connection, batch_id=batch_id)
+    initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    portfolio_positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
     portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
     watchlists = build_watchlists(config)
     watchlist_symbols = [row["symbol"] for row in watchlists["nordic"][:5]] + [row["symbol"] for row in watchlists["global"][:10]]

@@ -27,6 +27,7 @@ from saxo_daytrader_xai.saxo_openapi import (
 )
 from saxo_daytrader_xai.market_symbols import saxo_to_yahoo
 from saxo_daytrader_xai.portfolio import (
+    fetch_cash_summary,
     fetch_latest_batch_id,
     fetch_invalid_trade_ledger_rows,
     fetch_portfolio_positions,
@@ -156,13 +157,71 @@ def _whole_share_quantity(quantity: float) -> int:
     return max(int(math.floor(float(quantity))), 0)
 
 
-def _dispatch_execution_failure_alerts(connection, config: dict[str, Any]) -> None:
+def _initial_cash_dkk(config: dict[str, Any]) -> float:
+    return float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+
+
+def _max_affordable_buy_quantity(
+    *,
+    symbol: str,
+    price_local: float,
+    currency: str,
+    fx_rate: float,
+    available_cash_dkk: float,
+    config: dict[str, Any],
+) -> int:
+    if available_cash_dkk <= 0 or price_local <= 0 or fx_rate <= 0:
+        return 0
+    gross_per_share_dkk = price_local * fx_rate
+    quantity = _whole_share_quantity(available_cash_dkk / gross_per_share_dkk)
+    while quantity > 0:
+        gross_local = price_local * quantity
+        gross_dkk = gross_local * fx_rate
+        commission = _calculate_buy_commission(symbol, gross_local, gross_dkk, currency, fx_rate, config)
+        total_spend_dkk = gross_dkk + commission["commission_dkk"]
+        if total_spend_dkk <= available_cash_dkk + 1e-9:
+            return quantity
+        quantity -= 1
+    return 0
+
+
+def _dispatch_execution_alerts(connection, config: dict[str, Any]) -> dict[str, Any] | None:
     try:
         from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due
 
-        dispatch_broker_alerts_if_due(connection, config, force=False)
+        return dispatch_broker_alerts_if_due(connection, config, force=False)
     except Exception:  # noqa: BLE001
-        return
+        return None
+
+
+def _dispatch_execution_failure_alerts(connection, config: dict[str, Any]) -> None:
+    _dispatch_execution_alerts(connection, config)
+
+
+def _mark_execution_failed(
+    connection,
+    *,
+    order_id: int,
+    approved: bool,
+    adapter: str,
+    error_text: str,
+) -> dict[str, Any]:
+    connection.execute(
+        """
+        UPDATE execution_orders
+        SET status = ?, approved_at = ?, error_text = ?, execution_result_json = ?
+        WHERE id = ?
+        """,
+        (
+            "execution_failed",
+            datetime.now(UTC).isoformat(timespec="seconds") if approved else None,
+            error_text,
+            json.dumps({"adapter": adapter, "error": error_text}, ensure_ascii=False, sort_keys=True),
+            order_id,
+        ),
+    )
+    connection.commit()
+    return {"status": "execution_failed", "order_id": order_id, "error": error_text}
 
 
 def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -176,8 +235,12 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     report_json = report["report_json"] or {}
     suggestions = report_json.get("suggested_trades", [])
     batch_id = fetch_latest_batch_id(connection)
-    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id)
-    position_map = _current_position_map(connection, batch_id=batch_id)
+    initial_cash_dkk = _initial_cash_dkk(config)
+    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    position_map = {
+        row["symbol"]: {**row, "quantity_open": row["quantity"]}
+        for row in fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    }
     live_symbols = list({item.get("symbol") for item in suggestions if item.get("symbol")})
     live_symbols.extend(position_map.keys())
     live_price_map = _get_live_price_map([symbol for symbol in live_symbols if symbol], config)
@@ -187,6 +250,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     max_position_weight = float(config["risk"]["max_position_weight"])
     min_trade_value_dkk = float(config["execution"]["min_trade_value_dkk"])
     remaining_capacity = _remaining_daily_order_capacity(connection, config)
+    remaining_cash_dkk = float(fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)["cash_balance_dkk"])
 
     for suggestion in suggestions:
         if remaining_capacity <= 0:
@@ -236,10 +300,46 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         quantity = abs(delta_value_dkk) / max(price_local * fx_rate, 1e-9)
         if action == "SELL":
             quantity = min(quantity, current_quantity)
-        whole_quantity = _whole_share_quantity(quantity)
-        estimated_value_dkk = whole_quantity * price_local * fx_rate
+            whole_quantity = _whole_share_quantity(quantity)
+            estimated_value_dkk = whole_quantity * price_local * fx_rate
+        else:
+            capped_delta_value_dkk = min(delta_value_dkk, max(remaining_cash_dkk, 0.0))
+            target_quantity = capped_delta_value_dkk / max(price_local * fx_rate, 1e-9)
+            whole_quantity = min(
+                _whole_share_quantity(quantity),
+                _max_affordable_buy_quantity(
+                    symbol=symbol,
+                    price_local=price_local,
+                    currency=currency,
+                    fx_rate=fx_rate,
+                    available_cash_dkk=max(remaining_cash_dkk, 0.0),
+                    config=config,
+                ),
+                _whole_share_quantity(target_quantity),
+            )
+            gross_local = whole_quantity * price_local
+            estimated_value_dkk = gross_local * fx_rate
         if whole_quantity <= 0 or estimated_value_dkk < min_trade_value_dkk:
             continue
+        if action == "BUY":
+            gross_local = whole_quantity * price_local
+            gross_dkk = gross_local * fx_rate
+            commission = _calculate_buy_commission(symbol, gross_local, gross_dkk, currency, fx_rate, config)
+            remaining_cash_dkk -= gross_dkk + commission["commission_dkk"]
+        else:
+            try:
+                sell_outcome = calculate_sell_outcome(
+                    symbol,
+                    float(whole_quantity),
+                    float(price_local),
+                    config=config,
+                    connection=connection,
+                    batch_id=batch_id,
+                    tax_year=datetime.now(UTC).year,
+                )
+                remaining_cash_dkk += float(sell_outcome["net_DKK"])
+            except ValueError:
+                pass
 
         orders.append(
             {
@@ -304,11 +404,23 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     price_local = float(order["price_local"])
     quantity = float(_whole_share_quantity(float(order["quantity"])))
     currency = order["currency"]
+    initial_cash_dkk = _initial_cash_dkk(config)
+    portfolio_before = {
+        "summary": fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+        "positions": fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+    }
     fx_snapshot = fetch_ecb_fx_rates()
     fx_rate = fx_rate_to_dkk(currency, fx_snapshot)
     gross_local = price_local * quantity
     gross_dkk = gross_local * fx_rate
     commission = _calculate_buy_commission(order["symbol"], gross_local, gross_dkk, currency, fx_rate, config)
+    total_spend_dkk = gross_dkk + commission["commission_dkk"]
+    available_cash_dkk = float(portfolio_before["summary"]["cash_balance_dkk"])
+    if total_spend_dkk > available_cash_dkk + 1e-9:
+        raise ValueError(
+            f"Insufficient cash to buy {int(quantity)} shares of {order['symbol']}; "
+            f"need {total_spend_dkk:.2f} DKK, have {available_cash_dkk:.2f} DKK"
+        )
     cursor = connection.execute(
         """
         INSERT INTO trade_ledger (
@@ -333,11 +445,11 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
             0.0,
             0.0,
             0.0,
-            -(gross_dkk + commission["commission_dkk"]),
+            -total_spend_dkk,
             order["mode"],
             "executed" if order["mode"] == "simulation" else "approved",
             "Phase 5 buy execution",
-            json.dumps({}, ensure_ascii=False, sort_keys=True),
+            json.dumps(portfolio_before, ensure_ascii=False, sort_keys=True),
             json.dumps({}, ensure_ascii=False, sort_keys=True),
             order["request_json"],
             datetime.now(UTC).year,
@@ -371,6 +483,15 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
             f"execution_order:{order['id']}",
             order["request_json"],
         ),
+    )
+    connection.commit()
+    portfolio_after = {
+        "summary": fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+        "positions": fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+    }
+    connection.execute(
+        "UPDATE trade_ledger SET portfolio_after_json = ? WHERE id = ?",
+        (json.dumps(portfolio_after, ensure_ascii=False, sort_keys=True), ledger_id),
     )
     connection.commit()
     return {"ledger_id": ledger_id, "lot_id": lot_id}
@@ -1082,24 +1203,41 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 return {"status": "execution_failed", "order_id": order_id, "error": error_text}
 
         batch_id = fetch_latest_batch_id(resolved_connection)
-        if order["action"] == "SELL":
-            trade = calculate_sell_outcome(
-                order["symbol"],
-                float(order["quantity"]),
-                float(order["price_local"]),
-                config=resolved_config,
-                connection=resolved_connection,
-                batch_id=batch_id,
-                tax_year=datetime.now(UTC).year,
+        try:
+            if order["action"] == "SELL":
+                trade = calculate_sell_outcome(
+                    order["symbol"],
+                    float(order["quantity"]),
+                    float(order["price_local"]),
+                    config=resolved_config,
+                    connection=resolved_connection,
+                    batch_id=batch_id,
+                    tax_year=datetime.now(UTC).year,
+                )
+                trade["mode"] = order["mode"]
+                trade["status"] = "executed"
+                trade["notes"] = "Phase 5 automated execution"
+                result = update_ledger(trade, config=resolved_config, connection=resolved_connection)
+                ledger_id = result["ledger_id"]
+            else:
+                result = _record_buy_trade(resolved_connection, resolved_config, order, batch_id)
+                ledger_id = result["ledger_id"]
+        except ValueError as exc:
+            error_text = str(exc)
+            failed = _mark_execution_failed(
+                resolved_connection,
+                order_id=order_id,
+                approved=True,
+                adapter=order["adapter"],
+                error_text=error_text,
             )
-            trade["mode"] = order["mode"]
-            trade["status"] = "executed"
-            trade["notes"] = "Phase 5 automated execution"
-            result = update_ledger(trade, config=resolved_config, connection=resolved_connection)
-            ledger_id = result["ledger_id"]
-        else:
-            result = _record_buy_trade(resolved_connection, resolved_config, order, batch_id)
-            ledger_id = result["ledger_id"]
+            append_audit_log(
+                resolved_connection,
+                "execution_order_failed",
+                {"order_id": order_id, "mode": order["mode"], "adapter": order["adapter"], "error": error_text},
+            )
+            _dispatch_execution_failure_alerts(resolved_connection, resolved_config)
+            return failed
 
         resolved_connection.execute(
             """
@@ -1317,7 +1455,14 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
                 if order["status"] == "pending_execution":
                     executed.append(execute_order(order["id"], config=resolved_config, connection=resolved_connection))
         broker_sync = sync_broker_order_statuses(config=resolved_config, connection=resolved_connection)
-        return {"status": "ok", "orders": orders, "executed": executed, "broker_sync": broker_sync}
+        alert_result = _dispatch_execution_alerts(resolved_connection, resolved_config)
+        return {
+            "status": "ok",
+            "orders": orders,
+            "executed": executed,
+            "broker_sync": broker_sync,
+            "alerts": alert_result,
+        }
     finally:
         if should_close:
             resolved_connection.close()

@@ -13,6 +13,7 @@ from saxo_daytrader_xai.db import append_audit_log, connect, init_db, prune_sche
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
+from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
 
@@ -150,10 +151,12 @@ def run_scheduler_cycle(
             resolved_connection,
             resolved_config,
         )
-        broker_alert_result = dispatch_broker_alerts_if_due(
-            resolved_connection,
-            resolved_config,
-        )
+        broker_alert_result = queue_result.get("alerts") if isinstance(queue_result, dict) else None
+        if broker_alert_result is None:
+            broker_alert_result = dispatch_broker_alerts_if_due(
+                resolved_connection,
+                resolved_config,
+            )
 
         outcome = {
             "status": "ok",
@@ -275,6 +278,7 @@ def run_scheduler_forever(
     )
     connection.close()
     interval_minutes = int(resolved_config["scheduler"]["poll_interval_minutes"])
+    price_interval_minutes = int(resolved_config.get("price_monitor", {}).get("poll_interval_minutes", 5))
     scheduler = BlockingScheduler(timezone="Europe/Copenhagen")
 
     scheduler.add_job(
@@ -288,13 +292,28 @@ def run_scheduler_forever(
             "force_mock": force_mock,
         },
     )
+    if bool(resolved_config.get("price_monitor", {}).get("enabled", True)):
+        scheduler.add_job(
+            refresh_portfolio_price_state,
+            "interval",
+            minutes=price_interval_minutes,
+            max_instances=1,
+            coalesce=True,
+            kwargs={
+                "config_path": str(config_path),
+            },
+        )
 
     if resolved_config["scheduler"].get("startup_run", True):
+        if bool(resolved_config.get("price_monitor", {}).get("enabled", True)):
+            price_result = refresh_portfolio_price_state(config_path=config_path)
+            print(price_result)
         result = run_scheduler_cycle(config_path=config_path, force_mock=force_mock)
         print(result)
 
     print(
         f"Scheduler started. Poll interval={interval_minutes} minutes, "
+        f"price poll interval={price_interval_minutes} minutes, "
         f"force_mock={force_mock}. Press Ctrl+C to stop."
     )
     try:

@@ -115,15 +115,17 @@ def _extract_saxo_error(payload: Any) -> str | None:
 def _raise_for_saxo_response(response: requests.Response, *, action: str) -> dict[str, Any]:
     payload = _response_json_or_none(response)
     error_text = _extract_saxo_error(payload)
-    if response.status_code >= 400:
-        if response.status_code == 404 and error_text and "OrderNotFound" in error_text:
+    status_code = int(getattr(response, "status_code", 200))
+    response_text = str(getattr(response, "text", "") or "")
+    if status_code >= 400:
+        if status_code == 404 and error_text and "OrderNotFound" in error_text:
             raise SaxoOrderNotFoundError(error_text)
         if error_text:
             raise SaxoSessionError(f"{action} failed: {error_text}")
-        snippet = (response.text or "").strip()
+        snippet = response_text.strip()
         if snippet:
-            raise SaxoSessionError(f"{action} failed: HTTP {response.status_code}: {snippet[:300]}")
-        raise SaxoSessionError(f"{action} failed: HTTP {response.status_code}")
+            raise SaxoSessionError(f"{action} failed: HTTP {status_code}: {snippet[:300]}")
+        raise SaxoSessionError(f"{action} failed: HTTP {status_code}")
     if error_text:
         if "OrderNotFound" in error_text:
             raise SaxoOrderNotFoundError(error_text)

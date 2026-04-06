@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 33 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 34 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -129,6 +129,15 @@ The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml
 - `rss.market_feeds`: RSS feeds for company/market headlines.
 - `rss.macro_feeds`: RSS feeds for macro and central-bank headlines.
 
+### `price_monitor`
+
+- `enabled`: enables persisted portfolio quote polling in the background worker.
+- `poll_interval_minutes`: how often the scheduler refreshes latest portfolio prices. Current default is `5`.
+- `reset_hour_local`: local hour used as the daily baseline reset point. Current default is `6`.
+- `timezone`: timezone used for the reset boundary. Default is `Europe/Copenhagen`.
+
+The price monitor stores latest portfolio quotes in SQLite and uses the first quote after the configured reset hour as the baseline for that day. Daily P/L in the UI is then calculated relative to that baseline instead of relying only on the CSV import.
+
 ### `analysis_windows`
 
 - `offset_minutes_after_open`: how long after an exchange open the system starts considering that market eligible for analysis.
@@ -213,6 +222,8 @@ Example: with `offset_minutes_after_open: 60` and `duration_minutes: 45`, a mark
 - `slack.enabled`: enable Slack delivery.
 - `slack.webhook_url`: Slack webhook URL, normally from `.env`.
 - `email.*`: SMTP configuration for email delivery.
+- `alerts.execution_success_enabled`: alerts when a queued trade is executed in simulation or successfully submitted to Saxo.
+- `alerts.execution_warning_enabled`: alerts for execution warnings such as `pending_approval`, `blocked_by_dry_run`, or invalid quantity.
 - `alerts.broker_fill_enabled`: alerts for confirmed broker fills.
 - `alerts.broker_reject_enabled`: alerts for broker rejections.
 - `alerts.broker_cancel_enabled`: alerts for broker cancels/expirations.
@@ -224,6 +235,7 @@ Example: with `offset_minutes_after_open: 60` and `duration_minutes: 45`, a mark
 - `route_profiles`: reusable delivery profiles.
 - `routes`: per-summary-kind and per-alert-kind overrides, including:
   - `daily`, `weekly`, `monthly`, `quarterly`, `ytd`
+  - `alert_execution_success`, `alert_execution_warning`
   - `alert_broker_fill`, `alert_broker_reject`, `alert_broker_cancel`, `alert_broker_grouped`
   - `alert_execution_failed`, `alert_broker_management_failed`
 
@@ -244,10 +256,12 @@ Run one mock scheduler cycle for smoke testing:
 The scheduler:
 
 - checks the configured exchange analysis windows
+- refreshes portfolio quotes every `price_monitor.poll_interval_minutes`
 - refreshes the exchange-calendar cache on a recurring interval
 - generates xAI decision reports during eligible windows
 - queues suggested trades
 - auto-executes queued trades in simulation mode
+- dispatches execution notifications for successes, warnings, and failures
 - sends one daily summary per configured channel after the local dispatch time
 - sends optional weekly, monthly, quarterly, and YTD digests after their configured local dispatch windows
 - sends optional broker event alerts when fills, rejections, or confirmed cancellations appear in the local broker sync tables
@@ -266,6 +280,7 @@ The scheduler:
 - pushes notification alerts when live execution fails, including session, lookup, and broker submission errors
 - handles broker-side cancel/replace failures cleanly in the UI and pushes notifications for management failures without crashing Streamlit
 - supports configurable starting cash in DKK, shows live cash balance in the portfolio summary, and adjusts cash automatically as trades execute
+- persists latest portfolio quotes, resets the intraday baseline at `06:00` Europe/Copenhagen, and recalculates daily P/L from that baseline
 
 ### What One Scheduler Cycle Does
 
@@ -281,6 +296,13 @@ Each scheduler cycle does the following in order:
 8. Synchronizes broker order status for live orders.
 9. Dispatches due digests and broker alerts.
 10. Records cycle history and prunes old scheduler history rows.
+
+The scheduler process also runs a separate quote-refresh job for portfolio prices. By default:
+
+- the main decision cycle runs every `10` minutes
+- the quote-refresh cycle runs every `5` minutes
+
+That means price colors and daily P/L can update more frequently than decision generation.
 
 ### What `poll_interval_minutes: 10` Means
 
@@ -496,10 +518,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 33 validation script:
+Run the Phase 35 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase33.py
+.venv/bin/python scripts/validate_phase35.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -511,10 +533,10 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 33 validation passed.
-Starting cash DKK: 10000.00
-Cash after buy DKK: 9xxx.xx
-Insufficient-cash status: execution_failed
+Phase 34 validation passed.
+First baseline date: 2026-04-06
+MSTR daily pnl after move DKK: 3360.00
+Reset baseline date: 2026-04-07
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.

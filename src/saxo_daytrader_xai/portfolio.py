@@ -95,6 +95,16 @@ def _cash_effect_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _latest_price_state_by_symbol(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM portfolio_price_snapshots
+        """
+    ).fetchall()
+    return {row["symbol"]: dict(row) for row in rows}
+
+
 def fetch_cash_summary(connection: sqlite3.Connection, *, initial_cash_dkk: float = 0.0) -> dict[str, Any]:
     cash_from_trades = 0.0
     invalid_trade_ids: list[int] = []
@@ -119,6 +129,7 @@ def fetch_cash_summary(connection: sqlite3.Connection, *, initial_cash_dkk: floa
 
 def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initial_cash_dkk: float = 0.0) -> list[dict[str, Any]]:
     base_rows = _base_snapshot_rows(connection, batch_id)
+    latest_price_state = _latest_price_state_by_symbol(connection)
     states: dict[str, dict[str, Any]] = {}
     for row in base_rows:
         base_quantity = float(row["quantity"] or 0.0)
@@ -193,11 +204,26 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
         effective_quantity = float(state["quantity"] or 0.0)
         if effective_quantity <= 1e-9:
             continue
-        current_price_local = float(state["current_price_local"] or state["open_price_local"] or 0.0)
-        fx_rate = float(state["latest_fx_rate"] or 1.0)
+        price_state = latest_price_state.get(state["symbol"], {})
+        current_price_local = float(
+            price_state.get("current_price_local")
+            or state["current_price_local"]
+            or state["open_price_local"]
+            or 0.0
+        )
+        fx_rate = float(price_state.get("current_fx_rate_to_dkk") or state["latest_fx_rate"] or 1.0)
+        baseline_price_local = price_state.get("baseline_price_local")
+        baseline_fx_rate = price_state.get("baseline_fx_rate_to_dkk")
+        if baseline_price_local not in (None, "") and baseline_fx_rate not in (None, ""):
+            daily_pnl_dkk = effective_quantity * (
+                current_price_local * fx_rate
+                - float(baseline_price_local) * float(baseline_fx_rate)
+            )
+        else:
+            base_quantity = float(state.get("base_quantity") or 0.0)
+            quantity_scale = effective_quantity / base_quantity if base_quantity > 0 else 0.0
+            daily_pnl_dkk = float(state.get("base_daily_pnl_dkk") or 0.0) * quantity_scale
         effective_market_value_dkk = effective_quantity * current_price_local * fx_rate
-        base_quantity = float(state.get("base_quantity") or 0.0)
-        quantity_scale = effective_quantity / base_quantity if base_quantity > 0 else 0.0
         positions.append(
             {
                 **state,
@@ -205,7 +231,13 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
                 "market_value_local": effective_quantity * current_price_local,
                 "market_value_dkk": effective_market_value_dkk,
                 "unrealised_pnl_dkk": effective_market_value_dkk - float(state["cost_basis_dkk"] or 0.0),
-                "daily_pnl_dkk": float(state.get("base_daily_pnl_dkk") or 0.0) * quantity_scale,
+                "daily_pnl_dkk": daily_pnl_dkk,
+                "day_baseline_price_local": baseline_price_local,
+                "day_baseline_fx_rate_to_dkk": baseline_fx_rate,
+                "current_fx_rate_to_dkk": fx_rate,
+                "latest_quote_updated_at": price_state.get("updated_at"),
+                "baseline_session_date": price_state.get("baseline_session_date"),
+                "quote_status": price_state.get("status"),
             }
         )
 

@@ -81,9 +81,13 @@ def _summary_execution_stats(connection, config: dict[str, Any], start_date: dat
     return {row["status"]: row["count_rows"] for row in rows}
 
 
-def _summary_top_positions(connection) -> list[dict[str, Any]]:
+def _summary_top_positions(connection, config: dict[str, Any]) -> list[dict[str, Any]]:
     batch_id = fetch_latest_batch_id(connection)
-    positions = fetch_portfolio_positions(connection, batch_id=batch_id)
+    positions = fetch_portfolio_positions(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0),
+    )
     return positions[:5]
 
 
@@ -127,12 +131,13 @@ def build_summary(
     local_now = _notification_now(config, reference_time)
     start_date, end_date, summary_label = _period_descriptor(summary_kind, local_now, config)
     batch_id = fetch_latest_batch_id(connection)
-    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id)
+    initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
     tax_summary = fetch_realised_tax_summary(connection, tax_year=end_date.year)
     trade_stats = _summary_trade_stats(connection, config, start_date, end_date)
     execution_stats = _summary_execution_stats(connection, config, start_date, end_date)
     latest_report = fetch_latest_decision_report(connection)
-    top_positions = _summary_top_positions(connection)
+    top_positions = _summary_top_positions(connection, config)
 
     suggested_trade_count = 0
     if latest_report and latest_report.get("report_json"):
@@ -483,6 +488,8 @@ def fetch_notification_deliveries(connection, limit: int = 100) -> list[dict[str
 
 def _alert_severity(summary_kind: str) -> str:
     return {
+        "alert_execution_success": "medium",
+        "alert_execution_warning": "low",
         "alert_broker_fill": "medium",
         "alert_broker_reject": "high",
         "alert_broker_cancel": "low",
@@ -575,6 +582,8 @@ def _alerts_enabled(config: dict[str, Any]) -> bool:
     return any(
         bool(alerts_cfg.get(key, False))
         for key in (
+            "execution_success_enabled",
+            "execution_warning_enabled",
             "broker_fill_enabled",
             "broker_reject_enabled",
             "broker_cancel_enabled",
@@ -591,6 +600,97 @@ def _severity_rank(severity: str) -> int:
 def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     alerts_by_scope: dict[str, dict[str, Any]] = {}
+
+    if alerts_cfg.get("execution_success_enabled", False):
+        success_rows = connection.execute(
+            """
+            SELECT *
+            FROM execution_orders
+            WHERE status IN ('executed', 'submitted_to_broker')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in success_rows:
+            record = dict(row)
+            alert_key = f"execution_success:{record['id']}:{record['status']}"
+            scope_key = _alert_scope_key("alert_execution_success", record)
+            if scope_key in alerts_by_scope:
+                continue
+            quantity = record.get("quantity")
+            quantity_text = f"{float(quantity):.0f}" if quantity is not None else "n/a"
+            subject_prefix = "Trade executed" if record["status"] == "executed" else "Trade submitted to broker"
+            alerts_by_scope[scope_key] = {
+                "alert_key": alert_key,
+                "summary_kind": "alert_execution_success",
+                "severity": _alert_severity("alert_execution_success"),
+                "scope_key": scope_key,
+                "execution_order_id": record["id"],
+                "subject": f"{subject_prefix} for {record['symbol']}",
+                "message_text": "\n".join(
+                    [
+                        f"{subject_prefix} for {record['symbol']}",
+                        "",
+                        f"Execution order ID: {record['id']}",
+                        f"Mode: {record.get('mode') or 'n/a'}",
+                        f"Action: {record.get('action') or 'n/a'}",
+                        f"Quantity: {quantity_text}",
+                        f"Status: {record['status']}",
+                        f"Estimated value DKK: {float(record.get('estimated_value_dkk') or 0.0):.2f}",
+                        f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
+                    ]
+                ),
+                "payload": {
+                    "alert_type": "execution_success",
+                    "record": record,
+                },
+            }
+
+    if alerts_cfg.get("execution_warning_enabled", False):
+        warning_rows = connection.execute(
+            """
+            SELECT *
+            FROM execution_orders
+            WHERE status IN ('pending_approval', 'blocked_by_dry_run', 'invalid_quantity')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in warning_rows:
+            record = dict(row)
+            alert_key = f"execution_warning:{record['id']}:{record['status']}"
+            scope_key = _alert_scope_key("alert_execution_warning", record)
+            if scope_key in alerts_by_scope:
+                continue
+            quantity = record.get("quantity")
+            quantity_text = f"{float(quantity):.0f}" if quantity is not None else "n/a"
+            warning_reason = record.get("error_text") or record["status"]
+            alerts_by_scope[scope_key] = {
+                "alert_key": alert_key,
+                "summary_kind": "alert_execution_warning",
+                "severity": _alert_severity("alert_execution_warning"),
+                "scope_key": scope_key,
+                "execution_order_id": record["id"],
+                "subject": f"Execution warning for {record['symbol']}",
+                "message_text": "\n".join(
+                    [
+                        f"Execution warning for {record['symbol']}",
+                        "",
+                        f"Execution order ID: {record['id']}",
+                        f"Mode: {record.get('mode') or 'n/a'}",
+                        f"Action: {record.get('action') or 'n/a'}",
+                        f"Quantity: {quantity_text}",
+                        f"Status: {record['status']}",
+                        f"Warning: {warning_reason}",
+                    ]
+                ),
+                "payload": {
+                    "alert_type": "execution_warning",
+                    "record": record,
+                },
+            }
 
     if alerts_cfg.get("execution_failure_enabled", False):
         failure_rows = connection.execute(

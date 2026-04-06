@@ -34,6 +34,12 @@ market_data:
       - name: Federal Reserve Press
         url: https://www.federalreserve.gov/feeds/press_all.xml
 
+price_monitor:
+  enabled: true
+  poll_interval_minutes: 5
+  reset_hour_local: 6
+  timezone: Europe/Copenhagen
+
 analysis_windows:
   offset_minutes_after_open: 60
   duration_minutes: 45
@@ -148,6 +154,8 @@ notifications:
     from_address: ENV:SMTP_FROM_ADDRESS
     to_addresses_csv: ENV:SMTP_TO_ADDRESSES
   alerts:
+    execution_success_enabled: true
+    execution_warning_enabled: true
     broker_fill_enabled: false
     broker_reject_enabled: false
     broker_cancel_enabled: false
@@ -168,6 +176,8 @@ notifications:
     monthly: {}
     quarterly: {}
     ytd: {}
+    alert_execution_success: {}
+    alert_execution_warning: {}
     alert_broker_fill: {}
     alert_broker_reject: {}
     alert_broker_cancel: {}

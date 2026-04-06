@@ -4,6 +4,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -83,6 +84,22 @@ def _format_qty(value: float | None) -> str:
     return f"{float(value):.4f}"
 
 
+def _signed_color(value: float | None) -> str:
+    if value is None:
+        return ""
+    if float(value) > 0:
+        return "color: #0a7f39; font-weight: 600;"
+    if float(value) < 0:
+        return "color: #b42318; font-weight: 600;"
+    return ""
+
+
+def _sent_alert_count(alert_result: dict | None) -> int:
+    if not isinstance(alert_result, dict):
+        return 0
+    return sum(1 for row in alert_result.get("sent", []) if row.get("status") == "sent")
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_watchlists(config_path: str) -> dict:
     return build_watchlists(load_config(config_path))
@@ -138,7 +155,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 28 dashboard with autonomous simulation support, live broker workflow, scheduler controls, route-aware notifications, scheduler cycle history, stale-worker detection, automatic history retention, and invalid simulation trade repair.")
+st.caption("Phase 34 dashboard with autonomous simulation support, live broker workflow, quote-aware daily P/L tracking, scheduler controls, route-aware notifications, scheduler cycle history, stale-worker detection, automatic history retention, and invalid simulation trade repair.")
 
 autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
     config.get("scheduler", {}).get("enabled", True)
@@ -174,13 +191,17 @@ tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution,
 with tab_portfolio:
     st.subheader("Portfolio Snapshot")
     cash_col1, cash_col2, cash_col3, cash_col4 = st.columns(4)
-    cash_col1.metric("Daily P/L", _format_dkk(summary["total_daily_pnl_dkk"]))
+    daily_delta = summary["total_daily_pnl_dkk"]
+    cash_col1.metric("Daily P/L Since 06:00", _format_dkk(daily_delta), delta=f"{daily_delta:+,.2f} DKK")
     cash_col2.metric("Latest Batch", batch_id or "No imports yet")
     cash_col3.metric("Initial Cash", _format_dkk(summary["initial_cash_dkk"]))
     cash_col4.metric("Cash From Trades", _format_dkk(summary["cash_from_trades_dkk"]))
+    baseline_session_date = next((row.get("baseline_session_date") for row in positions if row.get("baseline_session_date")), None)
+    if baseline_session_date:
+        st.caption(f"Intraday baseline session: {baseline_session_date} at 06:00 Europe/Copenhagen.")
 
     if positions:
-        st.dataframe(
+        position_df = pd.DataFrame(
             [
                 {
                     "Symbol": row["symbol"],
@@ -190,20 +211,34 @@ with tab_portfolio:
                     "Currency": row["currency"],
                     "Open Price": row["open_price_local"],
                     "Current Price": row["current_price_local"],
-                    "Cost Basis DKK": _format_dkk(row["cost_basis_dkk"]),
-                    "Market Value DKK": _format_dkk(row["market_value_dkk"]),
-                    "Unrealised P/L DKK": _format_dkk(row["unrealised_pnl_dkk"]),
-                    "Daily P/L DKK": _format_dkk(row["daily_pnl_dkk"]),
-                    "Allocation": _format_pct(row["allocation_pct"]),
+                    "Cost Basis DKK": row["cost_basis_dkk"],
+                    "Market Value DKK": row["market_value_dkk"],
+                    "Unrealised P/L DKK": row["unrealised_pnl_dkk"],
+                    "Daily P/L DKK": row["daily_pnl_dkk"],
+                    "Allocation": row["allocation_pct"],
                     "Asset Class": row["asset_class"],
                     "Market": row["market_status"],
                     "Value Date": row["value_date"],
                 }
                 for row in positions
-            ],
-            width="stretch",
-            hide_index=True,
+            ]
         )
+        styled_positions = (
+            position_df.style.format(
+                {
+                    "Qty": lambda value: _format_qty(value),
+                    "Open Price": lambda value: _format_money(value),
+                    "Current Price": lambda value: _format_money(value),
+                    "Cost Basis DKK": lambda value: _format_dkk(value),
+                    "Market Value DKK": lambda value: _format_dkk(value),
+                    "Unrealised P/L DKK": lambda value: _format_dkk(value),
+                    "Daily P/L DKK": lambda value: _format_dkk(value),
+                    "Allocation": lambda value: _format_pct(value),
+                }
+            )
+            .map(_signed_color, subset=["Daily P/L DKK", "Unrealised P/L DKK"])
+        )
+        st.dataframe(styled_positions, width="stretch", hide_index=True)
     else:
         st.warning("No portfolio positions are available in the database yet.")
 
@@ -443,21 +478,30 @@ with tab_decision:
     if button_col1.button("Run Decision Now", type="primary"):
         with st.spinner("Calling xAI decision engine..."):
             result = generate_decision_report(config=config, connection=connection)
-            queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
             latest_decision_report = fetch_latest_decision_report(connection)
-        st.success(f"Decision report status: {result['status']}")
+        st.success(
+            f"Decision report status: {result['status']} | "
+            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+        )
         st.rerun()
     if button_col2.button("Run Mock Decision"):
         with st.spinner("Generating mock decision report..."):
             result = generate_decision_report(config=config, connection=connection, force_mock=True)
-            queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
             latest_decision_report = fetch_latest_decision_report(connection)
-        st.info(f"Mock decision report status: {result['status']}")
+        st.info(
+            f"Mock decision report status: {result['status']} | "
+            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+        )
         st.rerun()
     if button_col3.button("Queue Latest Suggestions"):
         with st.spinner("Queuing latest report suggestions..."):
             queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
-        st.info(f"Queue result: {queue_result['status']}")
+        st.info(
+            f"Queue result: {queue_result['status']} | "
+            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+        )
         st.rerun()
 
     if latest_decision_report:
@@ -543,7 +587,10 @@ with tab_execution:
     if action_col1.button("Run Queue Processor"):
         with st.spinner("Processing queued execution orders..."):
             queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
-        st.success(f"Queue processor status: {queue_result['status']}")
+        st.success(
+            f"Queue processor status: {queue_result['status']} | "
+            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+        )
         st.rerun()
 
     if action_col2.button("Export Audit Bundle"):
@@ -736,13 +783,15 @@ with tab_notifications:
     notif_col4.metric("Quarterly Enabled", "Yes" if config["notifications"].get("quarterly_summary_enabled") else "No")
     notif_col5.metric("YTD Enabled", "Yes" if config["notifications"].get("ytd_summary_enabled") else "No")
 
-    alert_col1, alert_col2, alert_col3, alert_col4, alert_col5 = st.columns(5)
+    alert_col1, alert_col2, alert_col3, alert_col4, alert_col5, alert_col6, alert_col7 = st.columns(7)
     alerts_cfg = config["notifications"].get("alerts", {})
-    alert_col1.metric("Fill Alerts", "Yes" if alerts_cfg.get("broker_fill_enabled") else "No")
-    alert_col2.metric("Reject Alerts", "Yes" if alerts_cfg.get("broker_reject_enabled") else "No")
-    alert_col3.metric("Cancel Alerts", "Yes" if alerts_cfg.get("broker_cancel_enabled") else "No")
-    alert_col4.metric("Execution Failure Alerts", "Yes" if alerts_cfg.get("execution_failure_enabled") else "No")
-    alert_col5.metric("Mgmt Failure Alerts", "Yes" if alerts_cfg.get("broker_management_failure_enabled") else "No")
+    alert_col1.metric("Exec Success Alerts", "Yes" if alerts_cfg.get("execution_success_enabled") else "No")
+    alert_col2.metric("Exec Warning Alerts", "Yes" if alerts_cfg.get("execution_warning_enabled") else "No")
+    alert_col3.metric("Fill Alerts", "Yes" if alerts_cfg.get("broker_fill_enabled") else "No")
+    alert_col4.metric("Reject Alerts", "Yes" if alerts_cfg.get("broker_reject_enabled") else "No")
+    alert_col5.metric("Cancel Alerts", "Yes" if alerts_cfg.get("broker_cancel_enabled") else "No")
+    alert_col6.metric("Execution Failure Alerts", "Yes" if alerts_cfg.get("execution_failure_enabled") else "No")
+    alert_col7.metric("Mgmt Failure Alerts", "Yes" if alerts_cfg.get("broker_management_failure_enabled") else "No")
 
     suppression_cfg = config["notifications"].get("alert_suppression", {})
     suppress_col1, suppress_col2, suppress_col3, suppress_col4 = st.columns(4)
