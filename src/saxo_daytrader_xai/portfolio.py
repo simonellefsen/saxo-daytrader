@@ -4,6 +4,22 @@ import sqlite3
 from typing import Any
 
 
+ACTIVE_LEDGER_STATUSES = {"executed", "approved", "recorded"}
+
+
+def _normalize_asset_class(value: str | None) -> str:
+    text = (value or "").strip()
+    normalized = text.casefold()
+    mapping = {
+        "aktie": "Equity",
+        "aktier": "Equity",
+        "equity": "Equity",
+        "stock": "Equity",
+        "stocks": "Equity",
+    }
+    return mapping.get(normalized, text)
+
+
 def fetch_latest_batch_id(connection: sqlite3.Connection) -> str | None:
     row = connection.execute(
         "SELECT batch_id FROM import_batches ORDER BY imported_at DESC, rowid DESC LIMIT 1"
@@ -62,7 +78,46 @@ def _trade_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def _effective_positions(connection: sqlite3.Connection, batch_id: str) -> list[dict[str, Any]]:
+def _cash_effect_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            id,
+            created_at,
+            symbol,
+            side,
+            net_amount_dkk,
+            status
+        FROM trade_ledger
+        ORDER BY created_at, id
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def fetch_cash_summary(connection: sqlite3.Connection, *, initial_cash_dkk: float = 0.0) -> dict[str, Any]:
+    cash_from_trades = 0.0
+    invalid_trade_ids: list[int] = []
+    invalid_rows = {
+        int(row["id"]): row
+        for row in fetch_invalid_trade_ledger_rows(connection, limit=10_000)
+    }
+    for row in _cash_effect_rows(connection):
+        if row["status"] not in ACTIVE_LEDGER_STATUSES:
+            continue
+        if int(row["id"]) in invalid_rows:
+            invalid_trade_ids.append(int(row["id"]))
+            continue
+        cash_from_trades += float(row["net_amount_dkk"] or 0.0)
+    return {
+        "initial_cash_dkk": float(initial_cash_dkk or 0.0),
+        "cash_from_trades_dkk": cash_from_trades,
+        "cash_balance_dkk": float(initial_cash_dkk or 0.0) + cash_from_trades,
+        "ignored_invalid_trade_ids": invalid_trade_ids,
+    }
+
+
+def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initial_cash_dkk: float = 0.0) -> list[dict[str, Any]]:
     base_rows = _base_snapshot_rows(connection, batch_id)
     states: dict[str, dict[str, Any]] = {}
     for row in base_rows:
@@ -75,6 +130,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str) -> list[
         )
         states[row["symbol"]] = {
             **row,
+            "asset_class": _normalize_asset_class(row.get("asset_class")),
             "quantity": base_quantity,
             "cost_basis_dkk": float(row["cost_basis_dkk"] or 0.0),
             "current_price_local": current_price_local,
@@ -117,6 +173,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str) -> list[
         state["current_price_local"] = price_local or state["current_price_local"]
         state["latest_fx_rate"] = fx_rate or state["latest_fx_rate"]
         state["currency"] = trade["currency"] or state["currency"]
+        state["asset_class"] = _normalize_asset_class(state.get("asset_class") or "Equity")
 
         if trade["side"] == "BUY":
             state["quantity"] = float(state["quantity"]) + quantity
@@ -152,36 +209,61 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str) -> list[
             }
         )
 
-    total_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
+    invested_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
+    total_portfolio_value_dkk = invested_market_value_dkk + float(fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)["cash_balance_dkk"])
     for row in positions:
-        row["allocation_pct"] = (float(row["market_value_dkk"] or 0.0) / total_market_value_dkk) if total_market_value_dkk > 0 else 0.0
+        row["allocation_pct"] = (
+            float(row["market_value_dkk"] or 0.0) / total_portfolio_value_dkk
+            if total_portfolio_value_dkk > 0
+            else 0.0
+        )
     positions.sort(key=lambda row: (-(float(row["market_value_dkk"] or 0.0)), row["symbol"]))
     return positions
 
 
-def fetch_portfolio_positions(connection: sqlite3.Connection, batch_id: str | None = None) -> list[dict[str, Any]]:
+def fetch_portfolio_positions(
+    connection: sqlite3.Connection,
+    batch_id: str | None = None,
+    *,
+    initial_cash_dkk: float = 0.0,
+) -> list[dict[str, Any]]:
     batch_id = batch_id or fetch_latest_batch_id(connection)
     if not batch_id:
         return []
-    return _effective_positions(connection, batch_id)
+    return _effective_positions(connection, batch_id, initial_cash_dkk=initial_cash_dkk)
 
 
-def fetch_portfolio_summary(connection: sqlite3.Connection, batch_id: str | None = None) -> dict[str, Any]:
+def fetch_portfolio_summary(
+    connection: sqlite3.Connection,
+    batch_id: str | None = None,
+    *,
+    initial_cash_dkk: float = 0.0,
+) -> dict[str, Any]:
     batch_id = batch_id or fetch_latest_batch_id(connection)
     if not batch_id:
         return {
             "batch_id": None,
             "position_count": 0,
             "total_market_value_dkk": 0.0,
+            "invested_market_value_dkk": 0.0,
+            "cash_balance_dkk": float(initial_cash_dkk or 0.0),
+            "initial_cash_dkk": float(initial_cash_dkk or 0.0),
+            "cash_from_trades_dkk": 0.0,
             "total_cost_basis_dkk": 0.0,
             "total_unrealised_pnl_dkk": 0.0,
             "total_daily_pnl_dkk": 0.0,
         }
-    positions = _effective_positions(connection, batch_id)
+    positions = _effective_positions(connection, batch_id, initial_cash_dkk=initial_cash_dkk)
+    invested_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
+    cash_summary = fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)
     return {
         "batch_id": batch_id,
         "position_count": len(positions),
-        "total_market_value_dkk": sum(float(row["market_value_dkk"] or 0.0) for row in positions),
+        "total_market_value_dkk": invested_market_value_dkk + float(cash_summary["cash_balance_dkk"]),
+        "invested_market_value_dkk": invested_market_value_dkk,
+        "cash_balance_dkk": float(cash_summary["cash_balance_dkk"]),
+        "initial_cash_dkk": float(cash_summary["initial_cash_dkk"]),
+        "cash_from_trades_dkk": float(cash_summary["cash_from_trades_dkk"]),
         "total_cost_basis_dkk": sum(float(row["cost_basis_dkk"] or 0.0) for row in positions),
         "total_unrealised_pnl_dkk": sum(float(row["unrealised_pnl_dkk"] or 0.0) for row in positions),
         "total_daily_pnl_dkk": sum(float(row["daily_pnl_dkk"] or 0.0) for row in positions),
@@ -207,8 +289,14 @@ def _annotated_trade_ledger_rows(connection: sqlite3.Connection) -> list[dict[st
             gross_amount_dkk,
             commission_dkk,
             tax_dkk,
+            realised_gain_local,
             realised_gain_dkk,
+            price_gain_dkk,
+            fx_gain_dkk,
             cost_basis_sold_dkk,
+            cost_basis_sold_local,
+            sale_fx_rate_to_dkk,
+            cost_basis_fx_rate_to_dkk,
             net_amount_dkk,
             mode,
             status,

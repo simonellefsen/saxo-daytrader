@@ -6,9 +6,7 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
-import webbrowser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -18,14 +16,6 @@ if str(SRC) not in sys.path:
 
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.importer import sync_portfolio
-
-
-def _open_browser_later(port: int, delay_seconds: float = 1.5) -> None:
-    def opener() -> None:
-        time.sleep(delay_seconds)
-        webbrowser.open(f"http://127.0.0.1:{port}")
-
-    threading.Thread(target=opener, daemon=True).start()
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes] | None, *, sig: int) -> None:
@@ -117,9 +107,6 @@ def main() -> int:
 
     if args.sync_only:
         return 0
-
-    if not args.headless and not args.no_browser:
-        _open_browser_later(args.port)
 
     app_path = ROOT / "src" / "saxo_daytrader_xai" / "ui" / "app.py"
     dashboard_cmd = [

@@ -60,6 +60,19 @@ def _normalise_text(raw: str | None) -> str:
     return (raw or "").strip()
 
 
+def _normalise_asset_class(raw: str | None) -> str:
+    text = _normalise_text(raw)
+    normalized = text.casefold()
+    mapping = {
+        "aktie": "Equity",
+        "aktier": "Equity",
+        "equity": "Equity",
+        "stock": "Equity",
+        "stocks": "Equity",
+    }
+    return mapping.get(normalized, text)
+
+
 def _load_detail_rows(source_csv: Path) -> list[dict[str, str]]:
     with source_csv.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -86,7 +99,7 @@ def _build_snapshot_row(row: dict[str, str], source_csv: str, excluded_symbols: 
         "allocation_pct": _parse_float(row.get("% af portefølje"), decimal_style="en"),
         "status": _normalise_text(row.get("Status")),
         "account_name": _normalise_text(row.get("Konto")),
-        "asset_class": _normalise_text(row.get("Aktivtype") or row.get("Aktivklasse")),
+        "asset_class": _normalise_asset_class(row.get("Aktivtype") or row.get("Aktivklasse")),
         "market_status": _normalise_text(row.get("Markedsstatus")),
         "value_date": _normalise_text(row.get("Valørdato")),
         "source_csv": source_csv,

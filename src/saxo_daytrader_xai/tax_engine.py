@@ -260,6 +260,15 @@ def calculate_sell_outcome(
             - allocation_result["cost_basis_sold_dkk"]
             - commission_result["commission_dkk_total"]
         )
+        cost_basis_sold_local = float(allocation_result["cost_basis_sold_local"])
+        realised_gain_local = gross_local - cost_basis_sold_local
+        cost_basis_fx_rate_to_dkk = (
+            float(allocation_result["cost_basis_sold_dkk"]) / max(cost_basis_sold_local, 1e-9)
+            if cost_basis_sold_local > 0
+            else current_fx_rate
+        )
+        price_gain_dkk = realised_gain_local * current_fx_rate
+        fx_gain_dkk = cost_basis_sold_local * (current_fx_rate - cost_basis_fx_rate_to_dkk)
         effective_tax_year = int(tax_year or datetime.now(UTC).year)
         realised_share_income_before = _fetch_realised_share_income_ytd(resolved_connection, effective_tax_year)
         brackets = resolved_config["taxation"]["share_income"]["brackets"]
@@ -283,6 +292,12 @@ def calculate_sell_outcome(
                 "fx_conversion_DKK": commission_result["fx_conversion_dkk"],
             },
             "cost_basis_sold_DKK": allocation_result["cost_basis_sold_dkk"],
+            "cost_basis_sold_local": cost_basis_sold_local,
+            "cost_basis_fx_rate_to_dkk": cost_basis_fx_rate_to_dkk,
+            "sale_fx_rate_to_dkk": current_fx_rate,
+            "realised_gain_local": realised_gain_local,
+            "price_gain_dkk": price_gain_dkk,
+            "fx_gain_dkk": fx_gain_dkk,
             "realised_gain_DKK": realised_gain_dkk,
             "tax_DKK": tax_dkk,
             "net_DKK": net_dkk,
@@ -308,16 +323,10 @@ def update_ledger(
     try:
         created_at = datetime.now(UTC).isoformat(timespec="seconds")
         batch_id = trade_dict.get("batch_id") or fetch_latest_batch_id(resolved_connection)
+        initial_cash_dkk = float(resolved_config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
         portfolio_before = {
-            "summary": fetch_portfolio_summary(resolved_connection, batch_id=batch_id),
-            "positions": fetch_portfolio_positions(resolved_connection, batch_id=batch_id),
-        }
-        post_trade_summary = dict(portfolio_before["summary"])
-        post_trade_summary["total_market_value_dkk"] = float(post_trade_summary["total_market_value_dkk"]) - float(trade_dict["gross_DKK"])
-        post_trade_summary["total_cost_basis_dkk"] = float(post_trade_summary["total_cost_basis_dkk"]) - float(trade_dict["cost_basis_sold_DKK"])
-        post_trade_summary["total_unrealised_pnl_dkk"] = float(post_trade_summary["total_unrealised_pnl_dkk"]) - float(trade_dict["realised_gain_DKK"])
-        portfolio_after = {
-            "summary": post_trade_summary,
+            "summary": fetch_portfolio_summary(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+            "positions": fetch_portfolio_positions(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
         }
 
         cursor = resolved_connection.execute(
@@ -336,7 +345,13 @@ def update_ledger(
                 fx_conversion_dkk,
                 tax_dkk,
                 realised_gain_dkk,
+                realised_gain_local,
+                price_gain_dkk,
+                fx_gain_dkk,
                 cost_basis_sold_dkk,
+                cost_basis_sold_local,
+                sale_fx_rate_to_dkk,
+                cost_basis_fx_rate_to_dkk,
                 net_amount_dkk,
                 mode,
                 status,
@@ -346,7 +361,7 @@ def update_ledger(
                 decision_context_json,
                 tax_year,
                 batch_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
@@ -362,13 +377,19 @@ def update_ledger(
                 trade_dict["commission_breakdown"]["fx_conversion_DKK"],
                 trade_dict["tax_DKK"],
                 trade_dict["realised_gain_DKK"],
+                trade_dict.get("realised_gain_local", 0.0),
+                trade_dict.get("price_gain_dkk", 0.0),
+                trade_dict.get("fx_gain_dkk", 0.0),
                 trade_dict["cost_basis_sold_DKK"],
+                trade_dict.get("cost_basis_sold_local", 0.0),
+                trade_dict.get("sale_fx_rate_to_dkk"),
+                trade_dict.get("cost_basis_fx_rate_to_dkk"),
                 trade_dict["net_DKK"],
                 trade_dict.get("mode", "simulation"),
                 trade_dict.get("status", "recorded"),
                 trade_dict.get("notes", ""),
                 json.dumps(portfolio_before, ensure_ascii=False, sort_keys=True),
-                json.dumps(portfolio_after, ensure_ascii=False, sort_keys=True),
+                json.dumps({}, ensure_ascii=False, sort_keys=True),
                 json.dumps(trade_dict.get("decision_context", {}), ensure_ascii=False, sort_keys=True),
                 trade_dict["tax_year"],
                 batch_id,
@@ -406,6 +427,15 @@ def update_ledger(
                 )
                 for allocation in trade_dict["lot_allocations"]
             ],
+        )
+        resolved_connection.commit()
+        portfolio_after = {
+            "summary": fetch_portfolio_summary(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+            "positions": fetch_portfolio_positions(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+        }
+        resolved_connection.execute(
+            "UPDATE trade_ledger SET portfolio_after_json = ? WHERE id = ?",
+            (json.dumps(portfolio_after, ensure_ascii=False, sort_keys=True), ledger_id),
         )
         resolved_connection.commit()
 

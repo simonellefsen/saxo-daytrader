@@ -109,8 +109,9 @@ connection = connect(database_path)
 init_db(connection)
 
 batch_id = fetch_latest_batch_id(connection)
-summary = fetch_portfolio_summary(connection, batch_id=batch_id)
-positions = fetch_portfolio_positions(connection, batch_id=batch_id)
+initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
 portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
 trade_ledger = fetch_trade_ledger(connection)
 tax_summary = fetch_realised_tax_summary(connection, tax_year=2026)
@@ -159,11 +160,12 @@ if analysis_summary["analysis_window_active"]:
 else:
     st.warning("Analysis window inactive right now.")
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Positions", summary["position_count"])
 col2.metric("Portfolio Value", _format_dkk(summary["total_market_value_dkk"]))
-col3.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
-col4.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
+col3.metric("Cash", _format_dkk(summary["cash_balance_dkk"]))
+col4.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
+col5.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
 
 tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution, tab_notifications = st.tabs(
     ["Portfolio", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
@@ -171,9 +173,11 @@ tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution,
 
 with tab_portfolio:
     st.subheader("Portfolio Snapshot")
-    col5, col6 = st.columns(2)
-    col5.metric("Daily P/L", _format_dkk(summary["total_daily_pnl_dkk"]))
-    col6.metric("Latest Batch", batch_id or "No imports yet")
+    cash_col1, cash_col2, cash_col3, cash_col4 = st.columns(4)
+    cash_col1.metric("Daily P/L", _format_dkk(summary["total_daily_pnl_dkk"]))
+    cash_col2.metric("Latest Batch", batch_id or "No imports yet")
+    cash_col3.metric("Initial Cash", _format_dkk(summary["initial_cash_dkk"]))
+    cash_col4.metric("Cash From Trades", _format_dkk(summary["cash_from_trades_dkk"]))
 
     if positions:
         st.dataframe(
@@ -228,7 +232,38 @@ with tab_portfolio:
         f"commission: {_format_dkk(tax_summary['commission_dkk'])}"
     )
     if trade_ledger:
-        st.dataframe(trade_ledger, width="stretch", hide_index=True)
+        st.dataframe(
+            [
+                {
+                    "ID": row["id"],
+                    "Created": row["created_at"],
+                    "Symbol": row["symbol"],
+                    "Side": row["side"],
+                    "Qty": _format_qty(row["quantity"]),
+                    "Price Local": row["price_local"],
+                    "Currency": row["currency"],
+                    "Gross DKK": _format_dkk(row["gross_amount_dkk"]),
+                    "Commission DKK": _format_dkk(row["commission_dkk"]),
+                    "Tax DKK": _format_dkk(row["tax_dkk"]),
+                    "Realised Gain Local": row.get("realised_gain_local"),
+                    "Price Gain DKK": _format_dkk(row.get("price_gain_dkk")),
+                    "FX Gain DKK": _format_dkk(row.get("fx_gain_dkk")),
+                    "Realised Gain DKK": _format_dkk(row["realised_gain_dkk"]),
+                    "Cost Basis Sold DKK": _format_dkk(row["cost_basis_sold_dkk"]),
+                    "Cost Basis Sold Local": row.get("cost_basis_sold_local"),
+                    "Sale FX": row.get("sale_fx_rate_to_dkk"),
+                    "Cost FX": row.get("cost_basis_fx_rate_to_dkk"),
+                    "Net DKK": _format_dkk(row["net_amount_dkk"]),
+                    "Mode": row["mode"],
+                    "Status": row["status"],
+                    "Notes": row["notes"],
+                    "Validation": row.get("validation_note", ""),
+                }
+                for row in trade_ledger
+            ],
+            width="stretch",
+            hide_index=True,
+        )
     else:
         st.caption("No trades recorded yet. Trade execution arrives in later phases.")
 
