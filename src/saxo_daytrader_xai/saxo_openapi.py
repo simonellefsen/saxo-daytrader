@@ -39,6 +39,23 @@ EXCHANGE_ID_MAP = {
     "xlse": "XLIS",
 }
 
+EXCHANGE_ALIASES = {
+    "xnas": {"XNAS", "NASDAQ"},
+    "xnys": {"XNYS", "NYSE"},
+    "xcse": {"XCSE", "CSE", "COP"},
+    "xsto": {"XSTO", "STO", "STK"},
+    "xosl": {"XOSL", "OSL", "OSE"},
+    "xhel": {"XHEL", "HEL", "HEX"},
+    "xlon": {"XLON", "LSE", "LON"},
+    "xetr": {"XETR", "XTRA", "ETR"},
+    "xfra": {"XFRA", "FSE", "FRA"},
+    "xmil": {"XMIL", "MIL"},
+    "xpar": {"XPAR", "PAR"},
+    "xams": {"XAMS", "AMS"},
+    "xbru": {"XBRU", "BRU"},
+    "xlse": {"XLIS", "LIS"},
+}
+
 
 class SaxoSessionError(RuntimeError):
     pass
@@ -189,17 +206,37 @@ def _symbol_parts(symbol: str) -> tuple[str, str]:
     return base.strip().upper(), exchange.strip().lower()
 
 
+def _symbol_with_suffix(symbol: str) -> str:
+    base_symbol, exchange_code = _symbol_parts(symbol)
+    return f"{base_symbol}:{exchange_code}" if exchange_code else base_symbol
+
+
+def _exchange_aliases(exchange_code: str) -> set[str]:
+    aliases = EXCHANGE_ALIASES.get(exchange_code, {exchange_code.upper()})
+    return {value.upper() for value in aliases if value}
+
+
+def _candidate_score(candidate: dict[str, Any], *, requested_symbol: str, base_symbol: str, exchange_code: str) -> tuple[int, int, int]:
+    candidate_symbol = str(candidate.get("Symbol", "")).strip().upper()
+    candidate_exchange = str(candidate.get("ExchangeId", "")).strip().upper()
+    aliases = _exchange_aliases(exchange_code)
+    exact_symbol = int(candidate_symbol == requested_symbol.upper())
+    exact_base = int(candidate_symbol.split(":", 1)[0] == base_symbol)
+    exchange_match = int(candidate_exchange in aliases or candidate_symbol.endswith(f":{exchange_code.upper()}"))
+    tradable_as = candidate.get("TradableAs", []) or []
+    stock_preferred = int("Stock" in {str(value) for value in tradable_as})
+    return (exact_symbol, exchange_match, exact_base + stock_preferred)
+
+
 def lookup_instrument(symbol: str, config: dict[str, Any], session: dict[str, Any]) -> SaxoInstrument:
     base_symbol, exchange_code = _symbol_parts(symbol)
-    exchange_id = EXCHANGE_ID_MAP.get(exchange_code, exchange_code.upper())
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
     response = requests.get(
         f"{base_url}/ref/v1/instruments",
         params={
-            "$top": 20,
+            "$top": 50,
             "AccountKey": _account_key(config, session),
             "AssetTypes": ",".join(TRADABLE_ASSET_TYPES),
-            "ExchangeId": exchange_id,
             "IncludeNonTradable": "false",
             "Keywords": base_symbol,
         },
@@ -208,23 +245,29 @@ def lookup_instrument(symbol: str, config: dict[str, Any], session: dict[str, An
     )
     response.raise_for_status()
     candidates = response.json().get("Data", [])
-    exact_matches = [
-        item
-        for item in candidates
-        if str(item.get("Symbol", "")).upper() == base_symbol and str(item.get("ExchangeId", "")).upper() == exchange_id
-    ]
     selected = None
-    if exact_matches:
-        selected = exact_matches[0]
-    elif candidates:
-        selected = candidates[0]
+    if candidates:
+        requested_symbol = _symbol_with_suffix(symbol)
+        ranked = sorted(
+            candidates,
+            key=lambda item: _candidate_score(
+                item,
+                requested_symbol=requested_symbol,
+                base_symbol=base_symbol,
+                exchange_code=exchange_code,
+            ),
+            reverse=True,
+        )
+        best = ranked[0]
+        if _candidate_score(best, requested_symbol=requested_symbol, base_symbol=base_symbol, exchange_code=exchange_code) > (0, 0, 0):
+            selected = best
     if not selected:
         raise SaxoSessionError(f"No tradable Saxo instrument match found for {symbol}")
     return SaxoInstrument(
         symbol=symbol,
         uic=int(selected["Identifier"]),
         asset_type=str(selected["AssetType"]),
-        exchange_id=str(selected.get("ExchangeId", exchange_id)),
+        exchange_id=str(selected.get("ExchangeId", EXCHANGE_ID_MAP.get(exchange_code, exchange_code.upper()))),
         description=str(selected.get("Description", symbol)),
         tradable_as=[str(value) for value in selected.get("TradableAs", [])],
         currency_code=selected.get("CurrencyCode"),

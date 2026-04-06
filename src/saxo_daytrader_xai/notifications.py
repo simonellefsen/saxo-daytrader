@@ -487,6 +487,7 @@ def _alert_severity(summary_kind: str) -> str:
         "alert_broker_reject": "high",
         "alert_broker_cancel": "low",
         "alert_broker_grouped": "medium",
+        "alert_execution_failed": "high",
     }.get(summary_kind, "medium")
 
 
@@ -572,7 +573,7 @@ def _alerts_enabled(config: dict[str, Any]) -> bool:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     return any(
         bool(alerts_cfg.get(key, False))
-        for key in ("broker_fill_enabled", "broker_reject_enabled", "broker_cancel_enabled")
+        for key in ("broker_fill_enabled", "broker_reject_enabled", "broker_cancel_enabled", "execution_failure_enabled")
     )
 
 
@@ -583,6 +584,51 @@ def _severity_rank(severity: str) -> int:
 def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     alerts_by_scope: dict[str, dict[str, Any]] = {}
+
+    if alerts_cfg.get("execution_failure_enabled", False):
+        failure_rows = connection.execute(
+            """
+            SELECT *
+            FROM execution_orders
+            WHERE status = 'execution_failed'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in failure_rows:
+            record = dict(row)
+            alert_key = f"execution_failed:{record['id']}"
+            scope_key = _alert_scope_key("alert_execution_failed", record)
+            if scope_key in alerts_by_scope:
+                continue
+            error_text = record.get("error_text") or "Unknown execution error"
+            quantity = record.get("quantity")
+            quantity_text = f"{float(quantity):.0f}" if quantity is not None else "n/a"
+            alerts_by_scope[scope_key] = {
+                "alert_key": alert_key,
+                "summary_kind": "alert_execution_failed",
+                "severity": _alert_severity("alert_execution_failed"),
+                "scope_key": scope_key,
+                "execution_order_id": record["id"],
+                "subject": f"Execution failed for {record['symbol']}",
+                "message_text": "\n".join(
+                    [
+                        f"Execution failed for {record['symbol']}",
+                        "",
+                        f"Execution order ID: {record['id']}",
+                        f"Mode: {record.get('mode') or 'n/a'}",
+                        f"Action: {record.get('action') or 'n/a'}",
+                        f"Quantity: {quantity_text}",
+                        f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
+                        f"Error: {error_text}",
+                    ]
+                ),
+                "payload": {
+                    "alert_type": "execution_failed",
+                    "record": record,
+                },
+            }
 
     if alerts_cfg.get("broker_fill_enabled", False):
         fill_rows = connection.execute(

@@ -1,7 +1,7 @@
 app:
   project_name: saxo-daytrader-xai
   environment: local
-  dry_run: true
+  dry_run: false
   simulation_mode: true
   launch_scheduler_with_dashboard: true
   scheduler_restart_on_failure: true
@@ -48,10 +48,12 @@ scheduler:
   history_retention_days: 30
 
 execution:
-  mode: simulation
+  #mode: simulation
+  mode: live
   adapter: saxo
   auto_execute_simulation: true
-  require_approval_live: true
+  #require_approval_live: true
+  require_approval_live: false
   min_trade_value_dkk: 500
   max_daily_orders: 6
 
@@ -148,6 +150,7 @@ notifications:
     broker_fill_enabled: false
     broker_reject_enabled: false
     broker_cancel_enabled: false
+    execution_failure_enabled: true
   alert_suppression:
     enabled: true
     low_cooldown_minutes: 240
@@ -167,3 +170,4 @@ notifications:
     alert_broker_reject: {}
     alert_broker_cancel: {}
     alert_broker_grouped: {}
+    alert_execution_failed: {}

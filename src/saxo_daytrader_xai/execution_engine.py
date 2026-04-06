@@ -156,6 +156,15 @@ def _whole_share_quantity(quantity: float) -> int:
     return max(int(math.floor(float(quantity))), 0)
 
 
+def _dispatch_execution_failure_alerts(connection, config: dict[str, Any]) -> None:
+    try:
+        from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due
+
+        dispatch_broker_alerts_if_due(connection, config, force=False)
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
     existing = connection.execute(
         "SELECT * FROM execution_orders WHERE report_id = ? ORDER BY id",
@@ -1003,6 +1012,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                     ),
                 )
                 resolved_connection.commit()
+                _dispatch_execution_failure_alerts(resolved_connection, resolved_config)
                 return {"status": "execution_failed", "order_id": order_id, "error": error_text}
             try:
                 session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
@@ -1068,6 +1078,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                     "execution_order_failed",
                     {"order_id": order_id, "mode": order["mode"], "adapter": order["adapter"], "error": error_text},
                 )
+                _dispatch_execution_failure_alerts(resolved_connection, resolved_config)
                 return {"status": "execution_failed", "order_id": order_id, "error": error_text}
 
         batch_id = fetch_latest_batch_id(resolved_connection)

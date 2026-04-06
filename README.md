@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 29 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 31 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -133,6 +133,8 @@ The scheduler:
 - prunes old scheduler cycle-history rows automatically according to `scheduler.history_max_rows` and `scheduler.history_retention_days`
 - flags impossible simulation trades in the Execution tab and can quarantine them from the effective portfolio state
 - normalizes order quantities to whole shares before queueing, simulation execution, and Saxo order submission
+- resolves Saxo instruments by Saxo's own symbol and exchange aliases, so `SBUX:xnas` and `MU:xnas` map correctly during broker submission
+- pushes notification alerts when live execution fails, including session, lookup, and broker submission errors
 
 ## Deployment
 
@@ -289,10 +291,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 29 validation script:
+Run the Phase 31 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase29.py
+.venv/bin/python scripts/validate_phase31.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -304,10 +306,9 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 29 validation passed.
-Queued whole-share orders: 2
-Live payload amounts: [3, 3]
-Stored live quantity: 3
+Phase 31 validation passed.
+Execution failure alerts sent: 1
+Slack success payloads: 1
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
