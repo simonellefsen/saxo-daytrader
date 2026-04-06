@@ -12,6 +12,7 @@ import requests
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
+from saxo_daytrader_xai.identifier_lookup import resolve_instrument_identity
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.saxo_openapi import (
     SaxoOrderNotFoundError,
@@ -415,6 +416,7 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     gross_dkk = gross_local * fx_rate
     commission = _calculate_buy_commission(order["symbol"], gross_local, gross_dkk, currency, fx_rate, config)
     total_spend_dkk = gross_dkk + commission["commission_dkk"]
+    identity = resolve_instrument_identity(order["symbol"], currency=currency, config=config)
     available_cash_dkk = float(portfolio_before["summary"]["cash_balance_dkk"])
     if total_spend_dkk > available_cash_dkk + 1e-9:
         raise ValueError(
@@ -424,16 +426,18 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     cursor = connection.execute(
         """
         INSERT INTO trade_ledger (
-            created_at, symbol, isin, side, quantity, price_local, currency,
+            created_at, symbol, isin, figi, instrument_name, side, quantity, price_local, currency,
             gross_amount_dkk, commission_dkk, commission_local, fx_conversion_dkk, tax_dkk,
             realised_gain_dkk, cost_basis_sold_dkk, net_amount_dkk, mode, status, notes,
             portfolio_before_json, portfolio_after_json, decision_context_json, tax_year, batch_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             created_at,
             order["symbol"],
-            None,
+            identity.isin,
+            identity.figi,
+            identity.instrument_name,
             "BUY",
             quantity,
             price_local,
@@ -461,10 +465,10 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     connection.execute(
         """
         INSERT INTO position_lots (
-            lot_id, batch_id, created_at, acquired_at, symbol, isin, instrument_name,
+            lot_id, batch_id, created_at, acquired_at, symbol, isin, figi, instrument_name,
             quantity_original, currency, cost_basis_total_local, cost_basis_total_dkk,
             fx_rate_to_dkk, source_type, source_reference, raw_payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             lot_id,
@@ -472,8 +476,9 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
             created_at,
             created_at,
             order["symbol"],
-            None,
-            order["symbol"],
+            identity.isin,
+            identity.figi,
+            identity.instrument_name,
             quantity,
             currency,
             gross_local + commission["commission_local"],
@@ -481,7 +486,16 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
             fx_rate,
             f"{order['mode']}_buy",
             f"execution_order:{order['id']}",
-            order["request_json"],
+            json.dumps(
+                {
+                    "request": json.loads(order["request_json"]) if order.get("request_json") else {},
+                    "identity_source": identity.source,
+                    "figi": identity.figi,
+                    "isin": identity.isin,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
         ),
     )
     connection.commit()

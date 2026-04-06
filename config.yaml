@@ -126,6 +126,12 @@ tradingview:
   encrypted_password: ENV:TRADINGVIEW_PASSWORD
   totp_secret: ENV:TRADINGVIEW_TOTP_SECRET
 
+openfigi:
+  enabled: true
+  api_key: ENV:OPENFIGI_API_KEY
+  base_url: https://api.openfigi.com/v3
+  timeout_seconds: 10
+
 notifications:
   daily_summary_enabled: false
   weekly_summary_enabled: false

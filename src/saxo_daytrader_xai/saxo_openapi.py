@@ -70,6 +70,7 @@ class SaxoInstrument:
     description: str
     tradable_as: list[str]
     currency_code: str | None
+    isin_code: str | None
 
 
 class SaxoOrderNotFoundError(SaxoSessionError):
@@ -330,6 +331,10 @@ def lookup_instrument(symbol: str, config: dict[str, Any], session: dict[str, An
         description=str(selected.get("Description", symbol)),
         tradable_as=[str(value) for value in selected.get("TradableAs", [])],
         currency_code=selected.get("CurrencyCode"),
+        isin_code=(
+            selected.get("IsinCode")
+            or (selected.get("DisplayAndFormat", {}) or {}).get("IsinCode")
+        ),
     )
 
 

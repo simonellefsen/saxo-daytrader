@@ -3,6 +3,7 @@ __all__ = [
     "db",
     "execution_engine",
     "fx_service",
+    "identifier_lookup",
     "importer",
     "market_data",
     "market_news",

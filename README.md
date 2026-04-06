@@ -210,6 +210,15 @@ Example: with `offset_minutes_after_open: 60` and `duration_minutes: 45`, a mark
 - `encrypted_password`: TradingView password secret.
 - `totp_secret`: TOTP secret for 2FA automation.
 
+### `openfigi`
+
+- `enabled`: enables OpenFIGI fallback lookups when adding new assets that are not part of the imported Saxo CSV baseline.
+- `api_key`: optional OpenFIGI API key from `.env`. Without a key, OpenFIGI still works but with lower rate limits.
+- `base_url`: OpenFIGI API base URL.
+- `timeout_seconds`: HTTP timeout for OpenFIGI mapping requests.
+
+Important limitation: OpenFIGI's official mapping response returns FIGI metadata such as `figi`, `ticker`, `name`, `shareClassFIGI`, and `compositeFIGI`, but it does not return ISIN. In this project, Saxo metadata is therefore used first for ISIN enrichment, and OpenFIGI is used as a fallback to improve instrument naming and capture FIGI when Saxo metadata is unavailable.
+
 ### `notifications`
 
 - `daily_summary_enabled`, `weekly_summary_enabled`, `monthly_summary_enabled`, `quarterly_summary_enabled`, `ytd_summary_enabled`: enable the corresponding digest types.

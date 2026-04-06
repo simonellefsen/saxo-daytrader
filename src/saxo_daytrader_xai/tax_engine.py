@@ -280,6 +280,7 @@ def calculate_sell_outcome(
         return {
             "symbol": symbol,
             "isin": snapshot["isin"],
+            "instrument_name": snapshot.get("instrument_name"),
             "currency": currency,
             "qty_to_sell": qty_to_sell,
             "current_price": current_price,
@@ -335,6 +336,7 @@ def update_ledger(
                 created_at,
                 symbol,
                 isin,
+                instrument_name,
                 side,
                 quantity,
                 price_local,
@@ -361,12 +363,13 @@ def update_ledger(
                 decision_context_json,
                 tax_year,
                 batch_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
                 trade_dict["symbol"],
                 trade_dict.get("isin"),
+                trade_dict.get("instrument_name"),
                 "SELL",
                 trade_dict["qty_to_sell"],
                 trade_dict["current_price"],

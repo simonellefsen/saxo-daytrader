@@ -64,6 +64,9 @@ def _trade_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
         SELECT
             created_at,
             symbol,
+            instrument_name,
+            isin,
+            figi,
             side,
             quantity,
             price_local,
@@ -160,9 +163,10 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
         state = states.setdefault(
             symbol,
             {
-                "instrument_name": symbol,
+                "instrument_name": trade.get("instrument_name") or symbol,
                 "symbol": symbol,
-                "isin": None,
+                "isin": trade.get("isin"),
+                "figi": trade.get("figi"),
                 "quantity": 0.0,
                 "currency": trade["currency"],
                 "open_price_local": price_local,
@@ -186,6 +190,12 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
         state["latest_fx_rate"] = fx_rate or state["latest_fx_rate"]
         state["currency"] = trade["currency"] or state["currency"]
         state["asset_class"] = _normalize_asset_class(state.get("asset_class") or "Equity")
+        if trade.get("instrument_name"):
+            state["instrument_name"] = trade["instrument_name"]
+        if trade.get("isin"):
+            state["isin"] = trade["isin"]
+        if trade.get("figi"):
+            state["figi"] = trade["figi"]
 
         if trade["side"] == "BUY":
             state["quantity"] = float(state["quantity"]) + quantity

@@ -66,6 +66,7 @@ def init_db(connection: sqlite3.Connection) -> None:
             acquired_at TEXT,
             symbol TEXT NOT NULL,
             isin TEXT,
+            figi TEXT,
             instrument_name TEXT NOT NULL,
             quantity_original REAL NOT NULL,
             currency TEXT NOT NULL,
@@ -86,6 +87,8 @@ def init_db(connection: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             symbol TEXT NOT NULL,
             isin TEXT,
+            figi TEXT,
+            instrument_name TEXT,
             side TEXT NOT NULL,
             quantity REAL NOT NULL,
             price_local REAL NOT NULL,
@@ -318,6 +321,8 @@ def init_db(connection: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(connection, "trade_ledger", "commission_local", "REAL")
+    _ensure_column(connection, "trade_ledger", "figi", "TEXT")
+    _ensure_column(connection, "trade_ledger", "instrument_name", "TEXT")
     _ensure_column(connection, "trade_ledger", "fx_conversion_dkk", "REAL NOT NULL DEFAULT 0")
     _ensure_column(connection, "trade_ledger", "realised_gain_dkk", "REAL NOT NULL DEFAULT 0")
     _ensure_column(connection, "trade_ledger", "cost_basis_sold_dkk", "REAL NOT NULL DEFAULT 0")
@@ -329,6 +334,7 @@ def init_db(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "trade_ledger", "cost_basis_fx_rate_to_dkk", "REAL")
     _ensure_column(connection, "trade_ledger", "tax_year", "INTEGER")
     _ensure_column(connection, "trade_ledger", "batch_id", "TEXT")
+    _ensure_column(connection, "position_lots", "figi", "TEXT")
     _ensure_column(connection, "execution_orders", "broker_order_id", "TEXT")
     _ensure_column(connection, "notification_deliveries", "summary_kind", "TEXT NOT NULL DEFAULT 'daily'")
     connection.commit()
