@@ -188,7 +188,7 @@ def fetch_portfolio_summary(connection: sqlite3.Connection, batch_id: str | None
     }
 
 
-def fetch_trade_ledger(connection: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+def _annotated_trade_ledger_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
     batch_id = fetch_latest_batch_id(connection)
     available_by_symbol = {
         row["symbol"]: float(row["quantity"] or 0.0)
@@ -235,7 +235,21 @@ def fetch_trade_ledger(connection: sqlite3.Connection, limit: int = 50) -> list[
         record["validation_note"] = validation_note
         annotated.append(record)
     annotated.reverse()
+    return annotated
+
+
+def fetch_trade_ledger(connection: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+    annotated = _annotated_trade_ledger_rows(connection)
     return annotated[:limit]
+
+
+def fetch_invalid_trade_ledger_rows(connection: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]:
+    invalid_rows = [
+        row
+        for row in _annotated_trade_ledger_rows(connection)
+        if row.get("validation_note") and row.get("status") in {"executed", "approved", "recorded"}
+    ]
+    return invalid_rows[:limit]
 
 
 def fetch_portfolio_symbols(connection: sqlite3.Connection, batch_id: str | None = None) -> list[str]:

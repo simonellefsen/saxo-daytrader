@@ -430,3 +430,37 @@ def fetch_scheduler_cycles(connection: sqlite3.Connection, limit: int = 20) -> l
         record["cycle_json"] = json.loads(record["cycle_json"]) if record.get("cycle_json") else None
         output.append(record)
     return output
+
+
+def prune_scheduler_cycles(
+    connection: sqlite3.Connection,
+    *,
+    keep_max_rows: int | None = None,
+    keep_since_started_at: str | None = None,
+) -> int:
+    deleted_rows = 0
+    if keep_since_started_at:
+        cursor = connection.execute(
+            """
+            DELETE FROM scheduler_cycle_history
+            WHERE started_at < ?
+            """,
+            (keep_since_started_at,),
+        )
+        deleted_rows += int(cursor.rowcount or 0)
+    if keep_max_rows is not None and keep_max_rows > 0:
+        cursor = connection.execute(
+            """
+            DELETE FROM scheduler_cycle_history
+            WHERE id NOT IN (
+                SELECT id
+                FROM scheduler_cycle_history
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            """,
+            (keep_max_rows,),
+        )
+        deleted_rows += int(cursor.rowcount or 0)
+    connection.commit()
+    return deleted_rows

@@ -241,9 +241,12 @@ def build_market_order_payload(
     session: dict[str, Any],
 ) -> dict[str, Any]:
     instrument = lookup_instrument(symbol, config, session)
+    whole_quantity = int(quantity)
+    if whole_quantity <= 0:
+        raise SaxoSessionError("Order quantity must be at least 1 whole share")
     return {
         "AccountKey": _account_key(config, session),
-        "Amount": quantity,
+        "Amount": whole_quantity,
         "AssetType": instrument.asset_type,
         "BuySell": "Buy" if action == "BUY" else "Sell",
         "ExternalReference": external_reference[:50],

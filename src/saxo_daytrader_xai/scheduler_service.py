@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import time
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import append_audit_log, connect, init_db, record_scheduler_cycle, update_scheduler_status
+from saxo_daytrader_xai.db import append_audit_log, connect, init_db, prune_scheduler_cycles, record_scheduler_cycle, update_scheduler_status
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
@@ -80,6 +80,28 @@ def assess_scheduler_worker_health(
         "pid_alive": pid_alive,
         "restart_recommended": False,
     }
+
+
+def _scheduler_history_policy(config: dict[str, Any]) -> dict[str, int]:
+    scheduler_cfg = config.get("scheduler", {})
+    return {
+        "history_max_rows": int(scheduler_cfg.get("history_max_rows", 250)),
+        "history_retention_days": int(scheduler_cfg.get("history_retention_days", 30)),
+    }
+
+
+def _prune_scheduler_history(connection, config: dict[str, Any]) -> int:
+    policy = _scheduler_history_policy(config)
+    keep_since_started_at = None
+    if policy["history_retention_days"] > 0:
+        keep_since_started_at = (
+            datetime.now(UTC) - timedelta(days=policy["history_retention_days"])
+        ).isoformat(timespec="seconds")
+    return prune_scheduler_cycles(
+        connection,
+        keep_max_rows=policy["history_max_rows"],
+        keep_since_started_at=keep_since_started_at,
+    )
 
 
 def run_scheduler_cycle(
@@ -165,6 +187,16 @@ def run_scheduler_cycle(
             broker_alerts_status=broker_alert_result.get("status"),
             cycle_json=outcome,
         )
+        pruned_rows = _prune_scheduler_history(resolved_connection, resolved_config)
+        if pruned_rows:
+            append_audit_log(
+                resolved_connection,
+                "scheduler_cycle_history_pruned",
+                {
+                    "deleted_rows": pruned_rows,
+                    **_scheduler_history_policy(resolved_config),
+                },
+            )
         append_audit_log(resolved_connection, "scheduler_cycle_completed", outcome)
         return outcome
     except Exception as exc:  # noqa: BLE001
@@ -193,6 +225,16 @@ def run_scheduler_cycle(
             broker_alerts_status=None,
             cycle_json=payload,
         )
+        pruned_rows = _prune_scheduler_history(resolved_connection, resolved_config)
+        if pruned_rows:
+            append_audit_log(
+                resolved_connection,
+                "scheduler_cycle_history_pruned",
+                {
+                    "deleted_rows": pruned_rows,
+                    **_scheduler_history_policy(resolved_config),
+                },
+            )
         append_audit_log(resolved_connection, "scheduler_cycle_failed", payload)
         return payload
     finally:

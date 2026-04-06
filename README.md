@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 26 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 29 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -47,6 +47,9 @@ Phase 26 foundation for a local Python day-trading assistant focused on a Danish
 - Route-profile formatting so subject prefixes, message preambles, and summary style can be shared across notification kinds
 - Immutable scheduler cycle history with recent-cycle visibility in the dashboard
 - Scheduler stale-worker detection with bounded auto-restart for launcher-managed autonomous mode
+- Configurable scheduler cycle-history retention by age and row count
+- Detection and repair of invalid legacy simulation trades that exceed available holdings
+- Whole-share execution enforcement so queued and submitted equity orders use integer quantities only
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -127,6 +130,9 @@ The scheduler:
 - records scheduler activity in `audit_log`
 - exposes dead/stale worker detection in the dashboard using heartbeat age plus stored scheduler PID
 - can be auto-restarted by `main.py` when launched in autonomous mode, using the configured restart budget in `app.scheduler_*`
+- prunes old scheduler cycle-history rows automatically according to `scheduler.history_max_rows` and `scheduler.history_retention_days`
+- flags impossible simulation trades in the Execution tab and can quarantine them from the effective portfolio state
+- normalizes order quantities to whole shares before queueing, simulation execution, and Saxo order submission
 
 ## Deployment
 
@@ -283,10 +289,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 26 validation script:
+Run the Phase 29 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase26.py
+.venv/bin/python scripts/validate_phase29.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -298,11 +304,10 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 26 validation passed.
-Healthy status: healthy
-Stale status: stale
-Dead status: dead
-Restart budget enabled: True
+Phase 29 validation passed.
+Queued whole-share orders: 2
+Live payload amounts: [3, 3]
+Stored live quantity: 3
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -336,6 +341,9 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase24.py
 .venv/bin/python scripts/validate_phase25.py
 .venv/bin/python scripts/validate_phase26.py
+.venv/bin/python scripts/validate_phase27.py
+.venv/bin/python scripts/validate_phase28.py
+.venv/bin/python scripts/validate_phase29.py
 ```
 
 ## Project layout
@@ -372,6 +380,9 @@ Earlier validation scripts remain available:
 │   └── validate_phase24.py
 │   └── validate_phase25.py
 │   └── validate_phase26.py
+│   └── validate_phase27.py
+│   └── validate_phase28.py
+│   └── validate_phase29.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -396,5 +407,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add pruning and retention settings for scheduler cycle history so the SQLite file stays bounded over long runtimes.
-2. Add a launcher-visible incident counter and cooldown so repeated scheduler crashes can be surfaced more clearly in the dashboard.
+1. Add a launcher-visible incident counter and cooldown so repeated scheduler crashes can be surfaced more clearly in the dashboard.
+2. Add a one-click dashboard action to prune scheduler history immediately using the current retention policy.

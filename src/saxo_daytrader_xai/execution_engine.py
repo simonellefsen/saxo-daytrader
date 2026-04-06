@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from saxo_daytrader_xai.saxo_openapi import (
 from saxo_daytrader_xai.market_symbols import saxo_to_yahoo
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
+    fetch_invalid_trade_ledger_rows,
     fetch_portfolio_positions,
     fetch_portfolio_summary,
 )
@@ -150,6 +152,10 @@ def _remaining_daily_order_capacity(connection, config: dict[str, Any]) -> int:
     return max(limit - int(used), 0)
 
 
+def _whole_share_quantity(quantity: float) -> int:
+    return max(int(math.floor(float(quantity))), 0)
+
+
 def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
     existing = connection.execute(
         "SELECT * FROM execution_orders WHERE report_id = ? ORDER BY id",
@@ -221,7 +227,9 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         quantity = abs(delta_value_dkk) / max(price_local * fx_rate, 1e-9)
         if action == "SELL":
             quantity = min(quantity, current_quantity)
-        if quantity <= 1e-9 or abs(delta_value_dkk) < min_trade_value_dkk:
+        whole_quantity = _whole_share_quantity(quantity)
+        estimated_value_dkk = whole_quantity * price_local * fx_rate
+        if whole_quantity <= 0 or estimated_value_dkk < min_trade_value_dkk:
             continue
 
         orders.append(
@@ -232,10 +240,10 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
                 "status": "pending_approval" if config["execution"]["mode"] == "live" else "pending_execution",
                 "adapter": config["execution"]["adapter"],
                 "requested_weight_pct": requested_weight_pct,
-                "quantity": quantity,
+                "quantity": float(whole_quantity),
                 "price_local": price_local,
                 "currency": currency,
-                "estimated_value_dkk": abs(delta_value_dkk),
+                "estimated_value_dkk": estimated_value_dkk,
                 "approval_required": 1 if config["execution"]["mode"] == "live" else 0,
                 "request_json": json.dumps(suggestion, ensure_ascii=False, sort_keys=True),
                 "execution_result_json": None,
@@ -285,7 +293,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
 def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any], batch_id: str) -> dict[str, Any]:
     created_at = datetime.now(UTC).isoformat(timespec="seconds")
     price_local = float(order["price_local"])
-    quantity = float(order["quantity"])
+    quantity = float(_whole_share_quantity(float(order["quantity"])))
     currency = order["currency"]
     fx_snapshot = fetch_ecb_fx_rates()
     fx_rate = fx_rate_to_dkk(currency, fx_snapshot)
@@ -937,6 +945,25 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
         if not order_row:
             raise ValueError(f"Unknown execution order {order_id}")
         order = dict(order_row)
+        normalized_quantity = _whole_share_quantity(float(order["quantity"]))
+        if normalized_quantity <= 0:
+            resolved_connection.execute(
+                """
+                UPDATE execution_orders
+                SET status = ?, error_text = ?
+                WHERE id = ?
+                """,
+                ("invalid_quantity", "Order quantity must be at least 1 whole share", order_id),
+            )
+            resolved_connection.commit()
+            return {"status": "invalid_quantity", "order_id": order_id}
+        if abs(float(order["quantity"]) - normalized_quantity) > 1e-9:
+            order["quantity"] = float(normalized_quantity)
+            resolved_connection.execute(
+                "UPDATE execution_orders SET quantity = ? WHERE id = ?",
+                (float(normalized_quantity), order_id),
+            )
+            resolved_connection.commit()
         if order["status"] not in {"pending_execution", "pending_approval"}:
             return {"status": order["status"], "order_id": order_id}
         if order["mode"] == "live" and order["approval_required"] and not approved:
@@ -982,7 +1009,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 payload = build_market_order_payload(
                     symbol=order["symbol"],
                     action=order["action"],
-                    quantity=float(order["quantity"]),
+                    quantity=float(_whole_share_quantity(float(order["quantity"]))),
                     external_reference=f"saxo-daytrader:{order_id}",
                     config=resolved_config,
                     session=session,
@@ -1137,12 +1164,17 @@ def manage_live_order(
             original_payload = _broker_payload(order)
             order_type = str(original_payload.get("OrderType") or "Market")
             effective_price = new_price if new_price is not None else _coerce_float(order.get("price_local"))
+            normalized_replace_quantity = _whole_share_quantity(
+                new_quantity if new_quantity is not None else float(order["quantity"])
+            )
+            if normalized_replace_quantity <= 0:
+                return {"status": "invalid_quantity", "order_id": order_id}
             if new_price is not None and order_type == "Market":
                 order_type = "Limit"
             patch_payload: dict[str, Any] = {
                 "AccountKey": original_payload.get("AccountKey") or resolved_config["saxo"]["account_key"] or session.get("account_key"),
                 "OrderId": broker_order_id,
-                "Amount": new_quantity if new_quantity is not None else float(order["quantity"]),
+                "Amount": float(normalized_replace_quantity),
                 "AssetType": original_payload.get("AssetType", "Stock"),
                 "OrderType": order_type,
             }
@@ -1172,7 +1204,7 @@ def manage_live_order(
             event_type=event_type,
             broker_status=new_status,
             broker_substatus="requested",
-            broker_quantity=new_quantity if management_action == "replace" else _coerce_float(order.get("quantity")),
+            broker_quantity=float(normalized_replace_quantity) if management_action == "replace" else _coerce_float(order.get("quantity")),
             broker_price_local=new_price if management_action == "replace" else _coerce_float(order.get("price_local")),
             payload=payload,
         )
@@ -1262,6 +1294,88 @@ def fetch_execution_events(connection, limit: int = 100) -> list[dict[str, Any]]
         (limit,),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def fetch_invalid_simulation_trades(connection, limit: int = 50) -> list[dict[str, Any]]:
+    rows = fetch_invalid_trade_ledger_rows(connection, limit=limit)
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        related_order = connection.execute(
+            """
+            SELECT id, status, error_text
+            FROM execution_orders
+            WHERE ledger_id = ?
+            LIMIT 1
+            """,
+            (row["id"],),
+        ).fetchone()
+        record = dict(row)
+        if related_order:
+            record["execution_order_id"] = related_order["id"]
+            record["execution_order_status"] = related_order["status"]
+            record["execution_order_error"] = related_order["error_text"]
+        else:
+            record["execution_order_id"] = None
+            record["execution_order_status"] = None
+            record["execution_order_error"] = None
+        output.append(record)
+    return output
+
+
+def repair_invalid_simulation_trades(*, connection, config: dict[str, Any] | None = None, limit: int = 50) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        invalid_rows = fetch_invalid_simulation_trades(resolved_connection, limit=limit)
+        repaired_ids: list[int] = []
+        repaired_order_ids: list[int] = []
+        for row in invalid_rows:
+            if row["mode"] != "simulation" or row["status"] != "executed":
+                continue
+            note = str(row.get("notes") or "")
+            appended_note = f"{note} | quarantined invalid simulation trade".strip(" |")
+            resolved_connection.execute(
+                """
+                UPDATE trade_ledger
+                SET status = ?, notes = ?
+                WHERE id = ?
+                """,
+                ("ignored_invalid_simulation", appended_note, row["id"]),
+            )
+            repaired_ids.append(int(row["id"]))
+            if row.get("execution_order_id") is not None:
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, error_text = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "invalid_repaired",
+                        row["validation_note"],
+                        int(row["execution_order_id"]),
+                    ),
+                )
+                repaired_order_ids.append(int(row["execution_order_id"]))
+            append_audit_log(
+                resolved_connection,
+                "invalid_simulation_trade_repaired",
+                {
+                    "ledger_id": int(row["id"]),
+                    "execution_order_id": row.get("execution_order_id"),
+                    "symbol": row["symbol"],
+                    "validation_note": row["validation_note"],
+                },
+            )
+        resolved_connection.commit()
+        return {
+            "status": "ok",
+            "invalid_found": len(invalid_rows),
+            "ledger_rows_repaired": repaired_ids,
+            "execution_orders_repaired": repaired_order_ids,
+        }
+    finally:
+        if should_close:
+            resolved_connection.close()
 
 
 def export_audit_bundle(output_dir: str, *, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:

@@ -19,8 +19,10 @@ from saxo_daytrader_xai.execution_engine import (
     fetch_execution_events,
     fetch_execution_fills,
     fetch_execution_orders,
+    fetch_invalid_simulation_trades,
     manage_live_order,
     queue_and_maybe_execute_latest_report,
+    repair_invalid_simulation_trades,
     sync_broker_order_statuses,
 )
 from saxo_daytrader_xai.market_data import fetch_live_prices
@@ -32,7 +34,11 @@ from saxo_daytrader_xai.notifications import (
     dispatch_summaries_if_due,
     fetch_notification_deliveries,
 )
-from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
+from saxo_daytrader_xai.scheduler_service import (
+    _scheduler_history_policy,
+    assess_scheduler_worker_health,
+    run_manual_scheduler_cycle,
+)
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -66,6 +72,15 @@ def _format_pct(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value * 100:.2f}%"
+
+
+def _format_qty(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    rounded = round(float(value))
+    if abs(float(value) - rounded) <= 1e-9:
+        return str(int(rounded))
+    return f"{float(value):.4f}"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -122,7 +137,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 26 dashboard with autonomous simulation support, live broker workflow, scheduler controls, route-aware notifications, scheduler cycle history, and stale-worker detection.")
+st.caption("Phase 28 dashboard with autonomous simulation support, live broker workflow, scheduler controls, route-aware notifications, scheduler cycle history, stale-worker detection, automatic history retention, and invalid simulation trade repair.")
 
 autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
     config.get("scheduler", {}).get("enabled", True)
@@ -298,6 +313,11 @@ with tab_market:
     st.caption(scheduler_health["message"])
     if scheduler_health.get("restart_recommended"):
         st.warning("Scheduler restart is recommended. If the app launched the scheduler child, it will auto-restart within the configured restart budget.")
+    history_policy = _scheduler_history_policy(config)
+    st.caption(
+        f"Scheduler history retention: keep last {history_policy['history_max_rows']} rows "
+        f"and {history_policy['history_retention_days']} days."
+    )
     if "manual_scheduler_result" in st.session_state:
         last_manual_result = st.session_state["manual_scheduler_result"]
         if last_manual_result.get("status") == "ok":
@@ -466,14 +486,16 @@ with tab_execution:
     execution_orders = fetch_execution_orders(connection, limit=100)
     execution_fills = fetch_execution_fills(connection, limit=100)
     execution_events = fetch_execution_events(connection, limit=100)
+    invalid_simulation_trades = fetch_invalid_simulation_trades(connection, limit=25)
     pending_approvals = [row for row in execution_orders if row["status"] == "pending_approval"]
     executed_orders = [row for row in execution_orders if row["status"] == "executed"]
 
-    mode_col1, mode_col2, mode_col3, mode_col4 = st.columns(4)
+    mode_col1, mode_col2, mode_col3, mode_col4, mode_col5 = st.columns(5)
     mode_col1.metric("Execution Mode", str(config["execution"]["mode"]).upper())
     mode_col2.metric("Queued Orders", len(execution_orders))
     mode_col3.metric("Pending Approval", len(pending_approvals))
     mode_col4.metric("Broker Events", len(execution_events))
+    mode_col5.metric("Invalid Sim Trades", len(invalid_simulation_trades))
 
     st.caption(
         f"Adapter={config['execution']['adapter']} | dry_run={config['app']['dry_run']} | "
@@ -482,7 +504,7 @@ with tab_execution:
     if config["execution"]["mode"] == "live":
         st.info("Approved live orders are submitted to Saxo and stored as broker submissions. They are not booked into the local trade ledger as executed fills yet.")
 
-    action_col1, action_col2, action_col3 = st.columns(3)
+    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     if action_col1.button("Run Queue Processor"):
         with st.spinner("Processing queued execution orders..."):
             queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
@@ -499,13 +521,42 @@ with tab_execution:
             sync_result = sync_broker_order_statuses(config=config, connection=connection)
         st.success(f"Broker sync updated {sync_result['updated']} orders")
         st.rerun()
+    if action_col4.button("Repair Invalid Simulation Trades"):
+        with st.spinner("Repairing invalid simulation trades..."):
+            repair_result = repair_invalid_simulation_trades(config=config, connection=connection)
+        st.success(
+            f"Repaired {len(repair_result['ledger_rows_repaired'])} ledger rows and "
+            f"{len(repair_result['execution_orders_repaired'])} execution orders"
+        )
+        st.rerun()
+
+    if invalid_simulation_trades:
+        st.markdown("**Invalid Simulation Trades**")
+        st.warning("These ledger rows exceed the available imported quantity and are ignored by the effective portfolio overlay until repaired.")
+        st.dataframe(
+            [
+                {
+                    "Ledger ID": row["id"],
+                    "Created": row["created_at"],
+                    "Symbol": row["symbol"],
+                    "Side": row["side"],
+                    "Quantity": row["quantity"],
+                    "Execution Order ID": row["execution_order_id"],
+                    "Execution Order Status": row["execution_order_status"] or "",
+                    "Validation": row["validation_note"],
+                }
+                for row in invalid_simulation_trades
+            ],
+            width="stretch",
+            hide_index=True,
+        )
 
     if config["execution"]["mode"] == "live" and pending_approvals:
         st.markdown("**Pending Live Approvals**")
         for order in pending_approvals:
             cols = st.columns([3, 2, 2, 2, 2])
             cols[0].write(f"{order['action']} {order['symbol']}")
-            cols[1].write(f"Qty {order['quantity']:.4f}")
+            cols[1].write(f"Qty {_format_qty(order['quantity'])}")
             cols[2].write(_format_money(order["price_local"], order["currency"]))
             cols[3].write(_format_dkk(order["estimated_value_dkk"]))
             if cols[4].button("Approve", key=f"approve-{order['id']}"):
@@ -579,7 +630,7 @@ with tab_execution:
                     "Status": row["status"],
                     "Adapter": row["adapter"],
                     "Target Weight": _format_pct(row["requested_weight_pct"]),
-                    "Quantity": row["quantity"],
+                    "Quantity": _format_qty(row["quantity"]),
                     "Price": _format_money(row["price_local"], row["currency"]),
                     "Estimated Value DKK": _format_dkk(row["estimated_value_dkk"]),
                     "Broker Order ID": row["broker_order_id"],
@@ -605,8 +656,8 @@ with tab_execution:
                     "Symbol": row["symbol"],
                     "Side": row["side"],
                     "Fill Status": row["fill_status"],
-                    "Cumulative Qty": row["cumulative_quantity"],
-                    "Delta Qty": row["delta_quantity"],
+                    "Cumulative Qty": _format_qty(row["cumulative_quantity"]),
+                    "Delta Qty": _format_qty(row["delta_quantity"]),
                     "Avg Price": _format_money(row["average_price_local"], row["currency"]),
                     "Ledger ID": row["ledger_id"],
                 }
@@ -630,7 +681,7 @@ with tab_execution:
                     "Event": row["event_type"],
                     "Broker Status": row["broker_status"],
                     "Broker Substatus": row["broker_substatus"],
-                    "Broker Qty": row["broker_quantity"],
+                    "Broker Qty": _format_qty(row["broker_quantity"]),
                     "Broker Price": row["broker_price_local"],
                 }
                 for row in execution_events

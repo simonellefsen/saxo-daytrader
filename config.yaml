@@ -44,6 +44,8 @@ scheduler:
   enabled: true
   poll_interval_minutes: 15
   startup_run: true
+  history_max_rows: 250
+  history_retention_days: 30
 
 execution:
   mode: simulation
