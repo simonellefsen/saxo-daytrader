@@ -116,6 +116,22 @@ def run_scheduler_cycle(
             resolved_connection.close()
 
 
+def run_manual_scheduler_cycle(
+    *,
+    config: dict[str, Any] | None = None,
+    config_path: str | Path = "config.yaml",
+    connection=None,
+    mock: bool = False,
+) -> dict[str, Any]:
+    return run_scheduler_cycle(
+        config=config,
+        config_path=config_path,
+        connection=connection,
+        force_mock=mock,
+        force_decision=True,
+    )
+
+
 def run_scheduler_forever(
     *,
     config_path: str | Path = "config.yaml",

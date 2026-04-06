@@ -32,6 +32,7 @@ from saxo_daytrader_xai.notifications import (
     dispatch_summaries_if_due,
     fetch_notification_deliveries,
 )
+from saxo_daytrader_xai.scheduler_service import run_manual_scheduler_cycle
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -305,6 +306,32 @@ with tab_market:
     sched_col3.metric("Last Cycle Status", scheduler_status.get("last_cycle_status") if scheduler_status else "n/a")
     sched_col4.metric("Last Completed", scheduler_status.get("last_cycle_completed_at") if scheduler_status else "n/a")
     st.caption(scheduler_health_text)
+    if "manual_scheduler_result" in st.session_state:
+        last_manual_result = st.session_state["manual_scheduler_result"]
+        if last_manual_result.get("status") == "ok":
+            st.success(
+                f"Manual scheduler cycle completed. generated_decision={last_manual_result.get('generated_decision')} "
+                f"queue_status={last_manual_result.get('queue', {}).get('status')}"
+            )
+        else:
+            st.error(f"Manual scheduler cycle failed: {last_manual_result.get('error', 'unknown error')}")
+    cycle_col1, cycle_col2 = st.columns(2)
+    if cycle_col1.button("Run Scheduler Cycle Now"):
+        with st.spinner("Running scheduler cycle..."):
+            st.session_state["manual_scheduler_result"] = run_manual_scheduler_cycle(
+                config=config,
+                connection=connection,
+                mock=False,
+            )
+        st.rerun()
+    if cycle_col2.button("Run Mock Scheduler Cycle"):
+        with st.spinner("Running mock scheduler cycle..."):
+            st.session_state["manual_scheduler_result"] = run_manual_scheduler_cycle(
+                config=config,
+                connection=connection,
+                mock=True,
+            )
+        st.rerun()
     if scheduler_status and scheduler_status.get("last_cycle_json"):
         with st.expander("Latest Scheduler Cycle"):
             st.json(scheduler_status["last_cycle_json"])

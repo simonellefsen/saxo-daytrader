@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 22 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 23 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 22 includes
+## What Phase 23 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -43,6 +43,7 @@ Phase 22 foundation for a local Python day-trading assistant focused on a Danish
 - Grouped broker alerts so several broker updates for the same order can be collapsed into one delivery
 - Autonomous app launcher mode that starts the dashboard and background scheduler together for hands-off simulation trading
 - Scheduler heartbeat and last-cycle status persisted to SQLite and shown in the dashboard
+- One-click scheduler cycle controls in the dashboard for live or mock manual runs
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -259,10 +260,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 22 validation script:
+Run the Phase 23 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase22.py
+.venv/bin/python scripts/validate_phase23.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -274,10 +275,10 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 22 validation passed.
-Scheduler status row present: True
-Last cycle status: ok
-Heartbeat recorded: True
+Phase 23 validation passed.
+Manual live cycle status: ok
+Manual mock cycle status: ok
+Mock generate flag observed: True
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -307,6 +308,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase20.py
 .venv/bin/python scripts/validate_phase21.py
 .venv/bin/python scripts/validate_phase22.py
+.venv/bin/python scripts/validate_phase23.py
 ```
 
 ## Project layout
@@ -363,4 +365,4 @@ Earlier validation scripts remain available:
 ## Next-phase todo
 
 1. Add per-profile templates or formatting so alert and digest families can share presentation settings as well as destinations.
-2. Add a dashboard control for one-off scheduler cycles with visible last-run status and error summaries.
+2. Add a dashboard-visible history table of recent scheduler cycles and their top-level outcomes.
