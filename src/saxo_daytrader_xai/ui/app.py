@@ -19,6 +19,7 @@ from saxo_daytrader_xai.execution_engine import (
     fetch_execution_events,
     fetch_execution_fills,
     fetch_execution_orders,
+    manage_live_order,
     queue_and_maybe_execute_latest_report,
     sync_broker_order_statuses,
 )
@@ -421,6 +422,60 @@ with tab_execution:
             cols[3].write(_format_dkk(order["estimated_value_dkk"]))
             if cols[4].button("Approve", key=f"approve-{order['id']}"):
                 result = execute_order(order["id"], config=config, connection=connection, approved=True)
+                st.success(f"Order {order['id']} status: {result['status']}")
+                st.rerun()
+
+    manageable_orders = [
+        row
+        for row in execution_orders
+        if row["mode"] == "live"
+        and row["status"] in {
+            "submitted_to_broker",
+            "broker_working",
+            "broker_amended",
+            "broker_partially_filled",
+            "broker_replace_requested",
+            "broker_cancel_requested",
+        }
+    ]
+    if config["execution"]["mode"] == "live" and manageable_orders:
+        st.markdown("**Manage Live Broker Orders**")
+        for order in manageable_orders[:20]:
+            cols = st.columns([3, 2, 2, 2, 2, 2])
+            cols[0].write(f"{order['id']} {order['action']} {order['symbol']}")
+            cols[1].write(f"Status {order['status']}")
+            replace_qty = cols[2].number_input(
+                "Qty",
+                min_value=0.0,
+                value=float(order["quantity"] or 0.0),
+                step=1.0,
+                key=f"replace-qty-{order['id']}",
+            )
+            replace_price = cols[3].number_input(
+                "Price",
+                min_value=0.0,
+                value=float(order["price_local"] or 0.0),
+                step=0.01,
+                key=f"replace-price-{order['id']}",
+            )
+            if cols[4].button("Replace", key=f"replace-btn-{order['id']}"):
+                result = manage_live_order(
+                    order["id"],
+                    management_action="replace",
+                    config=config,
+                    connection=connection,
+                    new_quantity=replace_qty,
+                    new_price=replace_price if replace_price > 0 else None,
+                )
+                st.success(f"Order {order['id']} status: {result['status']}")
+                st.rerun()
+            if cols[5].button("Cancel", key=f"cancel-btn-{order['id']}"):
+                result = manage_live_order(
+                    order["id"],
+                    management_action="cancel",
+                    config=config,
+                    connection=connection,
+                )
                 st.success(f"Order {order['id']} status: {result['status']}")
                 st.rerun()
 

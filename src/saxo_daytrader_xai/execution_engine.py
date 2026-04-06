@@ -16,6 +16,8 @@ from saxo_daytrader_xai.saxo_openapi import (
     SaxoOrderNotFoundError,
     SaxoSessionError,
     build_market_order_payload,
+    cancel_order,
+    change_order,
     ensure_access_token,
     get_open_order,
     get_order_activity_last,
@@ -36,6 +38,16 @@ from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report
 def _load_default_config() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
     return load_config(root / "config.yaml")
+
+
+MANAGEABLE_LIVE_STATUSES = {
+    "submitted_to_broker",
+    "broker_working",
+    "broker_amended",
+    "broker_partially_filled",
+    "broker_replace_requested",
+    "broker_cancel_requested",
+}
 
 
 def _get_connection_and_config(config: dict[str, Any] | None, connection):
@@ -415,6 +427,14 @@ def _extract_broker_quantity(payload: dict[str, Any]) -> float | None:
     return None
 
 
+def _execution_result(order: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(order["execution_result_json"]) if order.get("execution_result_json") else {}
+
+
+def _broker_payload(order: dict[str, Any]) -> dict[str, Any]:
+    return _execution_result(order).get("payload", {})
+
+
 def _extract_broker_price(payload: dict[str, Any]) -> float | None:
     for key in ("OrderPrice", "Price", "OrderPriceDisplay"):
         value = _coerce_float(payload.get(key))
@@ -587,7 +607,14 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             SELECT *
             FROM execution_orders
             WHERE mode = 'live'
-              AND status IN ('submitted_to_broker', 'broker_working', 'broker_partially_filled', 'broker_amended')
+              AND status IN (
+                  'submitted_to_broker',
+                  'broker_working',
+                  'broker_partially_filled',
+                  'broker_amended',
+                  'broker_replace_requested',
+                  'broker_cancel_requested'
+              )
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -1058,6 +1085,123 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
             {"order_id": order_id, "ledger_id": ledger_id, "mode": order["mode"], "action": order["action"]},
         )
         return {"status": "executed", "order_id": order_id, "ledger_id": ledger_id}
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
+def manage_live_order(
+    order_id: int,
+    *,
+    management_action: str,
+    config: dict[str, Any] | None = None,
+    connection=None,
+    new_quantity: float | None = None,
+    new_price: float | None = None,
+) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        row = resolved_connection.execute("SELECT * FROM execution_orders WHERE id = ?", (order_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown execution order {order_id}")
+        order = dict(row)
+        if order["mode"] != "live":
+            return {"status": "not_live_order", "order_id": order_id}
+        if order["adapter"] != "saxo":
+            return {"status": "unsupported_adapter", "order_id": order_id}
+        if order["status"] not in MANAGEABLE_LIVE_STATUSES:
+            return {"status": "not_manageable", "order_id": order_id, "current_status": order["status"]}
+        if resolved_config["app"]["dry_run"]:
+            return {"status": "blocked_by_dry_run", "order_id": order_id}
+
+        session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+        execution_result = _execution_result(order)
+        broker_result = execution_result.get("broker_result", {})
+        broker_order_id = str(order.get("broker_order_id") or broker_result.get("OrderId") or "")
+        if not broker_order_id:
+            return {"status": "missing_broker_order_id", "order_id": order_id}
+
+        now_iso = datetime.now(UTC).isoformat(timespec="seconds")
+        if management_action == "cancel":
+            broker_response = cancel_order(broker_order_id, resolved_config, session)
+            new_status = "broker_cancel_requested"
+            payload = {
+                **execution_result,
+                "management": {
+                    "action": "cancel",
+                    "requested_at": now_iso,
+                    "broker_response": broker_response,
+                },
+            }
+            event_type = "broker_cancel_requested"
+        elif management_action == "replace":
+            original_payload = _broker_payload(order)
+            order_type = str(original_payload.get("OrderType") or "Market")
+            effective_price = new_price if new_price is not None else _coerce_float(order.get("price_local"))
+            if new_price is not None and order_type == "Market":
+                order_type = "Limit"
+            patch_payload: dict[str, Any] = {
+                "AccountKey": original_payload.get("AccountKey") or resolved_config["saxo"]["account_key"] or session.get("account_key"),
+                "OrderId": broker_order_id,
+                "Amount": new_quantity if new_quantity is not None else float(order["quantity"]),
+                "AssetType": original_payload.get("AssetType", "Stock"),
+                "OrderType": order_type,
+            }
+            if original_payload.get("OrderDuration"):
+                patch_payload["OrderDuration"] = original_payload["OrderDuration"]
+            if effective_price is not None and order_type != "Market":
+                patch_payload["OrderPrice"] = effective_price
+            broker_response = change_order(patch_payload, resolved_config, session)
+            new_status = "broker_replace_requested"
+            payload = {
+                **execution_result,
+                "management": {
+                    "action": "replace",
+                    "requested_at": now_iso,
+                    "request_payload": patch_payload,
+                    "broker_response": broker_response,
+                },
+            }
+            event_type = "broker_replace_requested"
+        else:
+            raise ValueError(f"Unsupported management action '{management_action}'")
+
+        event_id = _record_execution_event(
+            resolved_connection,
+            order=order,
+            broker_order_id=broker_order_id,
+            event_type=event_type,
+            broker_status=new_status,
+            broker_substatus="requested",
+            broker_quantity=new_quantity if management_action == "replace" else _coerce_float(order.get("quantity")),
+            broker_price_local=new_price if management_action == "replace" else _coerce_float(order.get("price_local")),
+            payload=payload,
+        )
+        resolved_connection.execute(
+            """
+            UPDATE execution_orders
+            SET status = ?, execution_result_json = ?
+            WHERE id = ?
+            """,
+            (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order_id),
+        )
+        resolved_connection.commit()
+        append_audit_log(
+            resolved_connection,
+            "execution_order_management_requested",
+            {
+                "order_id": order_id,
+                "broker_order_id": broker_order_id,
+                "action": management_action,
+                "event_id": event_id,
+            },
+        )
+        return {
+            "status": new_status,
+            "order_id": order_id,
+            "broker_order_id": broker_order_id,
+            "event_id": event_id,
+        }
     finally:
         if should_close:
             resolved_connection.close()

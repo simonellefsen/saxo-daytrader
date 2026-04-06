@@ -282,6 +282,30 @@ def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[s
     return response.json()
 
 
+def change_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.patch(
+        f"{base_url}/trade/v2/orders",
+        headers=_auth_headers(session["access_token"]),
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def cancel_order(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.delete(
+        f"{base_url}/trade/v2/orders/{order_id}",
+        params={"AccountKey": _account_key(config, session)},
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 def get_open_order(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
     response = requests.get(

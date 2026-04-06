@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 11 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 12 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 11 includes
+## What Phase 12 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -32,6 +32,7 @@ Phase 11 foundation for a local Python day-trading assistant focused on a Danish
 - Optional Slack webhook and SMTP email delivery for daily summaries
 - Immutable `notification_deliveries` records and notification history in the UI
 - Renderable `systemd` and `launchd` service templates for unattended local deployment
+- Live Saxo order-management actions for broker-side replace and cancel requests
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -42,6 +43,7 @@ Phase 11 foundation for a local Python day-trading assistant focused on a Danish
   - realised gain / tax summary from the trade ledger
   - a Decision Report tab that can auto-run during analysis windows or run on demand
   - an Execution tab for queued orders, live approvals, Saxo submission status, broker sync, and audit export
+  - live broker order replace/cancel controls for manageable Saxo orders
   - a Notifications tab with summary preview and delivery history
 
 ## Install
@@ -182,10 +184,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 11 validation script:
+Run the Phase 12 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase11.py
+.venv/bin/python scripts/validate_phase12.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -197,13 +199,14 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 11 validation passed.
-Rendered output dir: /tmp/saxo_daytrader_phase11_<id>
-Rendered files:
-- /tmp/.../systemd/saxo-daytrader-scheduler.service
-- /tmp/.../systemd/saxo-daytrader-dashboard.service
-- /tmp/.../launchd/com.saxo-daytrader.scheduler.plist
-- /tmp/.../launchd/com.saxo-daytrader.dashboard.plist
+Phase 12 validation passed.
+Imported source positions: 20
+Excluded positions: 2
+Replace request status: broker_replace_requested
+Cancel request status: broker_cancel_requested
+Replace sync status: broker_amended
+Cancel sync status: broker_cancelled
+Broker event rows: 4
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -222,6 +225,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase9.py
 .venv/bin/python scripts/validate_phase10.py
 .venv/bin/python scripts/validate_phase11.py
+.venv/bin/python scripts/validate_phase12.py
 ```
 
 ## Project layout
@@ -243,6 +247,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase9.py
 │   └── validate_phase10.py
 │   └── validate_phase11.py
+│   └── validate_phase12.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -267,6 +272,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add broker-side order replacement support so the app can submit controlled modify/cancel-replace actions, not only reconcile them after the fact.
-2. Add per-channel delivery throttling/backoff and richer notification templates.
+1. Add per-channel delivery throttling/backoff and richer notification templates.
 3. Add per-channel delivery throttling/backoff and richer notification templates.
