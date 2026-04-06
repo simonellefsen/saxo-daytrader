@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 13 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 14 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 13 includes
+## What Phase 14 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -29,11 +29,12 @@ Phase 13 foundation for a local Python day-trading assistant focused on a Danish
 - Immutable `execution_order_events` records for broker-side amendments, cancellations, rejections, and working-order state changes
 - Broker-side amendment reconciliation that updates local working order quantity and price from Saxo
 - Scheduler-driven daily performance summary generation
-- Optional Slack webhook and SMTP email delivery for daily summaries
+- Optional Slack webhook and SMTP email delivery for daily, weekly, and monthly summaries
 - Immutable `notification_deliveries` records and notification history in the UI
 - Renderable `systemd` and `launchd` service templates for unattended local deployment
 - Live Saxo order-management actions for broker-side replace and cancel requests
 - Notification throttling, retry backoff, and richer structured daily-summary formatting
+- Weekly and monthly digest generation with independent scheduling and per-kind notification deduplication
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -90,6 +91,7 @@ The scheduler:
 - queues suggested trades
 - auto-executes queued trades in simulation mode
 - sends one daily summary per configured channel after the local dispatch time
+- sends optional weekly and monthly digests after their configured local dispatch windows
 - records scheduler activity in `audit_log`
 
 ## Deployment
@@ -185,10 +187,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 13 validation script:
+Run the Phase 14 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase13.py
+.venv/bin/python scripts/validate_phase14.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -200,12 +202,12 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 13 validation passed.
+Phase 14 validation passed.
 Imported source positions: 20
 Excluded positions: 2
 Failed deliveries: 1
-Sent deliveries: 1
-Slack success payloads: 1
+Sent deliveries: 3
+Slack success payloads: 3
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -226,6 +228,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase11.py
 .venv/bin/python scripts/validate_phase12.py
 .venv/bin/python scripts/validate_phase13.py
+.venv/bin/python scripts/validate_phase14.py
 ```
 
 ## Project layout
@@ -249,6 +252,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase11.py
 │   └── validate_phase12.py
 │   └── validate_phase13.py
+│   └── validate_phase14.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -273,5 +277,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add notification digest variants for weekly and monthly summaries.
-3. Add per-channel delivery throttling/backoff and richer notification templates.
+1. Add quarterly and year-to-date digest variants on top of the same notification pipeline.
+2. Add alert-style notifications for broker fills, rejections, and cancel confirmations.

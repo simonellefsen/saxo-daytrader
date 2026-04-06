@@ -11,7 +11,7 @@ from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
-from saxo_daytrader_xai.notifications import dispatch_daily_summary_if_due
+from saxo_daytrader_xai.notifications import dispatch_summaries_if_due
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
 
@@ -56,7 +56,7 @@ def run_scheduler_cycle(
             config=resolved_config,
             connection=resolved_connection,
         )
-        notification_result = dispatch_daily_summary_if_due(
+        notification_result = dispatch_summaries_if_due(
             resolved_connection,
             resolved_config,
         )

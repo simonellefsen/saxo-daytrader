@@ -15,7 +15,9 @@ from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import connect, init_db
 from saxo_daytrader_xai.importer import sync_portfolio
 from saxo_daytrader_xai.notifications import (
+    build_summary,
     dispatch_daily_summary_if_due,
+    dispatch_summary_if_due,
     fetch_notification_deliveries,
 )
 
@@ -29,9 +31,13 @@ class _FakeResponse:
 
 def main() -> int:
     config = load_config(ROOT / "config.yaml")
-    db_path = Path("/tmp") / f"saxo_daytrader_phase13_{uuid.uuid4().hex}.db"
+    db_path = Path("/tmp") / f"saxo_daytrader_phase14_{uuid.uuid4().hex}.db"
     config["portfolio"]["database_path"] = str(db_path)
     config["notifications"]["daily_summary_enabled"] = True
+    config["notifications"]["weekly_summary_enabled"] = True
+    config["notifications"]["monthly_summary_enabled"] = True
+    config["notifications"]["weekly_dispatch_weekday_local"] = 0
+    config["notifications"]["monthly_dispatch_day_local"] = 1
     config["notifications"]["dispatch_hour_local"] = 0
     config["notifications"]["dispatch_minute_local"] = 0
     config["notifications"]["retry_backoff_minutes"] = 30
@@ -78,12 +84,27 @@ def main() -> int:
             config,
             reference_time=datetime(2026, 4, 6, 19, 15, tzinfo=UTC),
         )
+        weekly = dispatch_summary_if_due(
+            connection,
+            config,
+            summary_kind="weekly",
+            reference_time=datetime(2026, 4, 13, 19, 15, tzinfo=UTC),
+            force=True,
+        )
+        monthly = dispatch_summary_if_due(
+            connection,
+            config,
+            summary_kind="monthly",
+            reference_time=datetime(2026, 5, 1, 19, 15, tzinfo=UTC),
+            force=True,
+        )
     finally:
         notifications.requests.post = original_post
 
     deliveries = fetch_notification_deliveries(connection, limit=20)
     failed_rows = [row for row in deliveries if row["status"] == "failed"]
     sent_rows = [row for row in deliveries if row["status"] == "sent"]
+    summary_preview = build_summary(connection, config, summary_kind="weekly", reference_time=datetime(2026, 4, 13, 19, 15, tzinfo=UTC))
 
     assert first["sent"][0]["status"] == "failed", first
     assert second["sent"][0]["status"] == "skipped", second
@@ -91,10 +112,13 @@ def main() -> int:
     assert third["sent"][0]["status"] == "sent", third
     assert fourth["sent"][0]["status"] == "skipped", fourth
     assert fourth["sent"][0]["reason"] in {"already_sent", "cooldown_active"}, fourth
+    assert weekly["summary_kind"] == "weekly", weekly
+    assert monthly["summary_kind"] == "monthly", monthly
     assert len(failed_rows) == 1, failed_rows
-    assert len(sent_rows) == 1, sent_rows
+    assert len(sent_rows) == 3, sent_rows
+    assert "Period:" in summary_preview["message_text"], summary_preview["message_text"]
 
-    print("Phase 13 validation passed.")
+    print("Phase 14 validation passed.")
     print(f"Imported source positions: {result.source_positions}")
     print(f"Excluded positions: {result.excluded_positions}")
     print(f"Failed deliveries: {len(failed_rows)}")

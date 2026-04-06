@@ -38,8 +38,18 @@ def _day_bounds_utc(config: dict[str, Any], summary_date: date) -> tuple[str, st
     )
 
 
-def _summary_trade_stats(connection, config: dict[str, Any], summary_date: date) -> dict[str, Any]:
-    start_utc, end_utc = _day_bounds_utc(config, summary_date)
+def _period_bounds_utc(config: dict[str, Any], start_date: date, end_date: date) -> tuple[str, str]:
+    timezone = _notification_timezone(config)
+    local_start = timezone.localize(datetime.combine(start_date, time(0, 0)), is_dst=None)
+    local_end = timezone.localize(datetime.combine(end_date, time(23, 59, 59)), is_dst=None)
+    return (
+        local_start.astimezone(UTC).isoformat(timespec="seconds"),
+        local_end.astimezone(UTC).isoformat(timespec="seconds"),
+    )
+
+
+def _summary_trade_stats(connection, config: dict[str, Any], start_date: date, end_date: date) -> dict[str, Any]:
+    start_utc, end_utc = _period_bounds_utc(config, start_date, end_date)
     row = connection.execute(
         """
         SELECT
@@ -56,8 +66,8 @@ def _summary_trade_stats(connection, config: dict[str, Any], summary_date: date)
     return dict(row)
 
 
-def _summary_execution_stats(connection, config: dict[str, Any], summary_date: date) -> dict[str, Any]:
-    start_utc, end_utc = _day_bounds_utc(config, summary_date)
+def _summary_execution_stats(connection, config: dict[str, Any], start_date: date, end_date: date) -> dict[str, Any]:
+    start_utc, end_utc = _period_bounds_utc(config, start_date, end_date)
     rows = connection.execute(
         """
         SELECT status, COUNT(*) AS count_rows
@@ -77,14 +87,40 @@ def _summary_top_positions(connection) -> list[dict[str, Any]]:
     return positions[:5]
 
 
-def build_daily_summary(connection, config: dict[str, Any], reference_time: datetime | None = None) -> dict[str, Any]:
+def _period_descriptor(kind: str, local_now: datetime, config: dict[str, Any]) -> tuple[date, date, str]:
+    current_date = local_now.date()
+    if kind == "daily":
+        start_date = current_date
+        end_date = current_date
+        label = current_date.isoformat()
+    elif kind == "weekly":
+        end_date = current_date - timedelta(days=current_date.weekday() + 1)
+        start_date = end_date - timedelta(days=6)
+        label = f"{start_date.isoformat()}_to_{end_date.isoformat()}"
+    elif kind == "monthly":
+        first_of_current_month = current_date.replace(day=1)
+        end_date = first_of_current_month - timedelta(days=1)
+        start_date = end_date.replace(day=1)
+        label = f"{start_date.isoformat()}_to_{end_date.isoformat()}"
+    else:
+        raise ValueError(f"Unsupported summary kind '{kind}'")
+    return start_date, end_date, label
+
+
+def build_summary(
+    connection,
+    config: dict[str, Any],
+    *,
+    summary_kind: str = "daily",
+    reference_time: datetime | None = None,
+) -> dict[str, Any]:
     local_now = _notification_now(config, reference_time)
-    summary_date = local_now.date()
+    start_date, end_date, summary_label = _period_descriptor(summary_kind, local_now, config)
     batch_id = fetch_latest_batch_id(connection)
     portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id)
-    tax_summary = fetch_realised_tax_summary(connection, tax_year=summary_date.year)
-    trade_stats = _summary_trade_stats(connection, config, summary_date)
-    execution_stats = _summary_execution_stats(connection, config, summary_date)
+    tax_summary = fetch_realised_tax_summary(connection, tax_year=end_date.year)
+    trade_stats = _summary_trade_stats(connection, config, start_date, end_date)
+    execution_stats = _summary_execution_stats(connection, config, start_date, end_date)
     latest_report = fetch_latest_decision_report(connection)
     top_positions = _summary_top_positions(connection)
 
@@ -93,10 +129,13 @@ def build_daily_summary(connection, config: dict[str, Any], reference_time: date
         suggested_trade_count = len(latest_report["report_json"].get("suggested_trades", []))
 
     payload = {
-        "summary_date": summary_date.isoformat(),
+        "summary_kind": summary_kind,
+        "summary_date": summary_label,
+        "period_start": start_date.isoformat(),
+        "period_end": end_date.isoformat(),
         "generated_at_local": local_now.isoformat(timespec="seconds"),
         "portfolio": portfolio_summary,
-        "today": {
+        "period": {
             "trade_count": int(trade_stats["trade_count"]),
             "net_amount_dkk": float(trade_stats["net_amount_dkk"]),
             "realised_gain_dkk": float(trade_stats["realised_gain_dkk"]),
@@ -121,7 +160,7 @@ def build_daily_summary(connection, config: dict[str, Any], reference_time: date
             for row in top_positions
         ],
     }
-    subject = f"saxo-daytrader-xai daily summary {summary_date.isoformat()}"
+    subject = f"saxo-daytrader-xai {summary_kind} summary {summary_label}"
     style = str(config.get("notifications", {}).get("summary_style", "structured")).lower()
     if style == "compact":
         lines = [
@@ -134,12 +173,14 @@ def build_daily_summary(connection, config: dict[str, Any], reference_time: date
         lines = [
             subject,
             "",
+            f"Period: {start_date.isoformat()} to {end_date.isoformat()}",
+            "",
             "Portfolio:",
             f"- Value: {portfolio_summary['total_market_value_dkk']:.2f} DKK",
             f"- Daily P/L: {portfolio_summary['total_daily_pnl_dkk']:.2f} DKK",
             f"- Unrealised P/L: {portfolio_summary['total_unrealised_pnl_dkk']:.2f} DKK",
             "",
-            "Trading Today:",
+            "Trading:",
             f"- Trades: {int(trade_stats['trade_count'])}",
             f"- Realised gain: {float(trade_stats['realised_gain_dkk']):.2f} DKK",
             f"- Net amount: {float(trade_stats['net_amount_dkk']):.2f} DKK",
@@ -172,10 +213,15 @@ def build_daily_summary(connection, config: dict[str, Any], reference_time: date
     }
 
 
+def build_daily_summary(connection, config: dict[str, Any], reference_time: datetime | None = None) -> dict[str, Any]:
+    return build_summary(connection, config, summary_kind="daily", reference_time=reference_time)
+
+
 def _record_notification_delivery(
     connection,
     *,
     summary_date: str,
+    summary_kind: str,
     channel: str,
     status: str,
     subject: str,
@@ -186,12 +232,13 @@ def _record_notification_delivery(
     cursor = connection.execute(
         """
         INSERT INTO notification_deliveries (
-            created_at, summary_date, channel, status, subject, message_text, payload_json, error_text
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, summary_date, summary_kind, channel, status, subject, message_text, payload_json, error_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(UTC).isoformat(timespec="seconds"),
             summary_date,
+            summary_kind,
             channel,
             status,
             subject,
@@ -204,28 +251,32 @@ def _record_notification_delivery(
     return int(cursor.lastrowid)
 
 
-def _already_sent(connection, summary_date: str, channel: str) -> bool:
+def _already_sent(connection, summary_date: str, summary_kind: str, channel: str) -> bool:
     row = connection.execute(
         """
         SELECT 1
         FROM notification_deliveries
-        WHERE summary_date = ? AND channel = ? AND status = 'sent'
+        WHERE summary_date = ? AND summary_kind = ? AND channel = ? AND status = 'sent'
         ORDER BY id DESC
         LIMIT 1
         """,
-        (summary_date, channel),
+        (summary_date, summary_kind, channel),
     ).fetchone()
     return row is not None
 
 
-def _notification_state(connection, channel: str) -> dict[str, Any] | None:
+def _state_key(summary_kind: str, channel: str) -> str:
+    return f"{summary_kind}:{channel}"
+
+
+def _notification_state(connection, summary_kind: str, channel: str) -> dict[str, Any] | None:
     row = connection.execute(
         """
         SELECT *
         FROM notification_channel_state
         WHERE channel = ?
         """,
-        (channel,),
+        (_state_key(summary_kind, channel),),
     ).fetchone()
     return dict(row) if row else None
 
@@ -233,6 +284,7 @@ def _notification_state(connection, channel: str) -> dict[str, Any] | None:
 def _upsert_notification_state(
     connection,
     *,
+    summary_kind: str,
     channel: str,
     summary_date: str,
     last_attempt_at: str,
@@ -255,7 +307,7 @@ def _upsert_notification_state(
             last_error_text = excluded.last_error_text
         """,
         (
-            channel,
+            _state_key(summary_kind, channel),
             summary_date,
             last_attempt_at,
             next_attempt_after,
@@ -271,6 +323,7 @@ def _channel_ready(
     connection,
     config: dict[str, Any],
     *,
+    summary_kind: str,
     channel: str,
     summary_date: str,
     reference_time: datetime,
@@ -278,9 +331,9 @@ def _channel_ready(
 ) -> tuple[bool, str]:
     if force:
         return True, "forced"
-    if _already_sent(connection, summary_date, channel):
+    if _already_sent(connection, summary_date, summary_kind, channel):
         return False, "already_sent"
-    state = _notification_state(connection, channel)
+    state = _notification_state(connection, summary_kind, channel)
     if not state or state.get("summary_date") != summary_date:
         return True, "fresh"
     max_attempts = int(config.get("notifications", {}).get("max_attempts_per_day", 3))
@@ -366,18 +419,36 @@ def fetch_notification_deliveries(connection, limit: int = 100) -> list[dict[str
     return output
 
 
-def dispatch_daily_summary_if_due(
+def _summary_due(config: dict[str, Any], summary_kind: str, local_now: datetime, *, force: bool) -> bool:
+    if force:
+        return True
+    notifications_cfg = config.get("notifications", {})
+    if summary_kind == "daily":
+        return bool(notifications_cfg.get("daily_summary_enabled", False))
+    if summary_kind == "weekly":
+        return bool(notifications_cfg.get("weekly_summary_enabled", False)) and local_now.weekday() == int(
+            notifications_cfg.get("weekly_dispatch_weekday_local", 0)
+        )
+    if summary_kind == "monthly":
+        return bool(notifications_cfg.get("monthly_summary_enabled", False)) and local_now.day == int(
+            notifications_cfg.get("monthly_dispatch_day_local", 1)
+        )
+    return False
+
+
+def dispatch_summary_if_due(
     connection,
     config: dict[str, Any],
-    reference_time: datetime | None = None,
     *,
+    summary_kind: str = "daily",
+    reference_time: datetime | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     notifications_cfg = config.get("notifications", {})
-    if not notifications_cfg.get("daily_summary_enabled", False) and not force:
-        return {"status": "disabled", "sent": []}
-
     local_now = _notification_now(config, reference_time)
+    if not _summary_due(config, summary_kind, local_now, force=force):
+        return {"status": "disabled" if summary_kind == "daily" and not notifications_cfg.get("daily_summary_enabled", False) and not force else "not_due", "sent": [], "summary_kind": summary_kind}
+
     dispatch_time = local_now.replace(
         hour=int(notifications_cfg.get("dispatch_hour_local", 18)),
         minute=int(notifications_cfg.get("dispatch_minute_local", 15)),
@@ -385,9 +456,9 @@ def dispatch_daily_summary_if_due(
         microsecond=0,
     )
     if not force and local_now < dispatch_time:
-        return {"status": "not_due", "sent": []}
+        return {"status": "not_due", "sent": [], "summary_kind": summary_kind}
 
-    summary = build_daily_summary(connection, config, reference_time=reference_time)
+    summary = build_summary(connection, config, summary_kind=summary_kind, reference_time=reference_time)
     now_utc = (reference_time or datetime.now(UTC)).astimezone(UTC)
     channels: list[str] = []
     if notifications_cfg.get("slack", {}).get("enabled"):
@@ -402,6 +473,7 @@ def dispatch_daily_summary_if_due(
         is_ready, reason = _channel_ready(
             connection,
             config,
+            summary_kind=summary_kind,
             channel=channel,
             summary_date=summary["summary_date"],
             reference_time=now_utc,
@@ -410,7 +482,7 @@ def dispatch_daily_summary_if_due(
         if not is_ready:
             sent.append({"channel": channel, "status": "skipped", "reason": reason})
             continue
-        previous_state = _notification_state(connection, channel) or {}
+        previous_state = _notification_state(connection, summary_kind, channel) or {}
         attempt_count = int(previous_state.get("attempt_count") or 0) + 1
         try:
             if channel == "slack":
@@ -422,6 +494,7 @@ def dispatch_daily_summary_if_due(
             delivery_id = _record_notification_delivery(
                 connection,
                 summary_date=summary["summary_date"],
+                summary_kind=summary_kind,
                 channel=channel,
                 status="sent",
                 subject=summary["subject"],
@@ -430,6 +503,7 @@ def dispatch_daily_summary_if_due(
             )
             _upsert_notification_state(
                 connection,
+                summary_kind=summary_kind,
                 channel=channel,
                 summary_date=summary["summary_date"],
                 last_attempt_at=now_utc.isoformat(timespec="seconds"),
@@ -441,13 +515,14 @@ def dispatch_daily_summary_if_due(
             append_audit_log(
                 connection,
                 "daily_summary_sent",
-                {"summary_date": summary["summary_date"], "channel": channel, "delivery_id": delivery_id},
+                {"summary_date": summary["summary_date"], "summary_kind": summary_kind, "channel": channel, "delivery_id": delivery_id},
             )
             sent.append({"channel": channel, "status": "sent", "delivery_id": delivery_id})
         except Exception as exc:  # noqa: BLE001
             delivery_id = _record_notification_delivery(
                 connection,
                 summary_date=summary["summary_date"],
+                summary_kind=summary_kind,
                 channel=channel,
                 status="failed",
                 subject=summary["subject"],
@@ -458,6 +533,7 @@ def dispatch_daily_summary_if_due(
             next_attempt = now_utc + timedelta(minutes=int(config.get("notifications", {}).get("retry_backoff_minutes", 30)))
             _upsert_notification_state(
                 connection,
+                summary_kind=summary_kind,
                 channel=channel,
                 summary_date=summary["summary_date"],
                 last_attempt_at=now_utc.isoformat(timespec="seconds"),
@@ -471,6 +547,7 @@ def dispatch_daily_summary_if_due(
                 "daily_summary_failed",
                 {
                     "summary_date": summary["summary_date"],
+                    "summary_kind": summary_kind,
                     "channel": channel,
                     "delivery_id": delivery_id,
                     "error": str(exc),
@@ -478,4 +555,41 @@ def dispatch_daily_summary_if_due(
             )
             sent.append({"channel": channel, "status": "failed", "delivery_id": delivery_id, "error": str(exc)})
 
-    return {"status": "ok", "sent": sent, "summary": summary}
+    return {"status": "ok", "sent": sent, "summary": summary, "summary_kind": summary_kind}
+
+
+def dispatch_summaries_if_due(
+    connection,
+    config: dict[str, Any],
+    reference_time: datetime | None = None,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    results = []
+    for summary_kind in ("daily", "weekly", "monthly"):
+        results.append(
+            dispatch_summary_if_due(
+                connection,
+                config,
+                summary_kind=summary_kind,
+                reference_time=reference_time,
+                force=force,
+            )
+        )
+    return {"status": "ok", "results": results}
+
+
+def dispatch_daily_summary_if_due(
+    connection,
+    config: dict[str, Any],
+    reference_time: datetime | None = None,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    return dispatch_summary_if_due(
+        connection,
+        config,
+        summary_kind="daily",
+        reference_time=reference_time,
+        force=force,
+    )

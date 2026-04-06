@@ -249,6 +249,7 @@ def init_db(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "trade_ledger", "tax_year", "INTEGER")
     _ensure_column(connection, "trade_ledger", "batch_id", "TEXT")
     _ensure_column(connection, "execution_orders", "broker_order_id", "TEXT")
+    _ensure_column(connection, "notification_deliveries", "summary_kind", "TEXT NOT NULL DEFAULT 'daily'")
     connection.commit()
 
 

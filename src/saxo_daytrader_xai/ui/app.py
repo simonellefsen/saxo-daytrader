@@ -26,7 +26,7 @@ from saxo_daytrader_xai.execution_engine import (
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
-from saxo_daytrader_xai.notifications import build_daily_summary, dispatch_daily_summary_if_due, fetch_notification_deliveries
+from saxo_daytrader_xai.notifications import build_summary, dispatch_summaries_if_due, fetch_notification_deliveries
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -100,7 +100,9 @@ market_status_rows = get_market_status(config)
 analysis_summary = summarize_analysis_window(market_status_rows)
 latest_decision_report = fetch_latest_decision_report(connection)
 notification_deliveries = fetch_notification_deliveries(connection, limit=50)
-daily_summary_preview = build_daily_summary(connection, config)
+daily_summary_preview = build_summary(connection, config, summary_kind="daily")
+weekly_summary_preview = build_summary(connection, config, summary_kind="weekly")
+monthly_summary_preview = build_summary(connection, config, summary_kind="monthly")
 
 if should_auto_run_decision_report(connection, config, analysis_summary["analysis_window_active"]):
     with st.spinner("Generating xAI decision report..."):
@@ -557,18 +559,28 @@ with tab_notifications:
     st.subheader("Daily Summary Notifications")
     notif_col1, notif_col2, notif_col3 = st.columns(3)
     notif_col1.metric("Daily Summary Enabled", "Yes" if config["notifications"]["daily_summary_enabled"] else "No")
-    notif_col2.metric("Recent Deliveries", len(notification_deliveries))
-    notif_col3.metric("Slack Enabled", "Yes" if config["notifications"]["slack"]["enabled"] else "No")
+    notif_col2.metric("Weekly Enabled", "Yes" if config["notifications"]["weekly_summary_enabled"] else "No")
+    notif_col3.metric("Monthly Enabled", "Yes" if config["notifications"]["monthly_summary_enabled"] else "No")
 
-    if st.button("Send Daily Summary Now"):
-        with st.spinner("Dispatching daily summary..."):
-            summary_result = dispatch_daily_summary_if_due(connection, config, force=True)
+    if st.button("Send All Digests Now"):
+        with st.spinner("Dispatching summaries..."):
+            summary_result = dispatch_summaries_if_due(connection, config, force=True)
         st.success(f"Summary dispatch status: {summary_result['status']}")
         st.rerun()
 
-    st.markdown("**Current Summary Preview**")
+    st.markdown("**Daily Summary Preview**")
     st.caption(daily_summary_preview["subject"])
     st.code(daily_summary_preview["message_text"], language="text")
+
+    preview_col1, preview_col2 = st.columns(2)
+    with preview_col1:
+        st.markdown("**Weekly Digest Preview**")
+        st.caption(weekly_summary_preview["subject"])
+        st.code(weekly_summary_preview["message_text"], language="text")
+    with preview_col2:
+        st.markdown("**Monthly Digest Preview**")
+        st.caption(monthly_summary_preview["subject"])
+        st.code(monthly_summary_preview["message_text"], language="text")
 
     st.markdown("**Delivery History**")
     if notification_deliveries:
@@ -578,6 +590,7 @@ with tab_notifications:
                     "ID": row["id"],
                     "Created": row["created_at"],
                     "Summary Date": row["summary_date"],
+                    "Kind": row.get("summary_kind", "daily"),
                     "Channel": row["channel"],
                     "Status": row["status"],
                     "Subject": row["subject"],
