@@ -1,6 +1,6 @@
 # saxo-daytrader-xai
 
-Phase 34 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 36 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
 ## What Phase 23 includes
 
@@ -135,8 +135,10 @@ The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml
 - `poll_interval_minutes`: how often the scheduler refreshes latest portfolio prices. Current default is `5`.
 - `reset_hour_local`: local hour used as the daily baseline reset point. Current default is `6`.
 - `timezone`: timezone used for the reset boundary. Default is `Europe/Copenhagen`.
+- `history_max_rows`: optional cap on stored portfolio-value history points. `0` means unlimited.
+- `history_retention_days`: optional max age for stored portfolio-value history points. `0` means unlimited.
 
-The price monitor stores latest portfolio quotes in SQLite and uses the first quote after the configured reset hour as the baseline for that day. Daily P/L in the UI is then calculated relative to that baseline instead of relying only on the CSV import.
+The price monitor stores latest portfolio quotes in SQLite, appends portfolio-value history points for the Performance tab, and uses the first quote after the configured reset hour as the baseline for that day. Daily P/L in the UI is then calculated relative to that baseline instead of relying only on the CSV import.
 
 ### `analysis_windows`
 
@@ -281,6 +283,7 @@ The scheduler:
 - handles broker-side cancel/replace failures cleanly in the UI and pushes notifications for management failures without crashing Streamlit
 - supports configurable starting cash in DKK, shows live cash balance in the portfolio summary, and adjusts cash automatically as trades execute
 - persists latest portfolio quotes, resets the intraday baseline at `06:00` Europe/Copenhagen, and recalculates daily P/L from that baseline
+- records historical portfolio-value samples so the dashboard can graph daily, weekly, monthly, yearly, YTD, custom-range, and all-time performance
 
 ### What One Scheduler Cycle Does
 
@@ -518,10 +521,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 35 validation script:
+Run the Phase 36 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase35.py
+.venv/bin/python scripts/validate_phase36.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:

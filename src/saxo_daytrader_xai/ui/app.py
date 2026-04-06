@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytz
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -43,6 +44,7 @@ from saxo_daytrader_xai.scheduler_service import (
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
+    fetch_portfolio_value_history,
     fetch_realised_tax_summary,
     fetch_portfolio_summary,
     fetch_portfolio_symbols,
@@ -100,6 +102,66 @@ def _sent_alert_count(alert_result: dict | None) -> int:
     return sum(1 for row in alert_result.get("sent", []) if row.get("status") == "sent")
 
 
+def _history_timezone_name(config: dict) -> str:
+    return str(config.get("price_monitor", {}).get("timezone", "Europe/Copenhagen"))
+
+
+def _daily_baseline_start_local(config: dict, *, reference_time: datetime | None = None) -> datetime:
+    timezone = pytz.timezone(_history_timezone_name(config))
+    local_now = (reference_time or datetime.now(UTC)).astimezone(timezone)
+    reset_hour = int(config.get("price_monitor", {}).get("reset_hour_local", 6))
+    session_date = local_now.date()
+    if local_now.hour < reset_hour:
+        session_date = session_date - timedelta(days=1)
+    return timezone.localize(datetime.combine(session_date, time(hour=reset_hour)))
+
+
+def _history_frame(history_rows: list[dict], timezone_name: str) -> pd.DataFrame:
+    if not history_rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(
+        [
+            {
+                "Recorded At": row["recorded_at"],
+                "Portfolio Value DKK": float(row["total_market_value_dkk"]),
+                "Invested DKK": float(row["invested_market_value_dkk"]),
+                "Cash DKK": float(row["cash_balance_dkk"]),
+                "Cost Basis DKK": float(row["total_cost_basis_dkk"]),
+                "Unrealised P/L DKK": float(row["total_unrealised_pnl_dkk"]),
+                "Daily P/L DKK": float(row["total_daily_pnl_dkk"]),
+                "Positions": int(row["position_count"]),
+                "Snapshot Type": row["snapshot_type"],
+                "Source": row["source"],
+                "Baseline Session": row["baseline_session_date"],
+            }
+            for row in history_rows
+        ]
+    )
+    frame["Recorded At"] = pd.to_datetime(frame["Recorded At"], utc=True).dt.tz_convert(timezone_name)
+    frame = frame.sort_values("Recorded At").drop_duplicates(subset=["Recorded At"], keep="last")
+    return frame
+
+
+def _history_resample_rule(view_name: str, span_days: int | None) -> tuple[str | None, str]:
+    if view_name == "Daily":
+        return None, "5 min"
+    if view_name == "Weekly":
+        return "1H", "Hourly"
+    if view_name == "Monthly":
+        return "4H", "4 hours"
+    if view_name in {"Yearly", "Year to date", "All time"}:
+        return "1D", "Daily"
+    if span_days is None:
+        return None, "Raw"
+    if span_days <= 2:
+        return None, "Raw"
+    if span_days <= 14:
+        return "1H", "Hourly"
+    if span_days <= 90:
+        return "4H", "4 hours"
+    return "1D", "Daily"
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_watchlists(config_path: str) -> dict:
     return build_watchlists(load_config(config_path))
@@ -141,6 +203,7 @@ latest_decision_report = fetch_latest_decision_report(connection)
 notification_deliveries = fetch_notification_deliveries(connection, limit=50)
 scheduler_status = fetch_scheduler_status(connection)
 scheduler_cycles = fetch_scheduler_cycles(connection, limit=15)
+portfolio_value_history = fetch_portfolio_value_history(connection, limit=25_000)
 daily_summary_preview = build_summary(connection, config, summary_kind="daily")
 weekly_summary_preview = build_summary(connection, config, summary_kind="weekly")
 monthly_summary_preview = build_summary(connection, config, summary_kind="monthly")
@@ -155,7 +218,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 34 dashboard with autonomous simulation support, live broker workflow, quote-aware daily P/L tracking, scheduler controls, route-aware notifications, scheduler cycle history, stale-worker detection, automatic history retention, and invalid simulation trade repair.")
+st.caption("Phase 36 dashboard with autonomous simulation support, live broker workflow, quote-aware daily P/L tracking, portfolio-value history, scheduler controls, route-aware notifications, scheduler cycle history, stale-worker detection, automatic history retention, and invalid simulation trade repair.")
 
 autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
     config.get("scheduler", {}).get("enabled", True)
@@ -184,8 +247,8 @@ col3.metric("Cash", _format_dkk(summary["cash_balance_dkk"]))
 col4.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
 col5.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
 
-tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution, tab_notifications = st.tabs(
-    ["Portfolio", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
+tab_portfolio, tab_performance, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution, tab_notifications = st.tabs(
+    ["Portfolio", "Performance", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
 )
 
 with tab_portfolio:
@@ -301,6 +364,95 @@ with tab_portfolio:
         )
     else:
         st.caption("No trades recorded yet. Trade execution arrives in later phases.")
+
+with tab_performance:
+    st.subheader("Portfolio Value History")
+    if portfolio_value_history:
+        timezone_name = _history_timezone_name(config)
+        timezone = pytz.timezone(timezone_name)
+        local_now = datetime.now(UTC).astimezone(timezone)
+        history_view = st.selectbox(
+            "View",
+            ["Daily", "Weekly", "Monthly", "Yearly", "Year to date", "All time", "Custom range"],
+            index=1,
+        )
+
+        start_local: datetime | None = None
+        end_local: datetime | None = local_now
+        if history_view == "Daily":
+            start_local = _daily_baseline_start_local(config, reference_time=datetime.now(UTC))
+        elif history_view == "Weekly":
+            start_local = local_now - timedelta(days=7)
+        elif history_view == "Monthly":
+            start_local = local_now - timedelta(days=30)
+        elif history_view == "Yearly":
+            start_local = local_now - timedelta(days=365)
+        elif history_view == "Year to date":
+            start_local = timezone.localize(datetime(local_now.year, 1, 1))
+        elif history_view == "Custom range":
+            default_start = (local_now - timedelta(days=30)).date()
+            custom_col1, custom_col2 = st.columns(2)
+            start_date = custom_col1.date_input("Start date", value=default_start, key="portfolio-history-start")
+            end_date = custom_col2.date_input("End date", value=local_now.date(), key="portfolio-history-end")
+            start_local = timezone.localize(datetime.combine(start_date, time.min))
+            end_local = timezone.localize(datetime.combine(end_date, time.max))
+
+        history_frame = _history_frame(portfolio_value_history, timezone_name)
+        if start_local is not None:
+            history_frame = history_frame[history_frame["Recorded At"] >= pd.Timestamp(start_local)]
+        if end_local is not None:
+            history_frame = history_frame[history_frame["Recorded At"] <= pd.Timestamp(end_local)]
+
+        if history_frame.empty:
+            st.caption("No portfolio value samples are available for the selected range yet.")
+        else:
+            span_days = None
+            if start_local is not None and end_local is not None:
+                span_days = max(int((end_local - start_local).days), 0)
+            resample_rule, resolution_label = _history_resample_rule(history_view, span_days)
+            chart_frame = history_frame.set_index("Recorded At")[
+                ["Portfolio Value DKK", "Invested DKK", "Cash DKK"]
+            ]
+            if resample_rule:
+                chart_frame = chart_frame.resample(resample_rule).last().dropna(how="all")
+
+            first_value = float(chart_frame["Portfolio Value DKK"].iloc[0])
+            last_value = float(chart_frame["Portfolio Value DKK"].iloc[-1])
+            absolute_change = last_value - first_value
+            pct_change = (absolute_change / first_value * 100.0) if abs(first_value) > 1e-9 else 0.0
+
+            perf_col1, perf_col2, perf_col3, perf_col4 = st.columns(4)
+            perf_col1.metric("Current Value", _format_dkk(last_value), delta=f"{absolute_change:+,.2f} DKK")
+            perf_col2.metric("Change %", f"{pct_change:+.2f}%")
+            perf_col3.metric("Range High", _format_dkk(float(chart_frame["Portfolio Value DKK"].max())))
+            perf_col4.metric("Range Low", _format_dkk(float(chart_frame["Portfolio Value DKK"].min())))
+            st.caption(f"Resolution: {resolution_label} | Samples: {len(chart_frame)} | Timezone: {timezone_name}")
+            chart_display = chart_frame.copy()
+            if getattr(chart_display.index, "tz", None) is not None:
+                chart_display.index = chart_display.index.tz_localize(None)
+            st.line_chart(chart_display, height=360)
+
+            history_table = history_frame.sort_values("Recorded At", ascending=False).head(20).copy()
+            history_table["Recorded At"] = history_table["Recorded At"].dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+            st.dataframe(
+                history_table[
+                    [
+                        "Recorded At",
+                        "Portfolio Value DKK",
+                        "Invested DKK",
+                        "Cash DKK",
+                        "Daily P/L DKK",
+                        "Positions",
+                        "Snapshot Type",
+                        "Baseline Session",
+                        "Source",
+                    ]
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+    else:
+        st.caption("No portfolio value history has been recorded yet. The first point is created on CSV import and then refreshed by the 5-minute price monitor.")
 
 with tab_watchlist:
     st.subheader("Daily Refreshed Watchlists")

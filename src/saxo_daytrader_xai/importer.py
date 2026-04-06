@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
+from saxo_daytrader_xai.portfolio import record_portfolio_value_snapshot
 
 
 @dataclass(frozen=True)
@@ -288,6 +289,20 @@ def sync_portfolio(config: dict[str, Any]) -> ImportResult:
         ],
     )
     connection.commit()
+
+    record_portfolio_value_snapshot(
+        connection,
+        recorded_at=imported_at,
+        snapshot_type="import",
+        initial_cash_dkk=float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0),
+        batch_id=batch_id,
+        source="csv_import",
+        extra_payload={
+            "source_positions": len(detail_rows),
+            "imported_positions": imported_positions,
+            "excluded_positions": excluded_positions,
+        },
+    )
 
     append_audit_log(
         connection,

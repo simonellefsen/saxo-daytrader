@@ -39,6 +39,8 @@ price_monitor:
   poll_interval_minutes: 5
   reset_hour_local: 6
   timezone: Europe/Copenhagen
+  history_max_rows: 0
+  history_retention_days: 0
 
 analysis_windows:
   offset_minutes_after_open: 60

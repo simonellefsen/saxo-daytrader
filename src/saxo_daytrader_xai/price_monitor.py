@@ -10,7 +10,12 @@ from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
 from saxo_daytrader_xai.market_data import fetch_live_prices
-from saxo_daytrader_xai.portfolio import fetch_latest_batch_id, fetch_portfolio_positions
+from saxo_daytrader_xai.portfolio import (
+    fetch_latest_batch_id,
+    fetch_portfolio_positions,
+    prune_portfolio_value_history,
+    record_portfolio_value_snapshot,
+)
 
 
 def _resolve_config(config: dict[str, Any] | None, config_path: str | Path) -> dict[str, Any]:
@@ -139,11 +144,41 @@ def refresh_portfolio_price_state(
             updated += 1
 
         resolved_connection.commit()
+        history_cfg = resolved_config.get("price_monitor", {})
+        snapshot_id = record_portfolio_value_snapshot(
+            resolved_connection,
+            recorded_at=updated_at,
+            snapshot_type="price_monitor",
+            initial_cash_dkk=initial_cash_dkk,
+            batch_id=batch_id,
+            baseline_session_date=baseline_session_date,
+            source="price_monitor",
+            extra_payload={
+                "updated_symbols": updated,
+                "baseline_session_date": baseline_session_date,
+            },
+        )
+        pruned_history_rows = 0
+        history_retention_days = int(history_cfg.get("history_retention_days", 0) or 0)
+        keep_since_recorded_at = None
+        if history_retention_days > 0:
+            keep_since_recorded_at = (
+                (reference_time or datetime.now(UTC)).astimezone(UTC) - timedelta(days=history_retention_days)
+            ).isoformat(timespec="seconds")
+        history_max_rows = int(history_cfg.get("history_max_rows", 0) or 0)
+        if keep_since_recorded_at or history_max_rows > 0:
+            pruned_history_rows = prune_portfolio_value_history(
+                resolved_connection,
+                keep_max_rows=history_max_rows if history_max_rows > 0 else None,
+                keep_since_recorded_at=keep_since_recorded_at,
+            )
         payload = {
             "status": "ok",
             "updated": updated,
             "baseline_session_date": baseline_session_date,
             "symbols": symbols,
+            "portfolio_snapshot_id": snapshot_id,
+            "portfolio_history_pruned_rows": pruned_history_rows,
         }
         append_audit_log(resolved_connection, "portfolio_price_state_refreshed", payload)
         return payload

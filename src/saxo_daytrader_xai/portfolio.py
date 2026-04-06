@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -402,6 +403,136 @@ def fetch_realised_tax_summary(connection: sqlite3.Connection, tax_year: int) ->
         (tax_year,),
     ).fetchone()
     return dict(row) if row else {"realised_gain_dkk": 0.0, "tax_dkk": 0.0, "commission_dkk": 0.0, "trade_count": 0}
+
+
+def record_portfolio_value_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    recorded_at: str,
+    snapshot_type: str,
+    initial_cash_dkk: float = 0.0,
+    batch_id: str | None = None,
+    baseline_session_date: str | None = None,
+    source: str | None = None,
+    extra_payload: dict[str, Any] | None = None,
+) -> int:
+    summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    payload = {
+        "summary": summary,
+        "snapshot_type": snapshot_type,
+        "baseline_session_date": baseline_session_date,
+        "source": source,
+    }
+    if extra_payload:
+        payload["extra"] = extra_payload
+    cursor = connection.execute(
+        """
+        INSERT INTO portfolio_value_history (
+            recorded_at,
+            snapshot_type,
+            baseline_session_date,
+            batch_id,
+            total_market_value_dkk,
+            invested_market_value_dkk,
+            cash_balance_dkk,
+            total_cost_basis_dkk,
+            total_unrealised_pnl_dkk,
+            total_daily_pnl_dkk,
+            position_count,
+            source,
+            raw_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            recorded_at,
+            snapshot_type,
+            baseline_session_date,
+            summary.get("batch_id"),
+            float(summary["total_market_value_dkk"]),
+            float(summary["invested_market_value_dkk"]),
+            float(summary["cash_balance_dkk"]),
+            float(summary["total_cost_basis_dkk"]),
+            float(summary["total_unrealised_pnl_dkk"]),
+            float(summary["total_daily_pnl_dkk"]),
+            int(summary["position_count"]),
+            source,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
+
+
+def fetch_portfolio_value_history(
+    connection: sqlite3.Connection,
+    *,
+    start_at: str | None = None,
+    end_at: str | None = None,
+    limit: int = 20_000,
+) -> list[dict[str, Any]]:
+    conditions: list[str] = []
+    params: list[Any] = []
+    if start_at:
+        conditions.append("recorded_at >= ?")
+        params.append(start_at)
+    if end_at:
+        conditions.append("recorded_at <= ?")
+        params.append(end_at)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    rows = connection.execute(
+        f"""
+        SELECT *
+        FROM (
+            SELECT *
+            FROM portfolio_value_history
+            {where_clause}
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT ?
+        )
+        ORDER BY recorded_at ASC, id ASC
+        """,
+        (*params, int(limit)),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        record["raw_payload_json"] = json.loads(record["raw_payload_json"]) if record.get("raw_payload_json") else None
+        output.append(record)
+    return output
+
+
+def prune_portfolio_value_history(
+    connection: sqlite3.Connection,
+    *,
+    keep_max_rows: int | None = None,
+    keep_since_recorded_at: str | None = None,
+) -> int:
+    deleted_rows = 0
+    if keep_since_recorded_at:
+        cursor = connection.execute(
+            """
+            DELETE FROM portfolio_value_history
+            WHERE recorded_at < ?
+            """,
+            (keep_since_recorded_at,),
+        )
+        deleted_rows += int(cursor.rowcount or 0)
+    if keep_max_rows is not None and keep_max_rows > 0:
+        cursor = connection.execute(
+            """
+            DELETE FROM portfolio_value_history
+            WHERE id NOT IN (
+                SELECT id
+                FROM portfolio_value_history
+                ORDER BY recorded_at DESC, id DESC
+                LIMIT ?
+            )
+            """,
+            (keep_max_rows,),
+        )
+        deleted_rows += int(cursor.rowcount or 0)
+    connection.commit()
+    return deleted_rows
 
 
 def fetch_open_lot_summary(connection: sqlite3.Connection) -> list[dict[str, Any]]:

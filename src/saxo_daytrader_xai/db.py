@@ -289,6 +289,26 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_portfolio_price_snapshots_baseline
         ON portfolio_price_snapshots(baseline_session_date, updated_at DESC);
 
+        CREATE TABLE IF NOT EXISTS portfolio_value_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            snapshot_type TEXT NOT NULL,
+            baseline_session_date TEXT,
+            batch_id TEXT,
+            total_market_value_dkk REAL NOT NULL,
+            invested_market_value_dkk REAL NOT NULL,
+            cash_balance_dkk REAL NOT NULL,
+            total_cost_basis_dkk REAL NOT NULL,
+            total_unrealised_pnl_dkk REAL NOT NULL,
+            total_daily_pnl_dkk REAL NOT NULL,
+            position_count INTEGER NOT NULL,
+            source TEXT,
+            raw_payload_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_portfolio_value_history_recorded
+        ON portfolio_value_history(recorded_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
