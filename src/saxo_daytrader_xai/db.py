@@ -243,6 +243,17 @@ def init_db(connection: sqlite3.Connection) -> None:
             last_delivery_id INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS scheduler_status (
+            singleton_key TEXT PRIMARY KEY,
+            started_at TEXT,
+            last_heartbeat_at TEXT,
+            last_cycle_started_at TEXT,
+            last_cycle_completed_at TEXT,
+            last_cycle_status TEXT,
+            last_cycle_json TEXT,
+            scheduler_pid INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -279,3 +290,73 @@ def append_audit_log(connection: sqlite3.Connection, event_type: str, payload: d
         (event_type, json.dumps(payload, ensure_ascii=False, sort_keys=True)),
     )
     connection.commit()
+
+
+def update_scheduler_status(
+    connection: sqlite3.Connection,
+    *,
+    started_at: str | None = None,
+    last_heartbeat_at: str | None = None,
+    last_cycle_started_at: str | None = None,
+    last_cycle_completed_at: str | None = None,
+    last_cycle_status: str | None = None,
+    last_cycle_json: dict[str, Any] | None = None,
+    scheduler_pid: int | None = None,
+) -> None:
+    existing = connection.execute(
+        "SELECT * FROM scheduler_status WHERE singleton_key = 'main'"
+    ).fetchone()
+    if existing is None:
+        connection.execute(
+            """
+            INSERT INTO scheduler_status (
+                singleton_key, started_at, last_heartbeat_at, last_cycle_started_at,
+                last_cycle_completed_at, last_cycle_status, last_cycle_json, scheduler_pid
+            ) VALUES ('main', ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                started_at,
+                last_heartbeat_at,
+                last_cycle_started_at,
+                last_cycle_completed_at,
+                last_cycle_status,
+                json.dumps(last_cycle_json, ensure_ascii=False, sort_keys=True) if last_cycle_json is not None else None,
+                scheduler_pid,
+            ),
+        )
+    else:
+        row = dict(existing)
+        connection.execute(
+            """
+            UPDATE scheduler_status
+            SET started_at = ?,
+                last_heartbeat_at = ?,
+                last_cycle_started_at = ?,
+                last_cycle_completed_at = ?,
+                last_cycle_status = ?,
+                last_cycle_json = ?,
+                scheduler_pid = ?
+            WHERE singleton_key = 'main'
+            """,
+            (
+                started_at if started_at is not None else row["started_at"],
+                last_heartbeat_at if last_heartbeat_at is not None else row["last_heartbeat_at"],
+                last_cycle_started_at if last_cycle_started_at is not None else row["last_cycle_started_at"],
+                last_cycle_completed_at if last_cycle_completed_at is not None else row["last_cycle_completed_at"],
+                last_cycle_status if last_cycle_status is not None else row["last_cycle_status"],
+                json.dumps(last_cycle_json, ensure_ascii=False, sort_keys=True) if last_cycle_json is not None else row["last_cycle_json"],
+                scheduler_pid if scheduler_pid is not None else row["scheduler_pid"],
+            ),
+        )
+    connection.commit()
+
+
+def fetch_scheduler_status(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT * FROM scheduler_status WHERE singleton_key = 'main'"
+    ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    record["last_cycle_json"] = json.loads(record["last_cycle_json"]) if record.get("last_cycle_json") else None
+    return record

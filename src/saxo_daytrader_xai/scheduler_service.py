@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 from apscheduler.schedulers.blocking import BlockingScheduler
 
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import append_audit_log, connect, init_db
+from saxo_daytrader_xai.db import append_audit_log, connect, init_db, update_scheduler_status
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
@@ -35,6 +36,13 @@ def run_scheduler_cycle(
     should_close = connection is None
 
     try:
+        cycle_started_at = datetime.now(UTC).isoformat(timespec="seconds")
+        update_scheduler_status(
+            resolved_connection,
+            last_heartbeat_at=cycle_started_at,
+            last_cycle_started_at=cycle_started_at,
+            scheduler_pid=os.getpid(),
+        )
         calendar_refresh = refresh_market_calendars(resolved_config)
         market_status = get_market_status(resolved_config)
         analysis_summary = summarize_analysis_window(market_status)
@@ -77,6 +85,14 @@ def run_scheduler_cycle(
             "notifications": notification_result,
             "broker_alerts": broker_alert_result,
         }
+        update_scheduler_status(
+            resolved_connection,
+            last_heartbeat_at=outcome["timestamp"],
+            last_cycle_completed_at=outcome["timestamp"],
+            last_cycle_status="ok",
+            last_cycle_json=outcome,
+            scheduler_pid=os.getpid(),
+        )
         append_audit_log(resolved_connection, "scheduler_cycle_completed", outcome)
         return outcome
     except Exception as exc:  # noqa: BLE001
@@ -85,6 +101,14 @@ def run_scheduler_cycle(
             "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
             "error": str(exc),
         }
+        update_scheduler_status(
+            resolved_connection,
+            last_heartbeat_at=payload["timestamp"],
+            last_cycle_completed_at=payload["timestamp"],
+            last_cycle_status="failed",
+            last_cycle_json=payload,
+            scheduler_pid=os.getpid(),
+        )
         append_audit_log(resolved_connection, "scheduler_cycle_failed", payload)
         return payload
     finally:
@@ -98,6 +122,16 @@ def run_scheduler_forever(
     force_mock: bool = False,
 ) -> None:
     resolved_config = load_config(config_path)
+    connection = connect(resolved_config["portfolio"]["database_path"])
+    init_db(connection)
+    started_at = datetime.now(UTC).isoformat(timespec="seconds")
+    update_scheduler_status(
+        connection,
+        started_at=started_at,
+        last_heartbeat_at=started_at,
+        scheduler_pid=os.getpid(),
+    )
+    connection.close()
     interval_minutes = int(resolved_config["scheduler"]["poll_interval_minutes"])
     scheduler = BlockingScheduler(timezone="Europe/Copenhagen")
 

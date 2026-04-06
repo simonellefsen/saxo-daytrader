@@ -12,7 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import connect, init_db
+from saxo_daytrader_xai.db import connect, fetch_scheduler_status, init_db
 from saxo_daytrader_xai.execution_engine import (
     execute_order,
     export_audit_bundle,
@@ -67,6 +67,17 @@ def _format_pct(value: float | None) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _scheduler_health(status: dict | None, poll_interval_minutes: int) -> tuple[str, str]:
+    if not status or not status.get("last_heartbeat_at"):
+        return "unknown", "No scheduler heartbeat recorded yet."
+    last_heartbeat = datetime.fromisoformat(str(status["last_heartbeat_at"]))
+    age_minutes = (datetime.now(UTC) - last_heartbeat).total_seconds() / 60.0
+    healthy_window = max(poll_interval_minutes * 2, 5)
+    if age_minutes <= healthy_window:
+        return "healthy", f"Last heartbeat {age_minutes:.1f} minutes ago."
+    return "stale", f"Last heartbeat {age_minutes:.1f} minutes ago."
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_watchlists(config_path: str) -> dict:
     return build_watchlists(load_config(config_path))
@@ -105,6 +116,7 @@ market_status_rows = get_market_status(config)
 analysis_summary = summarize_analysis_window(market_status_rows)
 latest_decision_report = fetch_latest_decision_report(connection)
 notification_deliveries = fetch_notification_deliveries(connection, limit=50)
+scheduler_status = fetch_scheduler_status(connection)
 daily_summary_preview = build_summary(connection, config, summary_kind="daily")
 weekly_summary_preview = build_summary(connection, config, summary_kind="weekly")
 monthly_summary_preview = build_summary(connection, config, summary_kind="monthly")
@@ -283,6 +295,20 @@ with tab_news:
 
 with tab_market:
     st.subheader("Exchange Status")
+    scheduler_health, scheduler_health_text = _scheduler_health(
+        scheduler_status,
+        int(config.get("scheduler", {}).get("poll_interval_minutes", 15)),
+    )
+    sched_col1, sched_col2, sched_col3, sched_col4 = st.columns(4)
+    sched_col1.metric("Scheduler Health", scheduler_health.upper())
+    sched_col2.metric("Scheduler PID", scheduler_status.get("scheduler_pid") if scheduler_status else "n/a")
+    sched_col3.metric("Last Cycle Status", scheduler_status.get("last_cycle_status") if scheduler_status else "n/a")
+    sched_col4.metric("Last Completed", scheduler_status.get("last_cycle_completed_at") if scheduler_status else "n/a")
+    st.caption(scheduler_health_text)
+    if scheduler_status and scheduler_status.get("last_cycle_json"):
+        with st.expander("Latest Scheduler Cycle"):
+            st.json(scheduler_status["last_cycle_json"])
+
     st.dataframe(
         [
             {
