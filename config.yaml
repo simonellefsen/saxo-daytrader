@@ -50,9 +50,8 @@ execution:
   max_daily_orders: 6
 
 risk:
-  excluded_symbols:
-    - NOVOb:xcse
-    - TSLA:xnas
+  excluded_symbols: []
+  excluded_symbols_csv: ENV:RISK_EXCLUDED_SYMBOLS
   max_position_weight: 0.15
   allow_shorting: false
 

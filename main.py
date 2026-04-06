@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
+import signal
 import subprocess
 import sys
 import threading
@@ -62,7 +65,20 @@ def main() -> int:
         "--browser.gatherUsageStats",
         "false",
     ]
-    return subprocess.run(cmd, check=False).returncode
+    process = subprocess.Popen(cmd, start_new_session=True)
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        print("\nStopping dashboard...", file=sys.stderr)
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            return process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return 130
 
 
 if __name__ == "__main__":

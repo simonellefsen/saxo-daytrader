@@ -214,7 +214,8 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
 
 
 def build_trading_prompt(context: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
-    excluded_symbols = ", ".join(config["risk"]["excluded_symbols"])
+    excluded_symbols = config["risk"]["excluded_symbols"]
+    excluded_symbols_text = ", ".join(excluded_symbols) if excluded_symbols else "none configured"
     system_prompt = f"""
 You are the portfolio decision engine for a Danish SaxoInvestor day-trading system.
 
@@ -222,7 +223,7 @@ Core goal for every decision:
 {config['xai']['goal']}
 
 Hard rules:
-- Never trade or recommend trading these excluded symbols: {excluded_symbols}.
+- Never trade or recommend trading these excluded symbols: {excluded_symbols_text}.
 - Never short. Long-only portfolio.
 - No single position may exceed 15%% of portfolio value after the proposed trade.
 - Treat all pnl, commission, and taxation impacts in DKK.

@@ -38,6 +38,19 @@ def _resolve_env(value: Any) -> Any:
     return value
 
 
+def _normalize_symbol_list(value: Any) -> list[str]:
+    if value in (None, "", []):
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        output: list[str] = []
+        for item in value:
+            output.extend(_normalize_symbol_list(item))
+        return output
+    return []
+
+
 def load_config(config_path: str | os.PathLike[str] = "config.yaml") -> dict[str, Any]:
     load_dotenv()
     path = Path(config_path).expanduser().resolve()
@@ -48,6 +61,14 @@ def load_config(config_path: str | os.PathLike[str] = "config.yaml") -> dict[str
     portfolio_cfg = config.setdefault("portfolio", {})
     portfolio_cfg["database_path"] = str((path.parent / portfolio_cfg.get("database_path", "ledger.db")).resolve())
     portfolio_cfg["source_csv"] = str((path.parent / portfolio_cfg["source_csv"]).resolve())
+    risk_cfg = config.setdefault("risk", {})
+    merged_exclusions: list[str] = []
+    for symbol in _normalize_symbol_list(risk_cfg.get("excluded_symbols")) + _normalize_symbol_list(
+        risk_cfg.get("excluded_symbols_csv")
+    ):
+        if symbol not in merged_exclusions:
+            merged_exclusions.append(symbol)
+    risk_cfg["excluded_symbols"] = merged_exclusions
     saxo_cfg = config.setdefault("saxo", {})
     if saxo_cfg.get("session_path"):
         saxo_cfg["session_path"] = str((path.parent / saxo_cfg["session_path"]).resolve())

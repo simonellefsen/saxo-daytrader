@@ -111,8 +111,11 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
 st.title("saxo-daytrader-xai")
 st.caption("Phase 7 dashboard with decision automation, simulation execution, Saxo live submission, broker sync, and audit exports.")
 
-excluded_symbols = ", ".join(config.get("risk", {}).get("excluded_symbols", []))
-st.info(f"Excluded symbols enforced globally: {excluded_symbols}")
+excluded_symbols = config.get("risk", {}).get("excluded_symbols", [])
+if excluded_symbols:
+    st.info(f"Excluded symbols enforced globally: {', '.join(excluded_symbols)}")
+else:
+    st.info("No globally excluded symbols are configured.")
 
 if analysis_summary["analysis_window_active"]:
     st.success(f"Analysis window active: {', '.join(analysis_summary['active_markets'])}")
