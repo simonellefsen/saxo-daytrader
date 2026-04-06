@@ -224,6 +224,16 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_notification_deliveries_summary
         ON notification_deliveries(summary_date, channel, status, created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS notification_channel_state (
+            channel TEXT PRIMARY KEY,
+            summary_date TEXT,
+            last_attempt_at TEXT,
+            next_attempt_after TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_status TEXT,
+            last_error_text TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import smtplib
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from email.message import EmailMessage
 from typing import Any
 
@@ -122,24 +122,48 @@ def build_daily_summary(connection, config: dict[str, Any], reference_time: date
         ],
     }
     subject = f"saxo-daytrader-xai daily summary {summary_date.isoformat()}"
-    lines = [
-        subject,
-        f"Portfolio value: {portfolio_summary['total_market_value_dkk']:.2f} DKK",
-        f"Daily portfolio P/L: {portfolio_summary['total_daily_pnl_dkk']:.2f} DKK",
-        f"Unrealised P/L: {portfolio_summary['total_unrealised_pnl_dkk']:.2f} DKK",
-        f"Trades today: {int(trade_stats['trade_count'])}",
-        f"Realised gain today: {float(trade_stats['realised_gain_dkk']):.2f} DKK",
-        f"Commission today: {float(trade_stats['commission_dkk']):.2f} DKK",
-        f"Tax today: {float(trade_stats['tax_dkk']):.2f} DKK",
-        f"Latest decision report: {payload['latest_decision_report']['status'] or 'none'}",
-        f"Suggested trades in latest report: {suggested_trade_count}",
-    ]
-    if top_positions:
-        lines.append("Top positions:")
-        lines.extend(
-            f"- {row['symbol']}: {float(row['market_value_dkk']):.2f} DKK ({float(row['allocation_pct']) * 100:.2f}%)"
-            for row in top_positions[:3]
-        )
+    style = str(config.get("notifications", {}).get("summary_style", "structured")).lower()
+    if style == "compact":
+        lines = [
+            subject,
+            f"Portfolio {portfolio_summary['total_market_value_dkk']:.2f} DKK | Daily P/L {portfolio_summary['total_daily_pnl_dkk']:.2f} DKK | Trades {int(trade_stats['trade_count'])}",
+            f"Realised {float(trade_stats['realised_gain_dkk']):.2f} DKK | Tax {float(trade_stats['tax_dkk']):.2f} DKK | Commission {float(trade_stats['commission_dkk']):.2f} DKK",
+            f"Decision report {payload['latest_decision_report']['status'] or 'none'} | Suggested trades {suggested_trade_count}",
+        ]
+    else:
+        lines = [
+            subject,
+            "",
+            "Portfolio:",
+            f"- Value: {portfolio_summary['total_market_value_dkk']:.2f} DKK",
+            f"- Daily P/L: {portfolio_summary['total_daily_pnl_dkk']:.2f} DKK",
+            f"- Unrealised P/L: {portfolio_summary['total_unrealised_pnl_dkk']:.2f} DKK",
+            "",
+            "Trading Today:",
+            f"- Trades: {int(trade_stats['trade_count'])}",
+            f"- Realised gain: {float(trade_stats['realised_gain_dkk']):.2f} DKK",
+            f"- Net amount: {float(trade_stats['net_amount_dkk']):.2f} DKK",
+            f"- Tax: {float(trade_stats['tax_dkk']):.2f} DKK",
+            f"- Commission: {float(trade_stats['commission_dkk']):.2f} DKK",
+            "",
+            "Decision Engine:",
+            f"- Latest report: {payload['latest_decision_report']['status'] or 'none'}",
+            f"- Suggested trades: {suggested_trade_count}",
+        ]
+        if execution_stats:
+            lines.append("- Execution status counts:")
+            lines.extend(f"  - {status}: {count}" for status, count in sorted(execution_stats.items()))
+        if top_positions:
+            lines.extend(
+                [
+                    "",
+                    "Top Positions:",
+                    *[
+                        f"- {row['symbol']}: {float(row['market_value_dkk']):.2f} DKK ({float(row['allocation_pct']) * 100:.2f}%), daily {float(row['daily_pnl_dkk'] or 0):.2f} DKK"
+                        for row in top_positions[:3]
+                    ],
+                ]
+            )
     return {
         "summary_date": payload["summary_date"],
         "subject": subject,
@@ -192,6 +216,88 @@ def _already_sent(connection, summary_date: str, channel: str) -> bool:
         (summary_date, channel),
     ).fetchone()
     return row is not None
+
+
+def _notification_state(connection, channel: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM notification_channel_state
+        WHERE channel = ?
+        """,
+        (channel,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _upsert_notification_state(
+    connection,
+    *,
+    channel: str,
+    summary_date: str,
+    last_attempt_at: str,
+    next_attempt_after: str | None,
+    attempt_count: int,
+    last_status: str,
+    last_error_text: str | None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO notification_channel_state (
+            channel, summary_date, last_attempt_at, next_attempt_after, attempt_count, last_status, last_error_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(channel) DO UPDATE SET
+            summary_date = excluded.summary_date,
+            last_attempt_at = excluded.last_attempt_at,
+            next_attempt_after = excluded.next_attempt_after,
+            attempt_count = excluded.attempt_count,
+            last_status = excluded.last_status,
+            last_error_text = excluded.last_error_text
+        """,
+        (
+            channel,
+            summary_date,
+            last_attempt_at,
+            next_attempt_after,
+            attempt_count,
+            last_status,
+            last_error_text,
+        ),
+    )
+    connection.commit()
+
+
+def _channel_ready(
+    connection,
+    config: dict[str, Any],
+    *,
+    channel: str,
+    summary_date: str,
+    reference_time: datetime,
+    force: bool,
+) -> tuple[bool, str]:
+    if force:
+        return True, "forced"
+    if _already_sent(connection, summary_date, channel):
+        return False, "already_sent"
+    state = _notification_state(connection, channel)
+    if not state or state.get("summary_date") != summary_date:
+        return True, "fresh"
+    max_attempts = int(config.get("notifications", {}).get("max_attempts_per_day", 3))
+    if int(state.get("attempt_count") or 0) >= max_attempts:
+        return False, "max_attempts_reached"
+    next_attempt_after = state.get("next_attempt_after")
+    if next_attempt_after:
+        next_dt = datetime.fromisoformat(str(next_attempt_after))
+        if reference_time < next_dt:
+            return False, "backoff_active"
+    cooldown_minutes = int(config.get("notifications", {}).get("channel_cooldown_minutes", 240))
+    last_attempt_at = state.get("last_attempt_at")
+    if last_attempt_at and state.get("last_status") == "sent":
+        last_dt = datetime.fromisoformat(str(last_attempt_at))
+        if reference_time < last_dt + timedelta(minutes=cooldown_minutes):
+            return False, "cooldown_active"
+    return True, "ready"
 
 
 def _send_slack(config: dict[str, Any], subject: str, message_text: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -282,6 +388,7 @@ def dispatch_daily_summary_if_due(
         return {"status": "not_due", "sent": []}
 
     summary = build_daily_summary(connection, config, reference_time=reference_time)
+    now_utc = (reference_time or datetime.now(UTC)).astimezone(UTC)
     channels: list[str] = []
     if notifications_cfg.get("slack", {}).get("enabled"):
         channels.append("slack")
@@ -292,8 +399,19 @@ def dispatch_daily_summary_if_due(
 
     sent: list[dict[str, Any]] = []
     for channel in channels:
-        if not force and _already_sent(connection, summary["summary_date"], channel):
+        is_ready, reason = _channel_ready(
+            connection,
+            config,
+            channel=channel,
+            summary_date=summary["summary_date"],
+            reference_time=now_utc,
+            force=force,
+        )
+        if not is_ready:
+            sent.append({"channel": channel, "status": "skipped", "reason": reason})
             continue
+        previous_state = _notification_state(connection, channel) or {}
+        attempt_count = int(previous_state.get("attempt_count") or 0) + 1
         try:
             if channel == "slack":
                 delivery_meta = _send_slack(config, summary["subject"], summary["message_text"], summary["payload"])
@@ -309,6 +427,16 @@ def dispatch_daily_summary_if_due(
                 subject=summary["subject"],
                 message_text=summary["message_text"],
                 payload={**summary["payload"], "delivery_meta": delivery_meta},
+            )
+            _upsert_notification_state(
+                connection,
+                channel=channel,
+                summary_date=summary["summary_date"],
+                last_attempt_at=now_utc.isoformat(timespec="seconds"),
+                next_attempt_after=None,
+                attempt_count=attempt_count,
+                last_status="sent",
+                last_error_text=None,
             )
             append_audit_log(
                 connection,
@@ -326,6 +454,17 @@ def dispatch_daily_summary_if_due(
                 message_text=summary["message_text"],
                 payload=summary["payload"],
                 error_text=str(exc),
+            )
+            next_attempt = now_utc + timedelta(minutes=int(config.get("notifications", {}).get("retry_backoff_minutes", 30)))
+            _upsert_notification_state(
+                connection,
+                channel=channel,
+                summary_date=summary["summary_date"],
+                last_attempt_at=now_utc.isoformat(timespec="seconds"),
+                next_attempt_after=next_attempt.isoformat(timespec="seconds"),
+                attempt_count=attempt_count,
+                last_status="failed",
+                last_error_text=str(exc),
             )
             append_audit_log(
                 connection,

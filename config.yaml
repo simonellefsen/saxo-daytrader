@@ -114,6 +114,10 @@ notifications:
   timezone: Europe/Copenhagen
   dispatch_hour_local: 18
   dispatch_minute_local: 15
+  retry_backoff_minutes: 30
+  max_attempts_per_day: 3
+  channel_cooldown_minutes: 240
+  summary_style: structured
   slack:
     enabled: false
     webhook_url: ENV:SLACK_WEBHOOK_URL

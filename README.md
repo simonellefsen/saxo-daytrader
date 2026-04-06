@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 12 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 13 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 12 includes
+## What Phase 13 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -33,6 +33,7 @@ Phase 12 foundation for a local Python day-trading assistant focused on a Danish
 - Immutable `notification_deliveries` records and notification history in the UI
 - Renderable `systemd` and `launchd` service templates for unattended local deployment
 - Live Saxo order-management actions for broker-side replace and cancel requests
+- Notification throttling, retry backoff, and richer structured daily-summary formatting
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -184,10 +185,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 12 validation script:
+Run the Phase 13 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase12.py
+.venv/bin/python scripts/validate_phase13.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -199,14 +200,12 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 12 validation passed.
+Phase 13 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-Replace request status: broker_replace_requested
-Cancel request status: broker_cancel_requested
-Replace sync status: broker_amended
-Cancel sync status: broker_cancelled
-Broker event rows: 4
+Failed deliveries: 1
+Sent deliveries: 1
+Slack success payloads: 1
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -226,6 +225,7 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase10.py
 .venv/bin/python scripts/validate_phase11.py
 .venv/bin/python scripts/validate_phase12.py
+.venv/bin/python scripts/validate_phase13.py
 ```
 
 ## Project layout
@@ -248,6 +248,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase10.py
 │   └── validate_phase11.py
 │   └── validate_phase12.py
+│   └── validate_phase13.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -272,5 +273,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add per-channel delivery throttling/backoff and richer notification templates.
+1. Add notification digest variants for weekly and monthly summaries.
 3. Add per-channel delivery throttling/backoff and richer notification templates.
