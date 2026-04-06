@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 3 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 5 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 3 includes
+## What Phase 5 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -13,6 +13,13 @@ Phase 3 foundation for a local Python day-trading assistant focused on a Danish 
 - Danish share-income tax engine with 27% / 42% brackets
 - Configurable commission and FX-conversion cost handling
 - Immutable trade ledger and lot-realization records
+- xAI decision engine using the official Responses API
+- Structured JSON decision reports with step-by-step rationale, watchlist focus, and suggested trades
+- Decision report persistence with prompt, raw response, parsed report, and error tracking
+- APScheduler-based background worker for recurring analysis cycles
+- Simulation execution queue with immutable ledger updates
+- Live-mode approval queue with dry-run protection
+- Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
   - holdings allocation table with live quote refresh support
@@ -20,6 +27,8 @@ Phase 3 foundation for a local Python day-trading assistant focused on a Danish 
   - news, earnings, and macro headline tabs
   - market status and analysis-window detection
   - realised gain / tax summary from the trade ledger
+  - a Decision Report tab that can auto-run during analysis windows or run on demand
+  - an Execution tab for queued orders, live approvals, and audit export
 
 ## Install
 
@@ -41,6 +50,28 @@ Useful options:
 ```
 
 `main.py` imports the CSV into `ledger.db` before launching Streamlit.
+
+## Scheduler
+
+Run the always-on background worker:
+
+```bash
+.venv/bin/python scripts/run_scheduler.py
+```
+
+Run one mock scheduler cycle for smoke testing:
+
+```bash
+.venv/bin/python scripts/run_scheduler.py --once --mock-decisions --force-decision
+```
+
+The scheduler:
+
+- checks the configured exchange analysis windows
+- generates xAI decision reports during eligible windows
+- queues suggested trades
+- auto-executes queued trades in simulation mode
+- records scheduler activity in `audit_log`
 
 ## Saxo OAuth helper
 
@@ -78,32 +109,38 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 3 validation script:
+Run the Phase 5 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase3.py
+.venv/bin/python scripts/validate_phase5.py
 ```
 
-Expected output for the provided `Positioner_05-apr-2026_12_16_34.csv`:
+Phase 4 validation remains available. To validate against the live xAI API:
+
+```bash
+.venv/bin/python scripts/validate_phase4.py --live
+```
+
+Expected output shape:
 
 ```text
-Phase 3 validation passed.
+Phase 5 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-Active positions in DB: 18
-Simulated sells: 18
-Realised gains DKK: -1740.61
-Tax impact DKK: 0.00
-Commission DKK: 361.44
+Execution orders created: 1
+Executed simulation orders: 3
+Trade ledger rows: 3
 ```
 
-The script then prints exact per-position sell outcomes for a 10% simulation across all imported holdings.
+The exact queued-order count can vary slightly with the imported portfolio snapshot.
 
 Earlier validation scripts remain available:
 
 ```bash
 .venv/bin/python scripts/validate_phase1.py
 .venv/bin/python scripts/validate_phase2.py
+.venv/bin/python scripts/validate_phase3.py
+.venv/bin/python scripts/validate_phase4.py
 ```
 
 ## Project layout
@@ -117,24 +154,30 @@ Earlier validation scripts remain available:
 │   └── validate_phase1.py
 │   └── validate_phase2.py
 │   └── validate_phase3.py
+│   └── validate_phase4.py
+│   └── validate_phase5.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
         ├── db.py
+        ├── execution_engine.py
+        ├── fx_service.py
         ├── importer.py
         ├── market_data.py
         ├── market_news.py
         ├── market_schedule.py
         ├── market_symbols.py
         ├── portfolio.py
+        ├── scheduler_service.py
         ├── tax_engine.py
         ├── watchlists.py
+        ├── xai_decision.py
         └── ui/
             └── app.py
 ```
 
 ## Next-phase todo
 
-1. Add the xAI decision engine with the full internal trading prompt and JSON trade suggestions.
-2. Store xAI prompts, responses, and decision reports in the immutable audit trail.
-3. Add a decision-report page to the UI and wire the analysis window to run the xAI engine on schedule.
+1. Wire approved live orders to the Saxo OpenAPI order endpoints once OAuth access-token storage is in place.
+2. Add optional Slack or email daily summaries from the scheduler worker.
+3. Add systemd and launchd service examples for unattended local deployment.

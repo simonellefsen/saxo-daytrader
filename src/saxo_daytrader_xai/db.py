@@ -121,6 +121,52 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_lot_realizations_lot
         ON lot_realizations(lot_id, ledger_id);
 
+        CREATE TABLE IF NOT EXISTS decision_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            report_date TEXT NOT NULL,
+            batch_id TEXT,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            analysis_window_active INTEGER NOT NULL DEFAULT 0,
+            response_id TEXT,
+            prompt_text TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            response_json TEXT,
+            report_json TEXT,
+            error_text TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_decision_reports_created
+        ON decision_reports(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS execution_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            report_id INTEGER,
+            symbol TEXT NOT NULL,
+            action TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            adapter TEXT NOT NULL,
+            requested_weight_pct REAL,
+            quantity REAL,
+            price_local REAL,
+            currency TEXT,
+            estimated_value_dkk REAL,
+            approval_required INTEGER NOT NULL DEFAULT 0,
+            approved_at TEXT,
+            ledger_id INTEGER,
+            request_json TEXT NOT NULL,
+            execution_result_json TEXT,
+            error_text TEXT,
+            FOREIGN KEY(report_id) REFERENCES decision_reports(id),
+            FOREIGN KEY(ledger_id) REFERENCES trade_ledger(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_execution_orders_report
+        ON execution_orders(report_id, status);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

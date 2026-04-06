@@ -1,12 +1,16 @@
 __all__ = [
     "config",
     "db",
+    "execution_engine",
+    "fx_service",
     "importer",
     "market_data",
     "market_news",
     "market_schedule",
     "market_symbols",
     "portfolio",
+    "scheduler_service",
     "tax_engine",
     "watchlists",
+    "xai_decision",
 ]

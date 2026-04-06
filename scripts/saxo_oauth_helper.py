@@ -42,7 +42,19 @@ class CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        self.server.auth_params = {key: values[0] for key, values in params.items()}
+        expected_path = getattr(self.server, "expected_callback_path", None)
+        if expected_path and parsed.path != expected_path:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        auth_params = {key: values[0] for key, values in params.items()}
+        if not any(key in auth_params for key in ("code", "error", "state")):
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        self.server.auth_params = auth_params
         body = (
             "<html><body><h1>Saxo authorization complete</h1>"
             "<p>You can close this window and return to the terminal.</p></body></html>"
@@ -76,6 +88,7 @@ def wait_for_callback(redirect_uri: str, timeout_seconds: int) -> dict[str, str]
     server = ThreadingHTTPServer((parsed.hostname, parsed.port), CallbackHandler)
     server.timeout = 1
     server.auth_params = None
+    server.expected_callback_path = parsed.path or "/"
     deadline = time.time() + timeout_seconds
     try:
         while time.time() < deadline and server.auth_params is None:

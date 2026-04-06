@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import streamlit as st
@@ -12,6 +13,12 @@ if str(SRC) not in sys.path:
 
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import connect, init_db
+from saxo_daytrader_xai.execution_engine import (
+    execute_order,
+    export_audit_bundle,
+    fetch_execution_orders,
+    queue_and_maybe_execute_latest_report,
+)
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
@@ -24,6 +31,11 @@ from saxo_daytrader_xai.portfolio import (
     fetch_trade_ledger,
 )
 from saxo_daytrader_xai.watchlists import build_watchlists
+from saxo_daytrader_xai.xai_decision import (
+    fetch_latest_decision_report,
+    generate_decision_report,
+    should_auto_run_decision_report,
+)
 
 
 def _format_dkk(value: float | None) -> str:
@@ -81,9 +93,17 @@ watchlist_symbols = [row["symbol"] for row in watchlists["nordic"][:8]] + [row["
 market_intelligence = _load_market_intelligence(config_path, tuple(portfolio_symbols[:10]), tuple(watchlist_symbols))
 market_status_rows = get_market_status(config)
 analysis_summary = summarize_analysis_window(market_status_rows)
+latest_decision_report = fetch_latest_decision_report(connection)
+
+if should_auto_run_decision_report(connection, config, analysis_summary["analysis_window_active"]):
+    with st.spinner("Generating xAI decision report..."):
+        generated_report = generate_decision_report(config=config, connection=connection)
+        queue_and_maybe_execute_latest_report(config=config, connection=connection)
+        latest_decision_report = fetch_latest_decision_report(connection)
+        st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 2 dashboard with live prices, curated watchlists, headlines, earnings, and exchange analysis windows.")
+st.caption("Phase 5 dashboard with decision automation, simulation execution, approval gating, and audit exports.")
 
 excluded_symbols = ", ".join(config.get("risk", {}).get("excluded_symbols", []))
 st.info(f"Excluded symbols enforced globally: {excluded_symbols}")
@@ -99,7 +119,9 @@ col2.metric("Portfolio Value", _format_dkk(summary["total_market_value_dkk"]))
 col3.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
 col4.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
 
-tab_portfolio, tab_watchlist, tab_news, tab_market = st.tabs(["Portfolio", "Watchlist", "News", "Market Status"])
+tab_portfolio, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution = st.tabs(
+    ["Portfolio", "Watchlist", "News", "Market Status", "Decision Report", "Execution"]
+)
 
 with tab_portfolio:
     st.subheader("Portfolio Snapshot")
@@ -255,5 +277,152 @@ with tab_market:
         "The system marks a market as analysis-active when the current local exchange time is "
         "between 60 and 90 minutes after the exchange opens."
     )
+
+with tab_decision:
+    st.subheader("xAI Decision Report")
+    button_col1, button_col2, button_col3 = st.columns(3)
+    if button_col1.button("Run Decision Now", type="primary"):
+        with st.spinner("Calling xAI decision engine..."):
+            result = generate_decision_report(config=config, connection=connection)
+            queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            latest_decision_report = fetch_latest_decision_report(connection)
+        st.success(f"Decision report status: {result['status']}")
+        st.rerun()
+    if button_col2.button("Run Mock Decision"):
+        with st.spinner("Generating mock decision report..."):
+            result = generate_decision_report(config=config, connection=connection, force_mock=True)
+            queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            latest_decision_report = fetch_latest_decision_report(connection)
+        st.info(f"Mock decision report status: {result['status']}")
+        st.rerun()
+    if button_col3.button("Queue Latest Suggestions"):
+        with st.spinner("Queuing latest report suggestions..."):
+            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
+        st.info(f"Queue result: {queue_result['status']}")
+        st.rerun()
+
+    if latest_decision_report:
+        report = latest_decision_report["report_json"] or {}
+        st.caption(
+            f"Created at {latest_decision_report['created_at']} | "
+            f"status={latest_decision_report['status']} | "
+            f"model={latest_decision_report['model']}"
+        )
+        if latest_decision_report.get("error_text"):
+            st.warning(latest_decision_report["error_text"])
+
+        st.markdown(f"**{report.get('report_title', 'Decision Report')}**")
+        st.write(report.get("daily_target_assessment", ""))
+
+        regime = report.get("market_regime", {})
+        portfolio_assessment = report.get("portfolio_assessment", {})
+        st.json(
+            {
+                "analysis_window_active": report.get("analysis_window_active"),
+                "goal": report.get("goal"),
+                "market_regime": regime,
+                "portfolio_assessment": portfolio_assessment,
+            }
+        )
+
+        st.markdown("**Reasoning Steps**")
+        for step in report.get("reasoning_steps", []):
+            st.write(f"- {step}")
+
+        st.markdown("**Risk Rules Check**")
+        for item in report.get("risk_rules_check", []):
+            st.write(f"- {item}")
+
+        st.markdown("**Suggested Trades**")
+        suggested_trades = report.get("suggested_trades", [])
+        if suggested_trades:
+            st.dataframe(suggested_trades, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No suggested trades in the latest report.")
+
+        st.markdown("**Watchlist Focus**")
+        watchlist_focus = report.get("watchlist_focus", [])
+        if watchlist_focus:
+            st.dataframe(watchlist_focus, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No watchlist focus items in the latest report.")
+
+        with st.expander("Prompt and Raw Report"):
+            st.json(
+                {
+                    "prompt": latest_decision_report.get("request_json"),
+                    "report": latest_decision_report.get("report_json"),
+                }
+            )
+    else:
+        st.caption("No decision report has been generated yet.")
+
+with tab_execution:
+    st.subheader("Execution Queue")
+    execution_orders = fetch_execution_orders(connection, limit=100)
+    pending_approvals = [row for row in execution_orders if row["status"] == "pending_approval"]
+    executed_orders = [row for row in execution_orders if row["status"] == "executed"]
+
+    mode_col1, mode_col2, mode_col3, mode_col4 = st.columns(4)
+    mode_col1.metric("Execution Mode", str(config["execution"]["mode"]).upper())
+    mode_col2.metric("Queued Orders", len(execution_orders))
+    mode_col3.metric("Pending Approval", len(pending_approvals))
+    mode_col4.metric("Executed Orders", len(executed_orders))
+
+    st.caption(
+        f"Adapter={config['execution']['adapter']} | dry_run={config['app']['dry_run']} | "
+        f"max_daily_orders={config['execution']['max_daily_orders']}"
+    )
+
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Run Queue Processor"):
+        with st.spinner("Processing queued execution orders..."):
+            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
+        st.success(f"Queue processor status: {queue_result['status']}")
+        st.rerun()
+
+    if action_col2.button("Export Audit Bundle"):
+        export_dir = ROOT / "exports" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        export_result = export_audit_bundle(str(export_dir), config=config, connection=connection)
+        st.success(f"Audit bundle exported to {export_result['output_dir']}")
+
+    if config["execution"]["mode"] == "live" and pending_approvals:
+        st.markdown("**Pending Live Approvals**")
+        for order in pending_approvals:
+            cols = st.columns([3, 2, 2, 2, 2])
+            cols[0].write(f"{order['action']} {order['symbol']}")
+            cols[1].write(f"Qty {order['quantity']:.4f}")
+            cols[2].write(_format_money(order["price_local"], order["currency"]))
+            cols[3].write(_format_dkk(order["estimated_value_dkk"]))
+            if cols[4].button("Approve", key=f"approve-{order['id']}"):
+                result = execute_order(order["id"], config=config, connection=connection, approved=True)
+                st.success(f"Order {order['id']} status: {result['status']}")
+                st.rerun()
+
+    if execution_orders:
+        st.dataframe(
+            [
+                {
+                    "ID": row["id"],
+                    "Created": row["created_at"],
+                    "Symbol": row["symbol"],
+                    "Action": row["action"],
+                    "Mode": row["mode"],
+                    "Status": row["status"],
+                    "Adapter": row["adapter"],
+                    "Target Weight": _format_pct(row["requested_weight_pct"]),
+                    "Quantity": row["quantity"],
+                    "Price": _format_money(row["price_local"], row["currency"]),
+                    "Estimated Value DKK": _format_dkk(row["estimated_value_dkk"]),
+                    "Ledger ID": row["ledger_id"],
+                    "Error": row["error_text"],
+                }
+                for row in execution_orders
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No execution orders have been created yet.")
 
 connection.close()
