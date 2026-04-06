@@ -4,6 +4,9 @@ app:
   dry_run: true
   simulation_mode: true
   launch_scheduler_with_dashboard: true
+  scheduler_restart_on_failure: true
+  scheduler_max_restarts: 3
+  scheduler_restart_delay_seconds: 2.0
 
 portfolio:
   base_currency: DKK

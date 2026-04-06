@@ -22,6 +22,66 @@ def _resolve_config(config: dict[str, Any] | None, config_path: str | Path) -> d
     return load_config(config_path)
 
 
+def _pid_is_alive(pid: int | None) -> bool | None:
+    if pid in (None, 0):
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def assess_scheduler_worker_health(
+    status: dict[str, Any] | None,
+    *,
+    poll_interval_minutes: int,
+    reference_time: datetime | None = None,
+) -> dict[str, Any]:
+    if not status or not status.get("last_heartbeat_at"):
+        return {
+            "status": "unknown",
+            "message": "No scheduler heartbeat recorded yet.",
+            "heartbeat_age_minutes": None,
+            "pid_alive": None,
+            "restart_recommended": False,
+        }
+
+    now = (reference_time or datetime.now(UTC)).astimezone(UTC)
+    last_heartbeat = datetime.fromisoformat(str(status["last_heartbeat_at"]))
+    age_minutes = (now - last_heartbeat).total_seconds() / 60.0
+    healthy_window = max(poll_interval_minutes * 2, 5)
+    pid_alive = _pid_is_alive(status.get("scheduler_pid"))
+
+    if pid_alive is False:
+        return {
+            "status": "dead",
+            "message": f"Scheduler PID {status.get('scheduler_pid')} is no longer running.",
+            "heartbeat_age_minutes": age_minutes,
+            "pid_alive": False,
+            "restart_recommended": True,
+        }
+    if age_minutes > healthy_window:
+        return {
+            "status": "stale",
+            "message": f"Last heartbeat {age_minutes:.1f} minutes ago.",
+            "heartbeat_age_minutes": age_minutes,
+            "pid_alive": pid_alive,
+            "restart_recommended": True,
+        }
+    return {
+        "status": "healthy",
+        "message": f"Last heartbeat {age_minutes:.1f} minutes ago.",
+        "heartbeat_age_minutes": age_minutes,
+        "pid_alive": pid_alive,
+        "restart_recommended": False,
+    }
+
+
 def run_scheduler_cycle(
     *,
     config: dict[str, Any] | None = None,

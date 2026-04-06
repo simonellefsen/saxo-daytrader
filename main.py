@@ -35,10 +35,32 @@ def _terminate_process_group(process: subprocess.Popen[bytes] | None, *, sig: in
         os.killpg(process.pid, sig)
 
 
+def _spawn_process(cmd: list[str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(cmd, start_new_session=True)
+
+
+def _scheduler_restart_enabled(config: dict) -> bool:
+    return bool(config.get("app", {}).get("scheduler_restart_on_failure", True))
+
+
+def _scheduler_max_restarts(config: dict) -> int:
+    return int(config.get("app", {}).get("scheduler_max_restarts", 3))
+
+
+def _scheduler_restart_delay_seconds(config: dict) -> float:
+    return float(config.get("app", {}).get("scheduler_restart_delay_seconds", 2.0))
+
+
 def _wait_for_children(
     dashboard_process: subprocess.Popen[bytes],
     scheduler_process: subprocess.Popen[bytes] | None,
+    *,
+    scheduler_cmd: list[str] | None = None,
+    scheduler_restart_enabled: bool = False,
+    scheduler_max_restarts: int = 0,
+    scheduler_restart_delay_seconds: float = 2.0,
 ) -> int:
+    scheduler_restart_count = 0
     while True:
         dashboard_code = dashboard_process.poll()
         scheduler_code = scheduler_process.poll() if scheduler_process is not None else None
@@ -51,6 +73,20 @@ def _wait_for_children(
             return int(dashboard_code)
 
         if scheduler_process is not None and scheduler_code not in (None, 0):
+            if (
+                scheduler_cmd is not None
+                and scheduler_restart_enabled
+                and scheduler_restart_count < scheduler_max_restarts
+            ):
+                scheduler_restart_count += 1
+                print(
+                    f"Scheduler exited with code {scheduler_code}; restarting "
+                    f"({scheduler_restart_count}/{scheduler_max_restarts})...",
+                    file=sys.stderr,
+                )
+                time.sleep(scheduler_restart_delay_seconds)
+                scheduler_process = _spawn_process(scheduler_cmd)
+                continue
             print("Scheduler exited unexpectedly; stopping dashboard...", file=sys.stderr)
             _terminate_process_group(dashboard_process, sig=signal.SIGTERM)
             with contextlib.suppress(subprocess.TimeoutExpired):
@@ -104,6 +140,7 @@ def main() -> int:
         and not args.no_scheduler
     )
     scheduler_process = None
+    scheduler_cmd = None
     if launch_scheduler:
         scheduler_cmd = [
             sys.executable,
@@ -112,11 +149,18 @@ def main() -> int:
             str(Path(args.config).resolve()),
         ]
         print("Launching background scheduler alongside dashboard...")
-        scheduler_process = subprocess.Popen(scheduler_cmd, start_new_session=True)
+        scheduler_process = _spawn_process(scheduler_cmd)
 
-    dashboard_process = subprocess.Popen(dashboard_cmd, start_new_session=True)
+    dashboard_process = _spawn_process(dashboard_cmd)
     try:
-        return _wait_for_children(dashboard_process, scheduler_process)
+        return _wait_for_children(
+            dashboard_process,
+            scheduler_process,
+            scheduler_cmd=scheduler_cmd,
+            scheduler_restart_enabled=_scheduler_restart_enabled(config),
+            scheduler_max_restarts=_scheduler_max_restarts(config),
+            scheduler_restart_delay_seconds=_scheduler_restart_delay_seconds(config),
+        )
     except KeyboardInterrupt:
         print("\nStopping dashboard...", file=sys.stderr)
         _terminate_process_group(dashboard_process, sig=signal.SIGTERM)

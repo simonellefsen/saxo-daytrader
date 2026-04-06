@@ -32,7 +32,7 @@ from saxo_daytrader_xai.notifications import (
     dispatch_summaries_if_due,
     fetch_notification_deliveries,
 )
-from saxo_daytrader_xai.scheduler_service import run_manual_scheduler_cycle
+from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -66,17 +66,6 @@ def _format_pct(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value * 100:.2f}%"
-
-
-def _scheduler_health(status: dict | None, poll_interval_minutes: int) -> tuple[str, str]:
-    if not status or not status.get("last_heartbeat_at"):
-        return "unknown", "No scheduler heartbeat recorded yet."
-    last_heartbeat = datetime.fromisoformat(str(status["last_heartbeat_at"]))
-    age_minutes = (datetime.now(UTC) - last_heartbeat).total_seconds() / 60.0
-    healthy_window = max(poll_interval_minutes * 2, 5)
-    if age_minutes <= healthy_window:
-        return "healthy", f"Last heartbeat {age_minutes:.1f} minutes ago."
-    return "stale", f"Last heartbeat {age_minutes:.1f} minutes ago."
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -133,7 +122,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 25 dashboard with autonomous simulation support, live broker workflow, scheduler controls, route-aware notifications, and scheduler cycle history.")
+st.caption("Phase 26 dashboard with autonomous simulation support, live broker workflow, scheduler controls, route-aware notifications, scheduler cycle history, and stale-worker detection.")
 
 autonomous_scheduler = bool(config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and bool(
     config.get("scheduler", {}).get("enabled", True)
@@ -297,16 +286,18 @@ with tab_news:
 
 with tab_market:
     st.subheader("Exchange Status")
-    scheduler_health, scheduler_health_text = _scheduler_health(
+    scheduler_health = assess_scheduler_worker_health(
         scheduler_status,
-        int(config.get("scheduler", {}).get("poll_interval_minutes", 15)),
+        poll_interval_minutes=int(config.get("scheduler", {}).get("poll_interval_minutes", 15)),
     )
     sched_col1, sched_col2, sched_col3, sched_col4 = st.columns(4)
-    sched_col1.metric("Scheduler Health", scheduler_health.upper())
+    sched_col1.metric("Scheduler Health", str(scheduler_health["status"]).upper())
     sched_col2.metric("Scheduler PID", scheduler_status.get("scheduler_pid") if scheduler_status else "n/a")
     sched_col3.metric("Last Cycle Status", scheduler_status.get("last_cycle_status") if scheduler_status else "n/a")
     sched_col4.metric("Last Completed", scheduler_status.get("last_cycle_completed_at") if scheduler_status else "n/a")
-    st.caption(scheduler_health_text)
+    st.caption(scheduler_health["message"])
+    if scheduler_health.get("restart_recommended"):
+        st.warning("Scheduler restart is recommended. If the app launched the scheduler child, it will auto-restart within the configured restart budget.")
     if "manual_scheduler_result" in st.session_state:
         last_manual_result = st.session_state["manual_scheduler_result"]
         if last_manual_result.get("status") == "ok":
