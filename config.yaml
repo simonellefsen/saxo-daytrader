@@ -1,0 +1,89 @@
+app:
+  project_name: saxo-daytrader-xai
+  environment: local
+  dry_run: true
+  simulation_mode: true
+
+portfolio:
+  base_currency: DKK
+  source_csv: Positioner_05-apr-2026_12_16_34.csv
+  database_path: ledger.db
+
+market_data:
+  refresh_interval_seconds: 300
+  request_timeout_seconds: 10
+  watchlists:
+    nordic_limit: 25
+    global_limit: 50
+  rss:
+    market_feeds:
+      - name: Yahoo Finance
+        url: https://finance.yahoo.com/news/rssindex
+      - name: CNBC Markets
+        url: https://www.cnbc.com/id/10001147/device/rss/rss.html
+      - name: Reuters Business
+        url: https://feeds.reuters.com/reuters/businessNews
+    macro_feeds:
+      - name: ECB Press
+        url: https://www.ecb.europa.eu/rss/press.html
+      - name: Federal Reserve Press
+        url: https://www.federalreserve.gov/feeds/press_all.xml
+
+analysis_windows:
+  offset_minutes_after_open: 60
+  duration_minutes: 30
+
+risk:
+  excluded_symbols:
+    - NOVOb:xcse
+    - TSLA:xnas
+  max_position_weight: 0.15
+  allow_shorting: false
+
+taxation:
+  share_income:
+    currency: DKK
+    brackets:
+      - up_to_dkk: 79000
+        rate: 0.27
+      - up_to_dkk:
+        rate: 0.42
+
+commissions:
+  default_rate: 0.0008
+  fx_conversion_rate: 0.0025
+  minimums:
+    XCSE:
+      currency: DKK
+      amount: 14.0
+    XNAS:
+      currency: USD
+      amount: 3.0
+    XNYS:
+      currency: USD
+      amount: 3.0
+    XLON:
+      currency: GBP
+      amount: 3.0
+    XMIL:
+      currency: EUR
+      amount: 3.0
+
+xai:
+  api_key: ENV:XAI_API_KEY
+  model: grok-4-latest
+  goal: >
+    Target average DKK 500 per trading day (DKK 3 500/week) before tax;
+    stretch goal DKK 1 000/day. Maximise portfolio value while keeping
+    risk reasonable for a day-trading horizon.
+
+saxo:
+  environment: SIM
+  client_id: ENV:SAXO_CLIENT_ID
+  client_secret: ENV:SAXO_CLIENT_SECRET
+  account_key: ENV:SAXO_ACCOUNT_KEY
+
+tradingview:
+  username: ENV:TRADINGVIEW_USERNAME
+  encrypted_password: ENV:TRADINGVIEW_PASSWORD
+  totp_secret: ENV:TRADINGVIEW_TOTP_SECRET
