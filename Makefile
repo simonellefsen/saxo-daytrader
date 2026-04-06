@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 PORT ?= 8501
 
-.PHONY: help install run run-headless scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
+.PHONY: help install run run-headless scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
 
 help:
 	@printf "%s\n" \
@@ -13,7 +13,7 @@ help:
 		"  make scheduler          Run the APScheduler worker continuously" \
 		"  make scheduler-once     Run one scheduler cycle in mock-decision mode" \
 		"  make sync               Import the CSV into ledger.db without starting Streamlit" \
-		"  make validate           Run the latest phase validation (Phase 14)" \
+		"  make validate           Run the latest phase validation (Phase 15)" \
 		"  make validate-phase1    Run Phase 1 validation" \
 		"  make validate-phase2    Run Phase 2 validation" \
 		"  make validate-phase3    Run Phase 3 validation" \
@@ -29,6 +29,7 @@ help:
 		"  make validate-phase12   Run Phase 12 live order replace/cancel validation" \
 		"  make validate-phase13   Run Phase 13 notification throttling/backoff validation" \
 		"  make validate-phase14   Run Phase 14 weekly/monthly digest validation" \
+		"  make validate-phase15   Run Phase 15 quarterly/YTD digest validation" \
 		"  make render-services    Render systemd and launchd service examples into deploy/rendered" \
 		"  make saxo-sim           Run Saxo OAuth helper against SIM using PKCE" \
 		"  make saxo-live          Run Saxo OAuth helper against LIVE using app secret" \
@@ -53,7 +54,7 @@ scheduler-once:
 sync:
 	$(PYTHON) main.py --sync-only
 
-validate: validate-phase14
+validate: validate-phase15
 
 validate-phase1:
 	$(PYTHON) scripts/validate_phase1.py
@@ -99,6 +100,9 @@ validate-phase13:
 
 validate-phase14:
 	$(PYTHON) scripts/validate_phase14.py
+
+validate-phase15:
+	$(PYTHON) scripts/validate_phase15.py
 
 render-services:
 	$(PYTHON) scripts/render_service_templates.py

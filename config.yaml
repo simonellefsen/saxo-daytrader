@@ -89,8 +89,8 @@ xai:
   base_url: https://api.x.ai/v1
   model: grok-4-fast-reasoning
   goal: >
-    Target average DKK 500 per trading day (DKK 3 500/week) before tax;
-    stretch goal DKK 1 000/day. Maximise portfolio value while keeping
+    Target average DKK 500 per trading day (DKK 3,500/week) before tax;
+    stretch goal DKK 1,000/day. Maximise portfolio value while keeping
     risk reasonable for a day-trading horizon.
   timeout_seconds: 120
   auto_run_interval_minutes: 240
@@ -113,11 +113,15 @@ notifications:
   daily_summary_enabled: false
   weekly_summary_enabled: false
   monthly_summary_enabled: false
+  quarterly_summary_enabled: false
+  ytd_summary_enabled: false
   timezone: Europe/Copenhagen
   dispatch_hour_local: 18
   dispatch_minute_local: 15
   weekly_dispatch_weekday_local: 0
   monthly_dispatch_day_local: 1
+  quarterly_dispatch_day_local: 1
+  ytd_dispatch_day_local: 1
   retry_backoff_minutes: 30
   max_attempts_per_day: 3
   channel_cooldown_minutes: 240

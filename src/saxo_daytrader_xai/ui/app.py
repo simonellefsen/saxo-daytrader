@@ -103,6 +103,8 @@ notification_deliveries = fetch_notification_deliveries(connection, limit=50)
 daily_summary_preview = build_summary(connection, config, summary_kind="daily")
 weekly_summary_preview = build_summary(connection, config, summary_kind="weekly")
 monthly_summary_preview = build_summary(connection, config, summary_kind="monthly")
+quarterly_summary_preview = build_summary(connection, config, summary_kind="quarterly")
+ytd_summary_preview = build_summary(connection, config, summary_kind="ytd")
 
 if should_auto_run_decision_report(connection, config, analysis_summary["analysis_window_active"]):
     with st.spinner("Generating xAI decision report..."):
@@ -112,7 +114,7 @@ if should_auto_run_decision_report(connection, config, analysis_summary["analysi
         st.toast(f"Decision report generated with status: {generated_report['status']}")
 
 st.title("saxo-daytrader-xai")
-st.caption("Phase 7 dashboard with decision automation, simulation execution, Saxo live submission, broker sync, and audit exports.")
+st.caption("Phase 15 dashboard with decision automation, live broker workflow, and multi-period notifications.")
 
 excluded_symbols = config.get("risk", {}).get("excluded_symbols", [])
 if excluded_symbols:
@@ -556,11 +558,13 @@ with tab_execution:
         st.caption("No broker lifecycle events have been synchronized yet.")
 
 with tab_notifications:
-    st.subheader("Daily Summary Notifications")
-    notif_col1, notif_col2, notif_col3 = st.columns(3)
-    notif_col1.metric("Daily Summary Enabled", "Yes" if config["notifications"]["daily_summary_enabled"] else "No")
+    st.subheader("Notifications")
+    notif_col1, notif_col2, notif_col3, notif_col4, notif_col5 = st.columns(5)
+    notif_col1.metric("Daily Enabled", "Yes" if config["notifications"]["daily_summary_enabled"] else "No")
     notif_col2.metric("Weekly Enabled", "Yes" if config["notifications"]["weekly_summary_enabled"] else "No")
     notif_col3.metric("Monthly Enabled", "Yes" if config["notifications"]["monthly_summary_enabled"] else "No")
+    notif_col4.metric("Quarterly Enabled", "Yes" if config["notifications"].get("quarterly_summary_enabled") else "No")
+    notif_col5.metric("YTD Enabled", "Yes" if config["notifications"].get("ytd_summary_enabled") else "No")
 
     if st.button("Send All Digests Now"):
         with st.spinner("Dispatching summaries..."):
@@ -581,6 +585,16 @@ with tab_notifications:
         st.markdown("**Monthly Digest Preview**")
         st.caption(monthly_summary_preview["subject"])
         st.code(monthly_summary_preview["message_text"], language="text")
+
+    preview_col3, preview_col4 = st.columns(2)
+    with preview_col3:
+        st.markdown("**Quarterly Digest Preview**")
+        st.caption(quarterly_summary_preview["subject"])
+        st.code(quarterly_summary_preview["message_text"], language="text")
+    with preview_col4:
+        st.markdown("**Year-to-Date Digest Preview**")
+        st.caption(ytd_summary_preview["subject"])
+        st.code(ytd_summary_preview["message_text"], language="text")
 
     st.markdown("**Delivery History**")
     if notification_deliveries:

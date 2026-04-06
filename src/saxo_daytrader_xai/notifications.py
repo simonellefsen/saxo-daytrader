@@ -102,6 +102,16 @@ def _period_descriptor(kind: str, local_now: datetime, config: dict[str, Any]) -
         end_date = first_of_current_month - timedelta(days=1)
         start_date = end_date.replace(day=1)
         label = f"{start_date.isoformat()}_to_{end_date.isoformat()}"
+    elif kind == "quarterly":
+        first_of_current_quarter = date(current_date.year, ((current_date.month - 1) // 3) * 3 + 1, 1)
+        end_date = first_of_current_quarter - timedelta(days=1)
+        start_date = date(end_date.year, ((end_date.month - 1) // 3) * 3 + 1, 1)
+        label = f"{start_date.isoformat()}_to_{end_date.isoformat()}"
+    elif kind == "ytd":
+        first_of_current_month = current_date.replace(day=1)
+        end_date = first_of_current_month - timedelta(days=1)
+        start_date = date(end_date.year, 1, 1)
+        label = f"{start_date.isoformat()}_to_{end_date.isoformat()}"
     else:
         raise ValueError(f"Unsupported summary kind '{kind}'")
     return start_date, end_date, label
@@ -433,6 +443,16 @@ def _summary_due(config: dict[str, Any], summary_kind: str, local_now: datetime,
         return bool(notifications_cfg.get("monthly_summary_enabled", False)) and local_now.day == int(
             notifications_cfg.get("monthly_dispatch_day_local", 1)
         )
+    if summary_kind == "quarterly":
+        return (
+            bool(notifications_cfg.get("quarterly_summary_enabled", False))
+            and local_now.day == int(notifications_cfg.get("quarterly_dispatch_day_local", 1))
+            and local_now.month in {1, 4, 7, 10}
+        )
+    if summary_kind == "ytd":
+        return bool(notifications_cfg.get("ytd_summary_enabled", False)) and local_now.day == int(
+            notifications_cfg.get("ytd_dispatch_day_local", 1)
+        )
     return False
 
 
@@ -566,7 +586,7 @@ def dispatch_summaries_if_due(
     force: bool = False,
 ) -> dict[str, Any]:
     results = []
-    for summary_kind in ("daily", "weekly", "monthly"):
+    for summary_kind in ("daily", "weekly", "monthly", "quarterly", "ytd"):
         results.append(
             dispatch_summary_if_due(
                 connection,
