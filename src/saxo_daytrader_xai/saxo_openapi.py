@@ -76,6 +76,63 @@ class SaxoOrderNotFoundError(SaxoSessionError):
     pass
 
 
+def _response_json_or_none(response: requests.Response) -> dict[str, Any] | list[Any] | None:
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _extract_saxo_error(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        error_info = payload.get("ErrorInfo")
+        if isinstance(error_info, dict):
+            code = error_info.get("ErrorCode")
+            message = error_info.get("Message")
+            if code and message:
+                return f"{code}: {message}"
+            if message:
+                return str(message)
+            if code:
+                return str(code)
+        orders = payload.get("Orders")
+        if isinstance(orders, list):
+            for item in orders:
+                nested = _extract_saxo_error(item)
+                if nested:
+                    return nested
+        message = payload.get("Message") or payload.get("message") or payload.get("error_description")
+        if message:
+            return str(message)
+    if isinstance(payload, list):
+        for item in payload:
+            nested = _extract_saxo_error(item)
+            if nested:
+                return nested
+    return None
+
+
+def _raise_for_saxo_response(response: requests.Response, *, action: str) -> dict[str, Any]:
+    payload = _response_json_or_none(response)
+    error_text = _extract_saxo_error(payload)
+    if response.status_code >= 400:
+        if response.status_code == 404 and error_text and "OrderNotFound" in error_text:
+            raise SaxoOrderNotFoundError(error_text)
+        if error_text:
+            raise SaxoSessionError(f"{action} failed: {error_text}")
+        snippet = (response.text or "").strip()
+        if snippet:
+            raise SaxoSessionError(f"{action} failed: HTTP {response.status_code}: {snippet[:300]}")
+        raise SaxoSessionError(f"{action} failed: HTTP {response.status_code}")
+    if error_text:
+        if "OrderNotFound" in error_text:
+            raise SaxoOrderNotFoundError(error_text)
+        raise SaxoSessionError(f"{action} failed: {error_text}")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
 def default_session_path(config: dict[str, Any]) -> Path:
     config_dir = Path(config["_meta"]["config_dir"])
     return config_dir / ".secrets" / "saxo_session.json"
@@ -312,8 +369,7 @@ def precheck_order(payload: dict[str, Any], config: dict[str, Any], session: dic
         json=request_payload,
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+    return _raise_for_saxo_response(response, action="Order precheck")
 
 
 def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
@@ -324,8 +380,7 @@ def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[s
         json=payload,
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+    return _raise_for_saxo_response(response, action="Order placement")
 
 
 def change_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
@@ -336,8 +391,7 @@ def change_order(payload: dict[str, Any], config: dict[str, Any], session: dict[
         json=payload,
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+    return _raise_for_saxo_response(response, action="Order replace")
 
 
 def cancel_order(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
@@ -348,8 +402,7 @@ def cancel_order(order_id: str, config: dict[str, Any], session: dict[str, Any])
         headers=_auth_headers(session["access_token"]),
         timeout=30,
     )
-    response.raise_for_status()
-    return response.json()
+    return _raise_for_saxo_response(response, action="Order cancel")
 
 
 def get_open_order(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:

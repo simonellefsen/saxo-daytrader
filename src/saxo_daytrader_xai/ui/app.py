@@ -701,12 +701,13 @@ with tab_notifications:
     notif_col4.metric("Quarterly Enabled", "Yes" if config["notifications"].get("quarterly_summary_enabled") else "No")
     notif_col5.metric("YTD Enabled", "Yes" if config["notifications"].get("ytd_summary_enabled") else "No")
 
-    alert_col1, alert_col2, alert_col3, alert_col4 = st.columns(4)
+    alert_col1, alert_col2, alert_col3, alert_col4, alert_col5 = st.columns(5)
     alerts_cfg = config["notifications"].get("alerts", {})
     alert_col1.metric("Fill Alerts", "Yes" if alerts_cfg.get("broker_fill_enabled") else "No")
     alert_col2.metric("Reject Alerts", "Yes" if alerts_cfg.get("broker_reject_enabled") else "No")
     alert_col3.metric("Cancel Alerts", "Yes" if alerts_cfg.get("broker_cancel_enabled") else "No")
     alert_col4.metric("Execution Failure Alerts", "Yes" if alerts_cfg.get("execution_failure_enabled") else "No")
+    alert_col5.metric("Mgmt Failure Alerts", "Yes" if alerts_cfg.get("broker_management_failure_enabled") else "No")
 
     suppression_cfg = config["notifications"].get("alert_suppression", {})
     suppress_col1, suppress_col2, suppress_col3, suppress_col4 = st.columns(4)

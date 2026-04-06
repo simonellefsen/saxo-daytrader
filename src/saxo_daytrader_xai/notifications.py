@@ -488,6 +488,7 @@ def _alert_severity(summary_kind: str) -> str:
         "alert_broker_cancel": "low",
         "alert_broker_grouped": "medium",
         "alert_execution_failed": "high",
+        "alert_broker_management_failed": "high",
     }.get(summary_kind, "medium")
 
 
@@ -573,7 +574,13 @@ def _alerts_enabled(config: dict[str, Any]) -> bool:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     return any(
         bool(alerts_cfg.get(key, False))
-        for key in ("broker_fill_enabled", "broker_reject_enabled", "broker_cancel_enabled", "execution_failure_enabled")
+        for key in (
+            "broker_fill_enabled",
+            "broker_reject_enabled",
+            "broker_cancel_enabled",
+            "execution_failure_enabled",
+            "broker_management_failure_enabled",
+        )
     )
 
 
@@ -679,6 +686,9 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
     if alerts_cfg.get("broker_cancel_enabled", False):
         event_type_map["broker_cancelled"] = ("alert_broker_cancel", "Broker order cancelled")
         event_type_map["broker_expired"] = ("alert_broker_cancel", "Broker order expired")
+    if alerts_cfg.get("broker_management_failure_enabled", False):
+        event_type_map["broker_cancel_failed"] = ("alert_broker_management_failed", "Broker cancel failed")
+        event_type_map["broker_replace_failed"] = ("alert_broker_management_failed", "Broker replace failed")
 
     if event_type_map:
         placeholders = ", ".join("?" for _ in event_type_map)

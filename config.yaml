@@ -151,6 +151,7 @@ notifications:
     broker_reject_enabled: false
     broker_cancel_enabled: false
     execution_failure_enabled: true
+    broker_management_failure_enabled: true
   alert_suppression:
     enabled: true
     low_cooldown_minutes: 240
@@ -171,3 +172,4 @@ notifications:
     alert_broker_cancel: {}
     alert_broker_grouped: {}
     alert_execution_failed: {}
+    alert_broker_management_failed: {}
