@@ -577,6 +577,13 @@ with tab_notifications:
     alert_col2.metric("Reject Alerts", "Yes" if alerts_cfg.get("broker_reject_enabled") else "No")
     alert_col3.metric("Cancel Alerts", "Yes" if alerts_cfg.get("broker_cancel_enabled") else "No")
 
+    suppression_cfg = config["notifications"].get("alert_suppression", {})
+    suppress_col1, suppress_col2, suppress_col3, suppress_col4 = st.columns(4)
+    suppress_col1.metric("Suppression Enabled", "Yes" if suppression_cfg.get("enabled", True) else "No")
+    suppress_col2.metric("Low Cooldown", f"{int(suppression_cfg.get('low_cooldown_minutes', 240))}m")
+    suppress_col3.metric("Medium Cooldown", f"{int(suppression_cfg.get('medium_cooldown_minutes', 60))}m")
+    suppress_col4.metric("High Cooldown", f"{int(suppression_cfg.get('high_cooldown_minutes', 0))}m")
+
     action_col1, action_col2 = st.columns(2)
     if action_col1.button("Send All Digests Now"):
         with st.spinner("Dispatching summaries..."):
@@ -612,6 +619,22 @@ with tab_notifications:
         st.markdown("**Year-to-Date Digest Preview**")
         st.caption(ytd_summary_preview["subject"])
         st.code(ytd_summary_preview["message_text"], language="text")
+
+    route_rows = []
+    for summary_kind, route_cfg in sorted(config["notifications"].get("routes", {}).items()):
+        if route_cfg:
+            route_rows.append(
+                {
+                    "Kind": summary_kind,
+                    "Slack Webhook Override": "Yes" if route_cfg.get("slack_webhook_url") else "No",
+                    "Email Recipients Override": "Yes" if route_cfg.get("email_to_addresses_csv") else "No",
+                }
+            )
+    st.markdown("**Route Overrides**")
+    if route_rows:
+        st.dataframe(route_rows, width="stretch", hide_index=True)
+    else:
+        st.caption("No per-kind delivery route overrides are configured.")
 
     st.markdown("**Delivery History**")
     if notification_deliveries:

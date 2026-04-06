@@ -142,3 +142,17 @@ notifications:
     broker_fill_enabled: false
     broker_reject_enabled: false
     broker_cancel_enabled: false
+  alert_suppression:
+    enabled: true
+    low_cooldown_minutes: 240
+    medium_cooldown_minutes: 60
+    high_cooldown_minutes: 0
+  routes:
+    daily: {}
+    weekly: {}
+    monthly: {}
+    quarterly: {}
+    ytd: {}
+    alert_broker_fill: {}
+    alert_broker_reject: {}
+    alert_broker_cancel: {}

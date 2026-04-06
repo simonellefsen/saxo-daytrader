@@ -234,6 +234,15 @@ def init_db(connection: sqlite3.Connection) -> None:
             last_error_text TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS notification_alert_state (
+            scope_key TEXT PRIMARY KEY,
+            severity TEXT NOT NULL,
+            last_sent_at TEXT,
+            last_alert_key TEXT,
+            last_summary_kind TEXT,
+            last_delivery_id INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 16 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 18 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 16 includes
+## What Phase 18 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -37,6 +37,8 @@ Phase 16 foundation for a local Python day-trading assistant focused on a Danish
 - Weekly and monthly digest generation with independent scheduling and per-kind notification deduplication
 - Quarterly and year-to-date digest generation using the same immutable notification pipeline
 - Broker alert notifications for fills, rejections, and cancel confirmations
+- Per-kind delivery routing so digests and broker alerts can target different Slack webhooks or email recipient lists
+- Severity-based broker alert suppression so repeated low-signal events can be throttled without disabling higher-value alerts
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -95,6 +97,8 @@ The scheduler:
 - sends one daily summary per configured channel after the local dispatch time
 - sends optional weekly, monthly, quarterly, and YTD digests after their configured local dispatch windows
 - sends optional broker event alerts when fills, rejections, or confirmed cancellations appear in the local broker sync tables
+- supports per-kind routing overrides for daily/weekly/monthly/quarterly/YTD digests and broker alert types
+- suppresses repeated broker alerts per order scope using severity-specific cooldown windows
 - records scheduler activity in `audit_log`
 
 ## Deployment
@@ -190,10 +194,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 16 validation script:
+Run the Phase 18 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase16.py
+.venv/bin/python scripts/validate_phase18.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -205,10 +209,11 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 16 validation passed.
+Phase 18 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-Alert deliveries sent: 3
+First pass sent: 2
+Second pass suppressed/skipped: 1
 Slack success payloads: 3
 ```
 
@@ -233,6 +238,8 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase14.py
 .venv/bin/python scripts/validate_phase15.py
 .venv/bin/python scripts/validate_phase16.py
+.venv/bin/python scripts/validate_phase17.py
+.venv/bin/python scripts/validate_phase18.py
 ```
 
 ## Project layout
@@ -259,6 +266,8 @@ Earlier validation scripts remain available:
 │   └── validate_phase14.py
 │   └── validate_phase15.py
 │   └── validate_phase16.py
+│   └── validate_phase17.py
+│   └── validate_phase18.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -283,5 +292,5 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add per-channel routing so digest kinds and broker alerts can target different Slack channels or email recipients.
-2. Add severity-based alert suppression so repeated low-signal broker events do not spam the delivery channels.
+1. Add route inheritance or named route profiles so multiple kinds can share one destination without repeated config.
+2. Add alert grouping so several broker events for the same order can be collapsed into one delivery.

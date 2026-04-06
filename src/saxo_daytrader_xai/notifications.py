@@ -363,23 +363,48 @@ def _channel_ready(
     return True, "ready"
 
 
-def _send_slack(config: dict[str, Any], subject: str, message_text: str, payload: dict[str, Any]) -> dict[str, Any]:
-    webhook_url = config.get("notifications", {}).get("slack", {}).get("webhook_url")
+def _route_config(config: dict[str, Any], summary_kind: str) -> dict[str, Any]:
+    routes = config.get("notifications", {}).get("routes", {})
+    route = routes.get(summary_kind, {})
+    return route if isinstance(route, dict) else {}
+
+
+def _resolve_slack_webhook(config: dict[str, Any], summary_kind: str) -> str:
+    route_cfg = _route_config(config, summary_kind)
+    webhook_url = route_cfg.get("slack_webhook_url") or config.get("notifications", {}).get("slack", {}).get("webhook_url")
     if not webhook_url:
         raise ValueError("Slack webhook URL is missing")
+    return str(webhook_url)
+
+
+def _resolve_email_to_addresses(config: dict[str, Any], summary_kind: str) -> list[str]:
+    route_cfg = _route_config(config, summary_kind)
+    raw_to = route_cfg.get("email_to_addresses_csv") or config.get("notifications", {}).get("email", {}).get("to_addresses_csv") or ""
+    return [part.strip() for part in str(raw_to).split(",") if part.strip()]
+
+
+def _send_slack(
+    config: dict[str, Any],
+    subject: str,
+    message_text: str,
+    payload: dict[str, Any],
+    *,
+    summary_kind: str,
+) -> dict[str, Any]:
+    webhook_url = _resolve_slack_webhook(config, summary_kind)
     response = requests.post(
         webhook_url,
         json={
             "text": f"*{subject}*\n```{message_text}```",
-            "metadata": {"event_type": "daily_summary", "event_payload": payload},
+            "metadata": {"event_type": summary_kind, "event_payload": payload},
         },
         timeout=20,
     )
     response.raise_for_status()
-    return {"status_code": response.status_code}
+    return {"status_code": response.status_code, "webhook_url": webhook_url}
 
 
-def _send_email(config: dict[str, Any], subject: str, message_text: str) -> dict[str, Any]:
+def _send_email(config: dict[str, Any], subject: str, message_text: str, *, summary_kind: str) -> dict[str, Any]:
     email_cfg = config.get("notifications", {}).get("email", {})
     host = str(email_cfg.get("smtp_host") or "")
     if not host:
@@ -388,11 +413,7 @@ def _send_email(config: dict[str, Any], subject: str, message_text: str) -> dict
     username = str(email_cfg.get("username") or "")
     password = str(email_cfg.get("password") or "")
     from_address = str(email_cfg.get("from_address") or "")
-    to_addresses = [
-        part.strip()
-        for part in str(email_cfg.get("to_addresses_csv") or "").split(",")
-        if part.strip()
-    ]
+    to_addresses = _resolve_email_to_addresses(config, summary_kind)
     if not from_address or not to_addresses:
         raise ValueError("SMTP from/to addresses are missing")
 
@@ -429,6 +450,92 @@ def fetch_notification_deliveries(connection, limit: int = 100) -> list[dict[str
     return output
 
 
+def _alert_severity(summary_kind: str) -> str:
+    return {
+        "alert_broker_fill": "medium",
+        "alert_broker_reject": "high",
+        "alert_broker_cancel": "low",
+    }.get(summary_kind, "medium")
+
+
+def _alert_scope_key(summary_kind: str, record: dict[str, Any]) -> str:
+    execution_order_id = record.get("execution_order_id") or record.get("id")
+    return f"{summary_kind}:order:{execution_order_id}"
+
+
+def _alert_cooldown_minutes(config: dict[str, Any], severity: str) -> int:
+    suppression_cfg = config.get("notifications", {}).get("alert_suppression", {})
+    return int(
+        suppression_cfg.get(
+            f"{severity}_cooldown_minutes",
+            {"low": 240, "medium": 60, "high": 0}.get(severity, 60),
+        )
+    )
+
+
+def _alert_state(connection, scope_key: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM notification_alert_state
+        WHERE scope_key = ?
+        """,
+        (scope_key,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _upsert_alert_state(
+    connection,
+    *,
+    scope_key: str,
+    severity: str,
+    last_sent_at: str,
+    last_alert_key: str,
+    last_summary_kind: str,
+    last_delivery_id: int | None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO notification_alert_state (
+            scope_key, severity, last_sent_at, last_alert_key, last_summary_kind, last_delivery_id
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope_key) DO UPDATE SET
+            severity = excluded.severity,
+            last_sent_at = excluded.last_sent_at,
+            last_alert_key = excluded.last_alert_key,
+            last_summary_kind = excluded.last_summary_kind,
+            last_delivery_id = excluded.last_delivery_id
+        """,
+        (scope_key, severity, last_sent_at, last_alert_key, last_summary_kind, last_delivery_id),
+    )
+    connection.commit()
+
+
+def _suppressed_alert_reason(
+    connection,
+    config: dict[str, Any],
+    *,
+    alert: dict[str, Any],
+    reference_time: datetime,
+    force: bool,
+) -> str | None:
+    suppression_cfg = config.get("notifications", {}).get("alert_suppression", {})
+    if force or not bool(suppression_cfg.get("enabled", True)):
+        return None
+    severity = alert["severity"]
+    cooldown_minutes = _alert_cooldown_minutes(config, severity)
+    if cooldown_minutes <= 0:
+        return None
+    state = _alert_state(connection, alert["scope_key"])
+    if not state or not state.get("last_sent_at"):
+        return None
+    last_sent_at = datetime.fromisoformat(str(state["last_sent_at"]))
+    if reference_time < last_sent_at + timedelta(minutes=cooldown_minutes):
+        return f"suppressed_{severity}"
+    return None
+
+
 def _alerts_enabled(config: dict[str, Any]) -> bool:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     return any(
@@ -439,7 +546,7 @@ def _alerts_enabled(config: dict[str, Any]) -> bool:
 
 def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
-    alerts: list[dict[str, Any]] = []
+    alerts_by_scope: dict[str, dict[str, Any]] = {}
 
     if alerts_cfg.get("broker_fill_enabled", False):
         fill_rows = connection.execute(
@@ -454,31 +561,34 @@ def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) 
         for row in fill_rows:
             record = dict(row)
             alert_key = f"fill:{record['id']}"
-            alerts.append(
-                {
-                    "alert_key": alert_key,
-                    "summary_kind": "alert_broker_fill",
-                    "subject": f"Broker fill confirmed for {record['symbol']}",
-                    "message_text": "\n".join(
-                        [
-                            f"Broker fill confirmed for {record['symbol']}",
-                            "",
-                            f"Order ID: {record['execution_order_id']}",
-                            f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
-                            f"Side: {record['side']}",
-                            f"Status: {record['fill_status']}",
-                            f"Delta quantity: {float(record['delta_quantity']):.4f}",
-                            f"Cumulative quantity: {float(record['cumulative_quantity']):.4f}",
-                            f"Average price: {float(record['average_price_local']):.4f} {record['currency']}",
-                            f"Ledger ID: {record.get('ledger_id') or 'n/a'}",
-                        ]
-                    ),
-                    "payload": {
-                        "alert_type": "broker_fill",
-                        "record": record,
-                    },
-                }
-            )
+            scope_key = _alert_scope_key("alert_broker_fill", record)
+            if scope_key in alerts_by_scope:
+                continue
+            alerts_by_scope[scope_key] = {
+                "alert_key": alert_key,
+                "summary_kind": "alert_broker_fill",
+                "severity": _alert_severity("alert_broker_fill"),
+                "scope_key": scope_key,
+                "subject": f"Broker fill confirmed for {record['symbol']}",
+                "message_text": "\n".join(
+                    [
+                        f"Broker fill confirmed for {record['symbol']}",
+                        "",
+                        f"Order ID: {record['execution_order_id']}",
+                        f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
+                        f"Side: {record['side']}",
+                        f"Status: {record['fill_status']}",
+                        f"Delta quantity: {float(record['delta_quantity']):.4f}",
+                        f"Cumulative quantity: {float(record['cumulative_quantity']):.4f}",
+                        f"Average price: {float(record['average_price_local']):.4f} {record['currency']}",
+                        f"Ledger ID: {record.get('ledger_id') or 'n/a'}",
+                    ]
+                ),
+                "payload": {
+                    "alert_type": "broker_fill",
+                    "record": record,
+                },
+            }
 
     event_type_map = {}
     if alerts_cfg.get("broker_reject_enabled", False):
@@ -503,30 +613,34 @@ def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) 
             record = dict(row)
             summary_kind, subject_prefix = event_type_map[record["event_type"]]
             alert_key = f"event:{record['id']}"
-            alerts.append(
-                {
-                    "alert_key": alert_key,
-                    "summary_kind": summary_kind,
-                    "subject": f"{subject_prefix} for order {record['execution_order_id']}",
-                    "message_text": "\n".join(
-                        [
-                            f"{subject_prefix} for execution order {record['execution_order_id']}",
-                            "",
-                            f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
-                            f"Event type: {record['event_type']}",
-                            f"Broker status: {record.get('broker_status') or 'n/a'}",
-                            f"Broker substatus: {record.get('broker_substatus') or 'n/a'}",
-                            f"Quantity: {record.get('broker_quantity') if record.get('broker_quantity') is not None else 'n/a'}",
-                            f"Price: {record.get('broker_price_local') if record.get('broker_price_local') is not None else 'n/a'}",
-                        ]
-                    ),
-                    "payload": {
-                        "alert_type": record["event_type"],
-                        "record": record,
-                    },
-                }
-            )
+            scope_key = _alert_scope_key(summary_kind, record)
+            if scope_key in alerts_by_scope:
+                continue
+            alerts_by_scope[scope_key] = {
+                "alert_key": alert_key,
+                "summary_kind": summary_kind,
+                "severity": _alert_severity(summary_kind),
+                "scope_key": scope_key,
+                "subject": f"{subject_prefix} for order {record['execution_order_id']}",
+                "message_text": "\n".join(
+                    [
+                        f"{subject_prefix} for execution order {record['execution_order_id']}",
+                        "",
+                        f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
+                        f"Event type: {record['event_type']}",
+                        f"Broker status: {record.get('broker_status') or 'n/a'}",
+                        f"Broker substatus: {record.get('broker_substatus') or 'n/a'}",
+                        f"Quantity: {record.get('broker_quantity') if record.get('broker_quantity') is not None else 'n/a'}",
+                        f"Price: {record.get('broker_price_local') if record.get('broker_price_local') is not None else 'n/a'}",
+                    ]
+                ),
+                "payload": {
+                    "alert_type": record["event_type"],
+                    "record": record,
+                },
+            }
 
+    alerts = list(alerts_by_scope.values())
     alerts.sort(key=lambda item: item["alert_key"])
     return alerts[:limit]
 
@@ -608,9 +722,15 @@ def dispatch_summary_if_due(
         attempt_count = int(previous_state.get("attempt_count") or 0) + 1
         try:
             if channel == "slack":
-                delivery_meta = _send_slack(config, summary["subject"], summary["message_text"], summary["payload"])
+                delivery_meta = _send_slack(
+                    config,
+                    summary["subject"],
+                    summary["message_text"],
+                    summary["payload"],
+                    summary_kind=summary_kind,
+                )
             elif channel == "email":
-                delivery_meta = _send_email(config, summary["subject"], summary["message_text"])
+                delivery_meta = _send_email(config, summary["subject"], summary["message_text"], summary_kind=summary_kind)
             else:
                 delivery_meta = {"status": "stored_only"}
             delivery_id = _record_notification_delivery(
@@ -725,6 +845,26 @@ def dispatch_broker_alerts_if_due(
     pending_alerts = _pending_broker_alerts(connection, config, limit=limit)
     sent: list[dict[str, Any]] = []
     for alert in pending_alerts:
+        suppressed_reason = _suppressed_alert_reason(
+            connection,
+            config,
+            alert=alert,
+            reference_time=now_utc,
+            force=force,
+        )
+        if suppressed_reason:
+            for channel in channels:
+                sent.append(
+                    {
+                        "alert_key": alert["alert_key"],
+                        "summary_kind": alert["summary_kind"],
+                        "severity": alert["severity"],
+                        "channel": channel,
+                        "status": "skipped",
+                        "reason": suppressed_reason,
+                    }
+                )
+            continue
         for channel in channels:
             is_ready, reason = _channel_ready(
                 connection,
@@ -750,9 +890,20 @@ def dispatch_broker_alerts_if_due(
             attempt_count = int(previous_state.get("attempt_count") or 0) + 1
             try:
                 if channel == "slack":
-                    delivery_meta = _send_slack(config, alert["subject"], alert["message_text"], alert["payload"])
+                    delivery_meta = _send_slack(
+                        config,
+                        alert["subject"],
+                        alert["message_text"],
+                        alert["payload"],
+                        summary_kind=alert["summary_kind"],
+                    )
                 elif channel == "email":
-                    delivery_meta = _send_email(config, alert["subject"], alert["message_text"])
+                    delivery_meta = _send_email(
+                        config,
+                        alert["subject"],
+                        alert["message_text"],
+                        summary_kind=alert["summary_kind"],
+                    )
                 else:
                     delivery_meta = {"status": "stored_only"}
                 delivery_id = _record_notification_delivery(
@@ -782,14 +933,25 @@ def dispatch_broker_alerts_if_due(
                     {
                         "alert_key": alert["alert_key"],
                         "summary_kind": alert["summary_kind"],
+                        "severity": alert["severity"],
                         "channel": channel,
                         "delivery_id": delivery_id,
                     },
+                )
+                _upsert_alert_state(
+                    connection,
+                    scope_key=alert["scope_key"],
+                    severity=alert["severity"],
+                    last_sent_at=now_utc.isoformat(timespec="seconds"),
+                    last_alert_key=alert["alert_key"],
+                    last_summary_kind=alert["summary_kind"],
+                    last_delivery_id=delivery_id,
                 )
                 sent.append(
                     {
                         "alert_key": alert["alert_key"],
                         "summary_kind": alert["summary_kind"],
+                        "severity": alert["severity"],
                         "channel": channel,
                         "status": "sent",
                         "delivery_id": delivery_id,
@@ -825,6 +987,7 @@ def dispatch_broker_alerts_if_due(
                     {
                         "alert_key": alert["alert_key"],
                         "summary_kind": alert["summary_kind"],
+                        "severity": alert["severity"],
                         "channel": channel,
                         "delivery_id": delivery_id,
                         "error": str(exc),
