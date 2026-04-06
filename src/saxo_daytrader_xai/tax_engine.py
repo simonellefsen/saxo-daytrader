@@ -112,6 +112,14 @@ def _fetch_position_snapshot(connection, symbol: str, batch_id: str | None = Non
     return dict(row) if row else None
 
 
+def _fetch_effective_position(connection, symbol: str, batch_id: str | None = None) -> dict[str, Any] | None:
+    positions = fetch_portfolio_positions(connection, batch_id=batch_id)
+    for row in positions:
+        if row["symbol"] == symbol:
+            return row
+    return None
+
+
 def _calculate_commission_components(
     symbol: str,
     gross_local: float,
@@ -214,22 +222,23 @@ def calculate_sell_outcome(
             raise ValueError("current_price must be greater than 0")
 
         snapshot = _fetch_position_snapshot(resolved_connection, symbol, batch_id=batch_id)
-        if snapshot is None:
+        effective_position = _fetch_effective_position(resolved_connection, symbol, batch_id=batch_id)
+        if snapshot is None or effective_position is None:
             raise ValueError(f"No active position found for symbol {symbol}")
+        if qty_to_sell > float(effective_position["quantity"]) + 1e-9:
+            raise ValueError(
+                f"Cannot sell {qty_to_sell}; only {float(effective_position['quantity'])} available for {symbol}"
+            )
 
         open_lots = _fetch_open_lots(resolved_connection, symbol)
         if not open_lots:
             raise ValueError(f"No open lots available for symbol {symbol}")
 
-        total_available = sum(float(lot["quantity_remaining"]) for lot in open_lots)
-        if qty_to_sell > total_available + 1e-9:
-            raise ValueError(f"Cannot sell {qty_to_sell}; only {total_available} available for {symbol}")
-
         currency = snapshot["currency"]
         current_fx_rate = 1.0
         if currency != resolved_config["portfolio"]["base_currency"]:
-            market_value_local = snapshot.get("market_value_local")
-            market_value_dkk = snapshot.get("market_value_dkk")
+            market_value_local = effective_position.get("market_value_local")
+            market_value_dkk = effective_position.get("market_value_dkk")
             if market_value_local not in (None, 0) and market_value_dkk not in (None, 0):
                 current_fx_rate = float(market_value_dkk) / float(market_value_local)
             else:

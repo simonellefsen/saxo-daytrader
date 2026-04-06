@@ -27,7 +27,6 @@ from saxo_daytrader_xai.saxo_openapi import (
 from saxo_daytrader_xai.market_symbols import saxo_to_yahoo
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
-    fetch_open_lot_summary,
     fetch_portfolio_positions,
     fetch_portfolio_summary,
 )
@@ -59,14 +58,11 @@ def _get_connection_and_config(config: dict[str, Any] | None, connection):
 
 def _current_position_map(connection, batch_id: str | None = None) -> dict[str, dict[str, Any]]:
     snapshot_positions = fetch_portfolio_positions(connection, batch_id=batch_id)
-    open_lots = fetch_open_lot_summary(connection)
-    open_by_symbol = {row["symbol"]: row for row in open_lots}
     positions = {}
     for row in snapshot_positions:
-        open_lot = open_by_symbol.get(row["symbol"], {})
         positions[row["symbol"]] = {
             **row,
-            "quantity_open": open_lot.get("quantity_open", row["quantity"]),
+            "quantity_open": row["quantity"],
         }
     return positions
 
@@ -184,7 +180,10 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         symbol = suggestion["symbol"]
         if action not in {"BUY", "SELL"}:
             continue
-        requested_weight_pct = min(float(suggestion["target_weight_pct"]), max_position_weight)
+        requested_weight_pct = float(suggestion["target_weight_pct"])
+        if requested_weight_pct > 1.0:
+            requested_weight_pct = requested_weight_pct / 100.0
+        requested_weight_pct = min(requested_weight_pct, max_position_weight)
         try:
             price_local, currency, fx_rate = _estimate_price_and_fx(symbol, position_map, live_price_map, fx_snapshot)
         except Exception as exc:  # noqa: BLE001
