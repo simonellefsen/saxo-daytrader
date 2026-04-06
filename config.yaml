@@ -13,8 +13,8 @@ market_data:
   refresh_interval_seconds: 300
   request_timeout_seconds: 10
   watchlists:
-    nordic_limit: 25
-    global_limit: 50
+    nordic_limit: 50
+    global_limit: 100
   rss:
     market_feeds:
       - name: Yahoo Finance
@@ -32,6 +32,9 @@ market_data:
 analysis_windows:
   offset_minutes_after_open: 60
   duration_minutes: 30
+  calendar_refresh_interval_minutes: 360
+  calendar_lookback_days: 7
+  calendar_lookahead_days: 45
 
 scheduler:
   enabled: true

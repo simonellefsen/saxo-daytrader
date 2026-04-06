@@ -10,7 +10,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
-from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
+from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
 
@@ -34,6 +34,7 @@ def run_scheduler_cycle(
     should_close = connection is None
 
     try:
+        calendar_refresh = refresh_market_calendars(resolved_config)
         market_status = get_market_status(resolved_config)
         analysis_summary = summarize_analysis_window(market_status)
         should_generate = force_decision or should_auto_run_decision_report(
@@ -58,6 +59,7 @@ def run_scheduler_cycle(
         outcome = {
             "status": "ok",
             "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
+            "calendar_refresh": calendar_refresh,
             "analysis_window_active": analysis_summary["analysis_window_active"],
             "active_markets": analysis_summary["active_markets"],
             "generated_decision": decision_result is not None,

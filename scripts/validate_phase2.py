@@ -36,18 +36,37 @@ def main() -> int:
     assert set(symbols).isdisjoint(excluded_symbols), "Excluded symbols leaked into the active portfolio"
 
     watchlists = build_watchlists(config)
-    assert len(watchlists["nordic"]) == 25, f"Expected 25 Nordic names, got {len(watchlists['nordic'])}"
-    assert len(watchlists["global"]) == 50, f"Expected 50 global names, got {len(watchlists['global'])}"
+    assert len(watchlists["nordic"]) == 50, f"Expected 50 Nordic names, got {len(watchlists['nordic'])}"
+    assert len(watchlists["global"]) == 100, f"Expected 100 global names, got {len(watchlists['global'])}"
     assert all(row["symbol"] not in excluded_symbols for row in watchlists["nordic"] + watchlists["global"])
 
     sample_quotes = fetch_live_prices(symbols[:3], timeout_seconds=config["market_data"]["request_timeout_seconds"])
     assert len(sample_quotes) == min(3, len(symbols))
 
-    copenhagen_now = pytz.timezone("Europe/Copenhagen").localize(datetime(2026, 4, 6, 10, 5))
-    market_status_rows = get_market_status(config, reference_time=copenhagen_now.astimezone(UTC))
+    holiday_reference = pytz.timezone("Europe/Copenhagen").localize(datetime(2026, 4, 6, 10, 5))
+    holiday_rows = get_market_status(config, reference_time=holiday_reference.astimezone(UTC))
+    holiday_lookup = {row["code"]: row for row in holiday_rows}
+    assert holiday_lookup["XCSE"]["is_open"] is False, "Expected Copenhagen to be closed on Easter Monday"
+    assert holiday_lookup["XCSE"]["holiday_name"] == "Easter Monday"
+    assert holiday_lookup["XOSL"]["is_open"] is False, "Expected Oslo to be closed on Easter Monday"
+    assert holiday_lookup["XOSL"]["holiday_name"] == "Easter Monday"
+    assert holiday_lookup["XCSE"]["calendar_source"] == "exchange_calendars"
+    assert holiday_lookup["XOSL"]["calendar_source"] == "exchange_calendars"
+
+    copenhagen_open_day = pytz.timezone("Europe/Copenhagen").localize(datetime(2026, 4, 7, 10, 5))
+    market_status_rows = get_market_status(config, reference_time=copenhagen_open_day.astimezone(UTC))
     analysis_summary = summarize_analysis_window(market_status_rows)
-    assert analysis_summary["analysis_window_active"], "Expected an active analysis window"
-    assert "Copenhagen" in analysis_summary["active_markets"], "Expected Copenhagen to be active"
+    assert analysis_summary["analysis_window_active"], "Expected an active analysis window on a normal trading day"
+    assert "Copenhagen" in analysis_summary["active_markets"], "Expected Copenhagen to be active on 2026-04-07"
+
+    pre_dst = pytz.timezone("Europe/Copenhagen").localize(datetime(2026, 3, 27, 10, 5))
+    post_dst = pytz.timezone("Europe/Copenhagen").localize(datetime(2026, 3, 30, 10, 5))
+    pre_dst_lookup = {row["code"]: row for row in get_market_status(config, reference_time=pre_dst.astimezone(UTC))}
+    post_dst_lookup = {row["code"]: row for row in get_market_status(config, reference_time=post_dst.astimezone(UTC))}
+    assert pre_dst_lookup["XCSE"]["session_open_local"].endswith("09:00")
+    assert post_dst_lookup["XCSE"]["session_open_local"].endswith("09:00")
+    assert pre_dst_lookup["XCSE"]["session_open_utc"].endswith("08:00")
+    assert post_dst_lookup["XCSE"]["session_open_utc"].endswith("07:00")
 
     intelligence = fetch_market_intelligence(
         config,

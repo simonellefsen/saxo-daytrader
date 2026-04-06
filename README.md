@@ -17,6 +17,7 @@ Phase 8 foundation for a local Python day-trading assistant focused on a Danish 
 - Structured JSON decision reports with step-by-step rationale, watchlist focus, and suggested trades
 - Decision report persistence with prompt, raw response, parsed report, and error tracking
 - APScheduler-based background worker for recurring analysis cycles
+- Exchange-calendar driven market hours, holiday closures, and daylight-saving aware session timing
 - Simulation execution queue with immutable ledger updates
 - Live-mode approval queue with dry-run protection
 - Saxo OpenAPI session cache with refresh-token reuse
@@ -74,6 +75,7 @@ Run one mock scheduler cycle for smoke testing:
 The scheduler:
 
 - checks the configured exchange analysis windows
+- refreshes the exchange-calendar cache on a recurring interval
 - generates xAI decision reports during eligible windows
 - queues suggested trades
 - auto-executes queued trades in simulation mode

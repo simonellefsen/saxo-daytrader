@@ -153,7 +153,7 @@ with tab_portfolio:
                 }
                 for row in positions
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -184,7 +184,7 @@ with tab_portfolio:
         f"commission: {_format_dkk(tax_summary['commission_dkk'])}"
     )
     if trade_ledger:
-        st.dataframe(trade_ledger, use_container_width=True, hide_index=True)
+        st.dataframe(trade_ledger, width="stretch", hide_index=True)
     else:
         st.caption("No trades recorded yet. Trade execution arrives in later phases.")
 
@@ -192,7 +192,7 @@ with tab_watchlist:
     st.subheader("Daily Refreshed Watchlists")
     st.caption(f"Generated at {watchlists['generated_at']}")
 
-    st.markdown("**Nordic Top 25**")
+    st.markdown(f"**Nordic Top {len(watchlists['nordic'])}**")
     st.dataframe(
         [
             {
@@ -207,11 +207,11 @@ with tab_watchlist:
             }
             for row in watchlists["nordic"]
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
-    st.markdown("**US / Europe Top 50**")
+    st.markdown(f"**US / Europe Top {len(watchlists['global'])}**")
     st.dataframe(
         [
             {
@@ -226,7 +226,7 @@ with tab_watchlist:
             }
             for row in watchlists["global"]
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -237,21 +237,21 @@ with tab_news:
     st.markdown("**Market News**")
     market_news_rows = market_intelligence["market_news"]
     if market_news_rows:
-        st.dataframe(market_news_rows, use_container_width=True, hide_index=True)
+        st.dataframe(market_news_rows, width="stretch", hide_index=True)
     else:
         st.caption("No market headlines were available.")
 
     st.markdown("**Earnings Calendar**")
     earnings_rows = market_intelligence["earnings_calendar"]
     if earnings_rows:
-        st.dataframe(earnings_rows, use_container_width=True, hide_index=True)
+        st.dataframe(earnings_rows, width="stretch", hide_index=True)
     else:
         st.caption("No upcoming earnings events were returned for the current focus list.")
 
     st.markdown("**Macro Events / Central Bank Headlines**")
     macro_rows = market_intelligence["macro_events"]
     if macro_rows:
-        st.dataframe(macro_rows, use_container_width=True, hide_index=True)
+        st.dataframe(macro_rows, width="stretch", hide_index=True)
     else:
         st.caption("No macro feeds were available.")
 
@@ -264,20 +264,26 @@ with tab_market:
                 "Market": row["market"],
                 "Timezone": row["timezone"],
                 "Local Time": row["local_time"],
+                "Status": row["status_reason"],
+                "Holiday": row["holiday_name"] or "",
+                "Session Open": row["session_open_local"],
+                "Session Close": row["session_close_local"],
                 "Open": row["is_open"],
                 "Analysis Window Active": row["analysis_window_active"],
                 "Analysis Window Start": row["analysis_window_start"],
                 "Analysis Window End": row["analysis_window_end"],
                 "Next Open": row["next_open"],
+                "Calendar Source": row["calendar_source"],
+                "Last Checked": row["calendar_last_checked"],
             }
             for row in market_status_rows
         ],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     st.write(
-        "The system marks a market as analysis-active when the current local exchange time is "
-        "between 60 and 90 minutes after the exchange opens."
+        "The system checks refreshed exchange calendars for each market, including holiday closures and daylight-saving shifts, "
+        "and marks a market as analysis-active when the current local exchange time is between 60 and 90 minutes after that market's actual session open."
     )
 
 with tab_decision:
@@ -338,14 +344,14 @@ with tab_decision:
         st.markdown("**Suggested Trades**")
         suggested_trades = report.get("suggested_trades", [])
         if suggested_trades:
-            st.dataframe(suggested_trades, use_container_width=True, hide_index=True)
+            st.dataframe(suggested_trades, width="stretch", hide_index=True)
         else:
             st.caption("No suggested trades in the latest report.")
 
         st.markdown("**Watchlist Focus**")
         watchlist_focus = report.get("watchlist_focus", [])
         if watchlist_focus:
-            st.dataframe(watchlist_focus, use_container_width=True, hide_index=True)
+            st.dataframe(watchlist_focus, width="stretch", hide_index=True)
         else:
             st.caption("No watchlist focus items in the latest report.")
 
@@ -431,7 +437,7 @@ with tab_execution:
                 }
                 for row in execution_orders
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -455,7 +461,7 @@ with tab_execution:
                 }
                 for row in execution_fills
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
