@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import sys
 from datetime import UTC, datetime, time, timedelta
+import re
 from pathlib import Path
 
 import pandas as pd
 import pytz
 import streamlit as st
-import streamlit.components.v1 as components
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC = ROOT / "src"
@@ -31,6 +31,7 @@ from saxo_daytrader_xai.execution_engine import (
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
+from saxo_daytrader_xai.market_symbols import saxo_to_yahoo
 from saxo_daytrader_xai.notifications import (
     build_summary,
     dispatch_broker_alerts_if_due,
@@ -43,6 +44,7 @@ from saxo_daytrader_xai.scheduler_service import (
     run_manual_scheduler_cycle,
 )
 from saxo_daytrader_xai.portfolio import (
+    fetch_goal_tracking,
     fetch_latest_batch_id,
     fetch_portfolio_positions,
     fetch_portfolio_value_history,
@@ -90,9 +92,18 @@ def _format_qty(value: float | None) -> str:
 def _signed_color(value: float | None) -> str:
     if value is None:
         return ""
-    if float(value) > 0:
+    numeric_value: float | None
+    if isinstance(value, str):
+        cleaned = value.replace(",", "")
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if not match:
+            return ""
+        numeric_value = float(match.group(0))
+    else:
+        numeric_value = float(value)
+    if numeric_value > 0:
         return "color: #0a7f39; font-weight: 600;"
-    if float(value) < 0:
+    if numeric_value < 0:
         return "color: #b42318; font-weight: 600;"
     return ""
 
@@ -106,7 +117,7 @@ def _sent_alert_count(alert_result: dict | None) -> int:
 def _enable_auto_refresh(interval_ms: int) -> None:
     if interval_ms <= 0:
         return
-    components.html(
+    st.html(
         f"""
         <script>
         const parentWin = window.parent;
@@ -118,8 +129,8 @@ def _enable_auto_refresh(interval_ms: int) -> None:
         }}, {int(interval_ms)});
         </script>
         """,
-        height=0,
-        width=0,
+        width="content",
+        unsafe_allow_javascript=True,
     )
 
 
@@ -183,6 +194,11 @@ def _history_resample_rule(view_name: str, span_days: int | None) -> tuple[str |
     return "1D", "Daily"
 
 
+def _yahoo_finance_quote_url(symbol: str) -> str:
+    yahoo_symbol = saxo_to_yahoo(symbol)
+    return f"https://finance.yahoo.com/quote/{yahoo_symbol}#{symbol}"
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_watchlists(config_path: str) -> dict:
     return build_watchlists(load_config(config_path))
@@ -214,6 +230,7 @@ init_db(connection)
 batch_id = fetch_latest_batch_id(connection)
 initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
 summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+goal_tracking = fetch_goal_tracking(connection, config)
 positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
 portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
 trade_ledger = fetch_trade_ledger(connection)
@@ -305,27 +322,42 @@ with tab_portfolio:
                     "Allocation": row["allocation_pct"],
                     "Asset Class": row["asset_class"],
                     "Market": row["market_status"],
+                    "Quote Updated": row.get("latest_quote_updated_at") or "n/a",
                     "Value Date": row["value_date"],
                 }
                 for row in positions
             ]
         )
+        display_df = position_df.copy()
+        display_df["Symbol"] = display_df["Symbol"].map(_yahoo_finance_quote_url)
+        display_df["Qty"] = display_df["Qty"].map(_format_qty)
+        display_df["Open Price"] = [
+            _format_money(row["Open Price"], row["Currency"])
+            for _, row in position_df.iterrows()
+        ]
+        display_df["Current Price"] = [
+            _format_money(row["Current Price"], row["Currency"])
+            for _, row in position_df.iterrows()
+        ]
+        for column in ["Cost Basis DKK", "Market Value DKK", "Unrealised P/L DKK", "Daily P/L DKK"]:
+            display_df[column] = display_df[column].map(_format_dkk)
+        display_df["Allocation"] = display_df["Allocation"].map(_format_pct)
         styled_positions = (
-            position_df.style.format(
-                {
-                    "Qty": lambda value: _format_qty(value),
-                    "Open Price": lambda value: _format_money(value),
-                    "Current Price": lambda value: _format_money(value),
-                    "Cost Basis DKK": lambda value: _format_dkk(value),
-                    "Market Value DKK": lambda value: _format_dkk(value),
-                    "Unrealised P/L DKK": lambda value: _format_dkk(value),
-                    "Daily P/L DKK": lambda value: _format_dkk(value),
-                    "Allocation": lambda value: _format_pct(value),
-                }
-            )
+            display_df.style
             .map(_signed_color, subset=["Daily P/L DKK", "Unrealised P/L DKK"])
         )
-        st.dataframe(styled_positions, width="stretch", hide_index=True)
+        st.dataframe(
+            styled_positions,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Symbol": st.column_config.LinkColumn(
+                    "Symbol",
+                    help="Open the ticker on Yahoo Finance in a new browser tab.",
+                    display_text=r".*#(.*)$",
+                )
+            },
+        )
     else:
         st.warning("No portfolio positions are available in the database yet.")
 
@@ -391,6 +423,68 @@ with tab_portfolio:
 
 with tab_performance:
     st.subheader("Portfolio Value History")
+    goal_periods = goal_tracking["periods"]
+    goal_col1, goal_col2, goal_col3, goal_col4, goal_col5 = st.columns(5)
+    goal_col1.metric(
+        "Day vs Goal",
+        _format_dkk(goal_periods["day"]["pnl_dkk"]),
+        delta=f"{goal_periods['day']['gap_dkk']:+,.2f} DKK vs target",
+    )
+    goal_col2.metric(
+        "Week vs Goal",
+        _format_dkk(goal_periods["week"]["pnl_dkk"]),
+        delta=f"{goal_periods['week']['gap_dkk']:+,.2f} DKK vs target",
+    )
+    goal_col3.metric(
+        "Month vs Goal",
+        _format_dkk(goal_periods["month"]["pnl_dkk"]),
+        delta=f"{goal_periods['month']['gap_dkk']:+,.2f} DKK vs target",
+    )
+    goal_col4.metric(
+        "Year vs Goal",
+        _format_dkk(goal_periods["year"]["pnl_dkk"]),
+        delta=f"{goal_periods['year']['gap_dkk']:+,.2f} DKK vs target",
+    )
+    goal_col5.metric(
+        "Avg / Observed Day",
+        _format_dkk(goal_tracking["average_dkk_per_observed_day"]),
+        delta=f"{goal_tracking['projected_weekly_dkk_from_average']:+,.2f} DKK projected week",
+    )
+    st.caption(
+        f"Goal tracking uses portfolio value before tax, reset at {goal_tracking['reset_hour_local']:02d}:00 "
+        f"{goal_tracking['timezone']}. Daily target {goal_tracking['daily_target_dkk']:.0f} DKK, "
+        f"weekly target {goal_tracking['weekly_target_dkk']:.0f} DKK."
+    )
+    goal_rows = pd.DataFrame(
+        [
+            {
+                "Period": period_name.title().replace("_", " "),
+                "P/L DKK": stats["pnl_dkk"],
+                "Target DKK": stats["target_dkk"],
+                "Stretch DKK": stats["stretch_target_dkk"],
+                "Gap DKK": stats["gap_dkk"],
+                "% Of Target": stats["pct_of_target"] / 100.0,
+                "Observed Session Days": stats["observed_session_days"],
+                "Start": stats["start_at"],
+                "End": stats["end_at"],
+            }
+            for period_name, stats in goal_periods.items()
+        ]
+    )
+    st.dataframe(
+        goal_rows.style.format(
+            {
+                "P/L DKK": lambda value: _format_dkk(value),
+                "Target DKK": lambda value: _format_dkk(value),
+                "Stretch DKK": lambda value: _format_dkk(value),
+                "Gap DKK": lambda value: _format_dkk(value),
+                "% Of Target": lambda value: _format_pct(value),
+            }
+        ).map(_signed_color, subset=["P/L DKK", "Gap DKK"]),
+        width="stretch",
+        hide_index=True,
+    )
+
     if portfolio_value_history:
         timezone_name = _history_timezone_name(config)
         timezone = pytz.timezone(timezone_name)
@@ -699,6 +793,7 @@ with tab_decision:
             {
                 "analysis_window_active": report.get("analysis_window_active"),
                 "goal": report.get("goal"),
+                "goal_tracking": goal_tracking,
                 "market_regime": regime,
                 "portfolio_assessment": portfolio_assessment,
             }

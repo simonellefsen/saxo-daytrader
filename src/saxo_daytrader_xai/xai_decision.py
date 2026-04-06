@@ -13,6 +13,7 @@ from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
 from saxo_daytrader_xai.portfolio import (
+    fetch_goal_tracking,
     fetch_latest_batch_id,
     fetch_portfolio_positions,
     fetch_portfolio_summary,
@@ -169,6 +170,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
     portfolio_positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
     portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
+    goal_tracking = fetch_goal_tracking(connection, config)
     watchlists = build_watchlists(config)
     watchlist_symbols = [row["symbol"] for row in watchlists["nordic"][:5]] + [row["symbol"] for row in watchlists["global"][:10]]
     market_news = fetch_market_intelligence(config, portfolio_symbols[:8], watchlist_symbols[:8])
@@ -207,6 +209,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
             "nordic": watchlists["nordic"][:10],
             "global": watchlists["global"][:15],
         },
+        "goal_tracking": goal_tracking,
         "market_news": market_news,
         "market_status": market_status_rows,
         "analysis_summary": analysis_summary,
@@ -253,12 +256,16 @@ News and macro context JSON:
 Market status JSON:
 {json.dumps({'analysis_summary': context['analysis_summary'], 'markets': context['market_status']}, ensure_ascii=False, indent=2)}
 
+Goal tracking JSON:
+{json.dumps(context['goal_tracking'], ensure_ascii=False, indent=2)}
+
 Task:
 1. Assess the current market regime for a day-trading horizon.
 2. Evaluate the existing portfolio, including concentration and downside risks.
-3. Identify the highest-priority trade adjustments for today, if any.
-4. Respect Danish tax drag, commission drag, and the long-only / exclusion constraints.
-5. Produce a concise but concrete decision report for the operator.
+3. Evaluate whether the portfolio is currently on track versus the DKK 500/day and DKK 3,500/week goals using the provided day/week/month/year/all-time performance data.
+4. Identify the highest-priority trade adjustments for today, if any.
+5. Respect Danish tax drag, commission drag, and the long-only / exclusion constraints.
+6. Produce a concise but concrete decision report for the operator.
 """.strip()
 
     return {
@@ -311,7 +318,11 @@ def _mock_decision_report(context: dict[str, Any], config: dict[str, Any]) -> di
             }
         ],
         "execution_notes": ["Mock mode only. No live model response was requested."],
-        "daily_target_assessment": "Insufficient for a live target assessment because the report is mocked.",
+        "daily_target_assessment": (
+            "Mock mode only. "
+            f"Observed day pnl is {context['goal_tracking']['periods']['day']['pnl_dkk']:.2f} DKK "
+            f"versus target {context['goal_tracking']['periods']['day']['target_dkk']:.2f} DKK."
+        ),
     }
 
 

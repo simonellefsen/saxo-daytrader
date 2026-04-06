@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
+
+import pytz
 
 
 ACTIVE_LEDGER_STATUSES = {"executed", "approved", "recorded"}
@@ -239,6 +242,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
             {
                 **state,
                 "quantity": effective_quantity,
+                "current_price_local": current_price_local,
                 "market_value_local": effective_quantity * current_price_local,
                 "market_value_dkk": effective_market_value_dkk,
                 "unrealised_pnl_dkk": effective_market_value_dkk - float(state["cost_basis_dkk"] or 0.0),
@@ -413,6 +417,145 @@ def fetch_realised_tax_summary(connection: sqlite3.Connection, tax_year: int) ->
         (tax_year,),
     ).fetchone()
     return dict(row) if row else {"realised_gain_dkk": 0.0, "tax_dkk": 0.0, "commission_dkk": 0.0, "trade_count": 0}
+
+
+def _price_monitor_timezone(config: dict[str, Any]):
+    return pytz.timezone(str(config.get("price_monitor", {}).get("timezone", "Europe/Copenhagen")))
+
+
+def _reset_hour_local(config: dict[str, Any]) -> int:
+    return int(config.get("price_monitor", {}).get("reset_hour_local", 6))
+
+
+def _session_start_local(config: dict[str, Any], local_date) -> datetime:
+    timezone = _price_monitor_timezone(config)
+    return timezone.localize(datetime.combine(local_date, time(hour=_reset_hour_local(config))))
+
+
+def _session_date_for_local_dt(config: dict[str, Any], local_dt: datetime):
+    session_date = local_dt.date()
+    if local_dt.hour < _reset_hour_local(config):
+        session_date = session_date - timedelta(days=1)
+    return session_date
+
+
+def _history_with_local_timestamps(connection: sqlite3.Connection, config: dict[str, Any]) -> list[dict[str, Any]]:
+    timezone = _price_monitor_timezone(config)
+    rows = fetch_portfolio_value_history(connection, limit=200_000)
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        recorded_at_utc = datetime.fromisoformat(str(row["recorded_at"]))
+        local_dt = recorded_at_utc.astimezone(timezone)
+        output.append(
+            {
+                **row,
+                "recorded_at_dt": recorded_at_utc,
+                "recorded_at_local": local_dt,
+                "session_date": row.get("baseline_session_date") or _session_date_for_local_dt(config, local_dt).isoformat(),
+            }
+        )
+    return output
+
+
+def _period_stats(history_rows: list[dict[str, Any]], *, start_local: datetime | None, end_local: datetime) -> dict[str, Any]:
+    eligible = [row for row in history_rows if row["recorded_at_local"] <= end_local]
+    if not eligible:
+        return {
+            "available": False,
+            "start_at": None,
+            "end_at": end_local.isoformat(timespec="seconds"),
+            "current_value_dkk": 0.0,
+            "anchor_value_dkk": 0.0,
+            "pnl_dkk": 0.0,
+            "observed_session_days": 0,
+        }
+    current_row = eligible[-1]
+    if start_local is None:
+        anchor_row = eligible[0]
+        in_period = eligible
+    else:
+        in_period = [row for row in eligible if row["recorded_at_local"] >= start_local]
+        anchor_row = in_period[0] if in_period else None
+        if anchor_row is None:
+            return {
+                "available": False,
+                "start_at": start_local.isoformat(timespec="seconds"),
+                "end_at": end_local.isoformat(timespec="seconds"),
+                "current_value_dkk": float(current_row["total_market_value_dkk"]),
+                "anchor_value_dkk": 0.0,
+                "pnl_dkk": 0.0,
+                "observed_session_days": 0,
+            }
+    observed_days = len({row["session_date"] for row in in_period})
+    pnl_dkk = float(current_row["total_market_value_dkk"]) - float(anchor_row["total_market_value_dkk"])
+    return {
+        "available": True,
+        "start_at": anchor_row["recorded_at_local"].isoformat(timespec="seconds"),
+        "end_at": current_row["recorded_at_local"].isoformat(timespec="seconds"),
+        "current_value_dkk": float(current_row["total_market_value_dkk"]),
+        "anchor_value_dkk": float(anchor_row["total_market_value_dkk"]),
+        "pnl_dkk": pnl_dkk,
+        "observed_session_days": observed_days,
+    }
+
+
+def fetch_goal_tracking(
+    connection: sqlite3.Connection,
+    config: dict[str, Any],
+    *,
+    reference_time: datetime | None = None,
+) -> dict[str, Any]:
+    history_rows = _history_with_local_timestamps(connection, config)
+    timezone = _price_monitor_timezone(config)
+    now_local = (reference_time or datetime.now(UTC)).astimezone(timezone)
+    goal_text = str(config.get("xai", {}).get("goal", ""))
+    baseline_day_start = _session_start_local(config, _session_date_for_local_dt(config, now_local))
+    baseline_week_start = _session_start_local(config, baseline_day_start.date() - timedelta(days=baseline_day_start.weekday()))
+    baseline_month_start = _session_start_local(config, baseline_day_start.replace(day=1).date())
+    baseline_year_start = _session_start_local(config, baseline_day_start.replace(month=1, day=1).date())
+
+    daily_target_dkk = 500.0
+    stretch_daily_target_dkk = 1000.0
+    weekly_target_dkk = 3500.0
+
+    periods = {
+        "day": _period_stats(history_rows, start_local=baseline_day_start, end_local=now_local),
+        "week": _period_stats(history_rows, start_local=baseline_week_start, end_local=now_local),
+        "month": _period_stats(history_rows, start_local=baseline_month_start, end_local=now_local),
+        "year": _period_stats(history_rows, start_local=baseline_year_start, end_local=now_local),
+        "all_time": _period_stats(history_rows, start_local=None, end_local=now_local),
+    }
+
+    for name, period in periods.items():
+        if name == "week":
+            target_dkk = weekly_target_dkk if period["observed_session_days"] >= 5 else daily_target_dkk * period["observed_session_days"]
+        else:
+            target_dkk = daily_target_dkk * period["observed_session_days"]
+        period["target_dkk"] = target_dkk
+        period["stretch_target_dkk"] = stretch_daily_target_dkk * period["observed_session_days"]
+        period["gap_dkk"] = period["pnl_dkk"] - target_dkk
+        period["pct_of_target"] = (period["pnl_dkk"] / target_dkk * 100.0) if abs(target_dkk) > 1e-9 else 0.0
+
+    all_time = periods["all_time"]
+    average_per_observed_day = (
+        all_time["pnl_dkk"] / all_time["observed_session_days"]
+        if all_time["observed_session_days"] > 0
+        else 0.0
+    )
+    projected_weekly_from_average = average_per_observed_day * 5.0
+
+    return {
+        "goal_text": goal_text,
+        "as_of": now_local.isoformat(timespec="seconds"),
+        "timezone": str(timezone),
+        "reset_hour_local": _reset_hour_local(config),
+        "daily_target_dkk": daily_target_dkk,
+        "stretch_daily_target_dkk": stretch_daily_target_dkk,
+        "weekly_target_dkk": weekly_target_dkk,
+        "average_dkk_per_observed_day": average_per_observed_day,
+        "projected_weekly_dkk_from_average": projected_weekly_from_average,
+        "periods": periods,
+    }
 
 
 def record_portfolio_value_snapshot(
