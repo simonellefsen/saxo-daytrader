@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -397,6 +398,111 @@ def _record_execution_fill(
     return int(cursor.lastrowid)
 
 
+def _coerce_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_broker_quantity(payload: dict[str, Any]) -> float | None:
+    for key in ("Amount", "CurrentAmount", "OrderAmount", "LeavesAmount", "OriginalAmount"):
+        value = _coerce_float(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_broker_price(payload: dict[str, Any]) -> float | None:
+    for key in ("OrderPrice", "Price", "OrderPriceDisplay"):
+        value = _coerce_float(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _event_signature(order_id: int, event_type: str, payload: dict[str, Any]) -> str:
+    def sanitize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: sanitize(item)
+                for key, item in value.items()
+                if key not in {"last_sync_at"}
+            }
+        if isinstance(value, list):
+            return [sanitize(item) for item in value]
+        return value
+
+    serialized = json.dumps(
+        sanitize(
+            {
+            "order_id": order_id,
+            "event_type": event_type,
+            "payload": payload,
+            }
+        ),
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _record_execution_event(
+    connection,
+    *,
+    order: dict[str, Any],
+    broker_order_id: str | None,
+    event_type: str,
+    broker_status: str | None,
+    broker_substatus: str | None,
+    broker_quantity: float | None,
+    broker_price_local: float | None,
+    payload: dict[str, Any],
+) -> int | None:
+    signature = _event_signature(
+        int(order["id"]),
+        event_type,
+        {
+            "broker_order_id": broker_order_id,
+            "broker_status": broker_status,
+            "broker_substatus": broker_substatus,
+            "broker_quantity": broker_quantity,
+            "broker_price_local": broker_price_local,
+        },
+    )
+    existing = connection.execute(
+        "SELECT id FROM execution_order_events WHERE event_signature = ?",
+        (signature,),
+    ).fetchone()
+    if existing:
+        return None
+    cursor = connection.execute(
+        """
+        INSERT INTO execution_order_events (
+            created_at, execution_order_id, broker_order_id, event_type,
+            broker_status, broker_substatus, broker_quantity, broker_price_local,
+            event_signature, raw_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(UTC).isoformat(timespec="seconds"),
+            order["id"],
+            broker_order_id,
+            event_type,
+            broker_status,
+            broker_substatus,
+            broker_quantity,
+            broker_price_local,
+            signature,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
 def _sync_incremental_live_fill(
     connection,
     config: dict[str, Any],
@@ -481,7 +587,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             SELECT *
             FROM execution_orders
             WHERE mode = 'live'
-              AND status IN ('submitted_to_broker', 'broker_working', 'broker_partially_filled')
+              AND status IN ('submitted_to_broker', 'broker_working', 'broker_partially_filled', 'broker_amended')
             ORDER BY id DESC
             LIMIT ?
             """,
@@ -505,8 +611,20 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             try:
                 open_order = get_open_order(str(broker_order_id), resolved_config, session)
                 broker_status = str(open_order.get("Status") or "Working")
+                broker_quantity = _extract_broker_quantity(open_order)
+                broker_price = _extract_broker_price(open_order)
+                quantity_changed = broker_quantity is not None and abs(broker_quantity - float(order["quantity"])) > 1e-9
+                price_changed = (
+                    broker_price is not None
+                    and order.get("price_local") is not None
+                    and abs(broker_price - float(order["price_local"])) > 1e-9
+                )
                 if broker_status.lower() in {"working", "placed"}:
-                    new_status = "broker_working"
+                    new_status = (
+                        "broker_amended"
+                        if quantity_changed or price_changed or order["status"] == "broker_amended"
+                        else "broker_working"
+                    )
                 elif broker_status.lower() == "fill":
                     new_status = "broker_partially_filled"
                 else:
@@ -514,16 +632,49 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                 payload = {
                     **execution_result,
                     "open_order": open_order,
+                    "broker_quantity": broker_quantity,
+                    "broker_price_local": broker_price,
+                    "quantity_changed": quantity_changed,
+                    "price_changed": price_changed,
                     "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 }
+                event_id = _record_execution_event(
+                    resolved_connection,
+                    order=order,
+                    broker_order_id=str(broker_order_id),
+                    event_type=new_status,
+                    broker_status=broker_status,
+                    broker_substatus=str(open_order.get("SubStatus") or ""),
+                    broker_quantity=broker_quantity,
+                    broker_price_local=broker_price,
+                    payload=payload,
+                )
                 resolved_connection.execute(
                     """
                     UPDATE execution_orders
-                    SET status = ?, execution_result_json = ?
+                    SET status = ?, quantity = COALESCE(?, quantity), price_local = COALESCE(?, price_local), execution_result_json = ?
                     WHERE id = ?
                     """,
-                    (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                    (
+                        new_status,
+                        broker_quantity,
+                        broker_price,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        order["id"],
+                    ),
                 )
+                if new_status == "broker_amended":
+                    append_audit_log(
+                        resolved_connection,
+                        "execution_order_amended",
+                        {
+                            "order_id": order["id"],
+                            "broker_order_id": broker_order_id,
+                            "broker_quantity": broker_quantity,
+                            "broker_price_local": broker_price,
+                            "event_id": event_id,
+                        },
+                    )
                 updates.append({"order_id": order["id"], "status": new_status})
                 continue
             except SaxoOrderNotFoundError:
@@ -531,9 +682,13 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
 
             activity_status = str(activity.get("Status") or "")
             activity_substatus = str(activity.get("SubStatus") or "")
+            broker_quantity = _extract_broker_quantity(activity)
+            broker_price = _extract_broker_price(activity) or _coerce_float(activity.get("AveragePrice"))
             payload = {
                 **execution_result,
                 "last_activity": activity,
+                "broker_quantity": broker_quantity,
+                "broker_price_local": broker_price,
                 "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
             }
 
@@ -545,6 +700,17 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                     activity,
                     broker_order_id=str(broker_order_id),
                     fill_status="FinalFill",
+                )
+                event_id = _record_execution_event(
+                    resolved_connection,
+                    order=order,
+                    broker_order_id=str(broker_order_id),
+                    event_type="broker_final_fill",
+                    broker_status=activity_status,
+                    broker_substatus=activity_substatus,
+                    broker_quantity=broker_quantity,
+                    broker_price_local=broker_price,
+                    payload=payload,
                 )
                 resolved_connection.execute(
                     """
@@ -563,6 +729,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                         "broker_order_id": broker_order_id,
                         "delta_quantity": result["delta_quantity"],
                         "cumulative_quantity": result["cumulative_quantity"],
+                        "event_id": event_id,
                     },
                 )
                 updates.append({"order_id": order["id"], "status": "executed", "ledger_id": result["ledger_id"]})
@@ -574,6 +741,17 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                     activity,
                     broker_order_id=str(broker_order_id),
                     fill_status="Fill",
+                )
+                event_id = _record_execution_event(
+                    resolved_connection,
+                    order=order,
+                    broker_order_id=str(broker_order_id),
+                    event_type="broker_fill",
+                    broker_status=activity_status,
+                    broker_substatus=activity_substatus,
+                    broker_quantity=broker_quantity,
+                    broker_price_local=broker_price,
+                    payload=payload,
                 )
                 resolved_connection.execute(
                     """
@@ -592,6 +770,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                         "broker_order_id": broker_order_id,
                         "delta_quantity": result["delta_quantity"],
                         "cumulative_quantity": result["cumulative_quantity"],
+                        "event_id": event_id,
                     },
                 )
                 updates.append(
@@ -602,8 +781,57 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                         "delta_quantity": result["delta_quantity"],
                     }
                 )
+            elif activity_status in {"Changed", "Replaced", "Amended"} and activity_substatus == "Confirmed":
+                event_id = _record_execution_event(
+                    resolved_connection,
+                    order=order,
+                    broker_order_id=str(broker_order_id),
+                    event_type="broker_amended",
+                    broker_status=activity_status,
+                    broker_substatus=activity_substatus,
+                    broker_quantity=broker_quantity,
+                    broker_price_local=broker_price,
+                    payload=payload,
+                )
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, quantity = COALESCE(?, quantity), price_local = COALESCE(?, price_local), execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "broker_amended",
+                        broker_quantity,
+                        broker_price,
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        order["id"],
+                    ),
+                )
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_amended",
+                    {
+                        "order_id": order["id"],
+                        "broker_order_id": broker_order_id,
+                        "broker_quantity": broker_quantity,
+                        "broker_price_local": broker_price,
+                        "event_id": event_id,
+                    },
+                )
+                updates.append({"order_id": order["id"], "status": "broker_amended"})
             elif activity_status in {"Cancelled", "Expired"} and activity_substatus == "Confirmed":
                 new_status = "broker_cancelled" if activity_status == "Cancelled" else "broker_expired"
+                event_id = _record_execution_event(
+                    resolved_connection,
+                    order=order,
+                    broker_order_id=str(broker_order_id),
+                    event_type=new_status,
+                    broker_status=activity_status,
+                    broker_substatus=activity_substatus,
+                    broker_quantity=broker_quantity,
+                    broker_price_local=broker_price,
+                    payload=payload,
+                )
                 resolved_connection.execute(
                     """
                     UPDATE execution_orders
@@ -612,7 +840,52 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                     """,
                     (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
                 )
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_closed_without_fill",
+                    {
+                        "order_id": order["id"],
+                        "broker_order_id": broker_order_id,
+                        "status": new_status,
+                        "event_id": event_id,
+                    },
+                )
                 updates.append({"order_id": order["id"], "status": new_status})
+            elif activity_status in {"Rejected", "Failed"}:
+                event_id = _record_execution_event(
+                    resolved_connection,
+                    order=order,
+                    broker_order_id=str(broker_order_id),
+                    event_type="broker_rejected",
+                    broker_status=activity_status,
+                    broker_substatus=activity_substatus,
+                    broker_quantity=broker_quantity,
+                    broker_price_local=broker_price,
+                    payload=payload,
+                )
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET status = ?, error_text = ?, execution_result_json = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "broker_rejected",
+                        json.dumps(activity, ensure_ascii=False, sort_keys=True),
+                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                        order["id"],
+                    ),
+                )
+                append_audit_log(
+                    resolved_connection,
+                    "execution_order_rejected",
+                    {
+                        "order_id": order["id"],
+                        "broker_order_id": broker_order_id,
+                        "event_id": event_id,
+                    },
+                )
+                updates.append({"order_id": order["id"], "status": "broker_rejected"})
             else:
                 resolved_connection.execute(
                     """
@@ -835,6 +1108,19 @@ def fetch_execution_fills(connection, limit: int = 100) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def fetch_execution_events(connection, limit: int = 100) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM execution_order_events
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def export_audit_bundle(output_dir: str, *, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
     import csv
 
@@ -848,6 +1134,7 @@ def export_audit_bundle(output_dir: str, *, config: dict[str, Any] | None = None
             "decision_reports": out / "decision_reports.csv",
             "execution_orders": out / "execution_orders.csv",
             "execution_fills": out / "execution_fills.csv",
+            "execution_order_events": out / "execution_order_events.csv",
             "audit_log": out / "audit_log.csv",
         }
         for table_name, path in exports.items():

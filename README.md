@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 8 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 9 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 8 includes
+## What Phase 9 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -26,6 +26,8 @@ Phase 8 foundation for a local Python day-trading assistant focused on a Danish 
 - Local ledger reconciliation when Saxo reports a confirmed final fill
 - Incremental local ledger reconciliation for confirmed partial fills
 - Immutable `execution_fills` records for broker fill history and deduplication
+- Immutable `execution_order_events` records for broker-side amendments, cancellations, rejections, and working-order state changes
+- Broker-side amendment reconciliation that updates local working order quantity and price from Saxo
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
 - Streamlit dashboard with:
   - portfolio summary in DKK
@@ -127,10 +129,10 @@ Before pushing this project to GitHub:
 
 ## Validation
 
-Run the Phase 8 validation script:
+Run the Phase 9 validation script:
 
 ```bash
-.venv/bin/python scripts/validate_phase8.py
+.venv/bin/python scripts/validate_phase9.py
 ```
 
 Earlier phase validations remain available. To validate against the live xAI API:
@@ -142,13 +144,12 @@ Earlier phase validations remain available. To validate against the live xAI API
 Expected output shape:
 
 ```text
-Phase 8 validation passed.
+Phase 9 validation passed.
 Imported source positions: 20
 Excluded positions: 2
-First sync status: broker_partially_filled
-Second sync status: executed
-Recorded fill rows: 2
-Trade ledger rows: 2
+Amended order status: broker_amended
+Cancelled order status: broker_cancelled
+Broker event rows: 2
 ```
 
 The exact order id values can vary slightly with the imported portfolio snapshot.
@@ -163,6 +164,8 @@ Earlier validation scripts remain available:
 .venv/bin/python scripts/validate_phase5.py
 .venv/bin/python scripts/validate_phase6.py
 .venv/bin/python scripts/validate_phase7.py
+.venv/bin/python scripts/validate_phase8.py
+.venv/bin/python scripts/validate_phase9.py
 ```
 
 ## Project layout
@@ -181,6 +184,7 @@ Earlier validation scripts remain available:
 │   └── validate_phase6.py
 │   └── validate_phase7.py
 │   └── validate_phase8.py
+│   └── validate_phase9.py
 └── src/
     └── saxo_daytrader_xai/
         ├── config.py
@@ -204,6 +208,6 @@ Earlier validation scripts remain available:
 
 ## Next-phase todo
 
-1. Add broker-side change/cancel reconciliation so edited or cancelled Saxo orders update local execution state more precisely.
-2. Add optional Slack or email daily summaries from the scheduler worker.
-3. Add systemd and launchd service examples for unattended local deployment.
+1. Add optional Slack or email daily summaries from the scheduler worker.
+2. Add systemd and launchd service examples for unattended local deployment.
+3. Add broker-side order replacement support so the app can submit controlled modify/cancel-replace actions, not only reconcile them after the fact.

@@ -188,6 +188,27 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_execution_fills_order
         ON execution_fills(execution_order_id, cumulative_quantity, created_at);
 
+        CREATE TABLE IF NOT EXISTS execution_order_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            execution_order_id INTEGER NOT NULL,
+            broker_order_id TEXT,
+            event_type TEXT NOT NULL,
+            broker_status TEXT,
+            broker_substatus TEXT,
+            broker_quantity REAL,
+            broker_price_local REAL,
+            event_signature TEXT NOT NULL,
+            raw_payload_json TEXT NOT NULL,
+            FOREIGN KEY(execution_order_id) REFERENCES execution_orders(id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_order_events_signature
+        ON execution_order_events(event_signature);
+
+        CREATE INDEX IF NOT EXISTS idx_execution_order_events_order
+        ON execution_order_events(execution_order_id, created_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
