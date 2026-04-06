@@ -429,6 +429,108 @@ def fetch_notification_deliveries(connection, limit: int = 100) -> list[dict[str
     return output
 
 
+def _alerts_enabled(config: dict[str, Any]) -> bool:
+    alerts_cfg = config.get("notifications", {}).get("alerts", {})
+    return any(
+        bool(alerts_cfg.get(key, False))
+        for key in ("broker_fill_enabled", "broker_reject_enabled", "broker_cancel_enabled")
+    )
+
+
+def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
+    alerts_cfg = config.get("notifications", {}).get("alerts", {})
+    alerts: list[dict[str, Any]] = []
+
+    if alerts_cfg.get("broker_fill_enabled", False):
+        fill_rows = connection.execute(
+            """
+            SELECT *
+            FROM execution_fills
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in fill_rows:
+            record = dict(row)
+            alert_key = f"fill:{record['id']}"
+            alerts.append(
+                {
+                    "alert_key": alert_key,
+                    "summary_kind": "alert_broker_fill",
+                    "subject": f"Broker fill confirmed for {record['symbol']}",
+                    "message_text": "\n".join(
+                        [
+                            f"Broker fill confirmed for {record['symbol']}",
+                            "",
+                            f"Order ID: {record['execution_order_id']}",
+                            f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
+                            f"Side: {record['side']}",
+                            f"Status: {record['fill_status']}",
+                            f"Delta quantity: {float(record['delta_quantity']):.4f}",
+                            f"Cumulative quantity: {float(record['cumulative_quantity']):.4f}",
+                            f"Average price: {float(record['average_price_local']):.4f} {record['currency']}",
+                            f"Ledger ID: {record.get('ledger_id') or 'n/a'}",
+                        ]
+                    ),
+                    "payload": {
+                        "alert_type": "broker_fill",
+                        "record": record,
+                    },
+                }
+            )
+
+    event_type_map = {}
+    if alerts_cfg.get("broker_reject_enabled", False):
+        event_type_map["broker_rejected"] = ("alert_broker_reject", "Broker order rejected")
+    if alerts_cfg.get("broker_cancel_enabled", False):
+        event_type_map["broker_cancelled"] = ("alert_broker_cancel", "Broker order cancelled")
+        event_type_map["broker_expired"] = ("alert_broker_cancel", "Broker order expired")
+
+    if event_type_map:
+        placeholders = ", ".join("?" for _ in event_type_map)
+        event_rows = connection.execute(
+            f"""
+            SELECT *
+            FROM execution_order_events
+            WHERE event_type IN ({placeholders})
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*event_type_map.keys(), limit),
+        ).fetchall()
+        for row in event_rows:
+            record = dict(row)
+            summary_kind, subject_prefix = event_type_map[record["event_type"]]
+            alert_key = f"event:{record['id']}"
+            alerts.append(
+                {
+                    "alert_key": alert_key,
+                    "summary_kind": summary_kind,
+                    "subject": f"{subject_prefix} for order {record['execution_order_id']}",
+                    "message_text": "\n".join(
+                        [
+                            f"{subject_prefix} for execution order {record['execution_order_id']}",
+                            "",
+                            f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
+                            f"Event type: {record['event_type']}",
+                            f"Broker status: {record.get('broker_status') or 'n/a'}",
+                            f"Broker substatus: {record.get('broker_substatus') or 'n/a'}",
+                            f"Quantity: {record.get('broker_quantity') if record.get('broker_quantity') is not None else 'n/a'}",
+                            f"Price: {record.get('broker_price_local') if record.get('broker_price_local') is not None else 'n/a'}",
+                        ]
+                    ),
+                    "payload": {
+                        "alert_type": record["event_type"],
+                        "record": record,
+                    },
+                }
+            )
+
+    alerts.sort(key=lambda item: item["alert_key"])
+    return alerts[:limit]
+
+
 def _summary_due(config: dict[str, Any], summary_kind: str, local_now: datetime, *, force: bool) -> bool:
     if force:
         return True
@@ -597,6 +699,148 @@ def dispatch_summaries_if_due(
             )
         )
     return {"status": "ok", "results": results}
+
+
+def dispatch_broker_alerts_if_due(
+    connection,
+    config: dict[str, Any],
+    reference_time: datetime | None = None,
+    *,
+    force: bool = False,
+    limit: int = 25,
+) -> dict[str, Any]:
+    if not _alerts_enabled(config) and not force:
+        return {"status": "disabled", "sent": [], "alerts": []}
+
+    now_utc = (reference_time or datetime.now(UTC)).astimezone(UTC)
+    channels: list[str] = []
+    notifications_cfg = config.get("notifications", {})
+    if notifications_cfg.get("slack", {}).get("enabled"):
+        channels.append("slack")
+    if notifications_cfg.get("email", {}).get("enabled"):
+        channels.append("email")
+    if not channels:
+        channels.append("audit_log")
+
+    pending_alerts = _pending_broker_alerts(connection, config, limit=limit)
+    sent: list[dict[str, Any]] = []
+    for alert in pending_alerts:
+        for channel in channels:
+            is_ready, reason = _channel_ready(
+                connection,
+                config,
+                summary_kind=alert["summary_kind"],
+                channel=channel,
+                summary_date=alert["alert_key"],
+                reference_time=now_utc,
+                force=force,
+            )
+            if not is_ready:
+                sent.append(
+                    {
+                        "alert_key": alert["alert_key"],
+                        "summary_kind": alert["summary_kind"],
+                        "channel": channel,
+                        "status": "skipped",
+                        "reason": reason,
+                    }
+                )
+                continue
+            previous_state = _notification_state(connection, alert["summary_kind"], channel) or {}
+            attempt_count = int(previous_state.get("attempt_count") or 0) + 1
+            try:
+                if channel == "slack":
+                    delivery_meta = _send_slack(config, alert["subject"], alert["message_text"], alert["payload"])
+                elif channel == "email":
+                    delivery_meta = _send_email(config, alert["subject"], alert["message_text"])
+                else:
+                    delivery_meta = {"status": "stored_only"}
+                delivery_id = _record_notification_delivery(
+                    connection,
+                    summary_date=alert["alert_key"],
+                    summary_kind=alert["summary_kind"],
+                    channel=channel,
+                    status="sent",
+                    subject=alert["subject"],
+                    message_text=alert["message_text"],
+                    payload={**alert["payload"], "delivery_meta": delivery_meta},
+                )
+                _upsert_notification_state(
+                    connection,
+                    summary_kind=alert["summary_kind"],
+                    channel=channel,
+                    summary_date=alert["alert_key"],
+                    last_attempt_at=now_utc.isoformat(timespec="seconds"),
+                    next_attempt_after=None,
+                    attempt_count=attempt_count,
+                    last_status="sent",
+                    last_error_text=None,
+                )
+                append_audit_log(
+                    connection,
+                    "broker_alert_sent",
+                    {
+                        "alert_key": alert["alert_key"],
+                        "summary_kind": alert["summary_kind"],
+                        "channel": channel,
+                        "delivery_id": delivery_id,
+                    },
+                )
+                sent.append(
+                    {
+                        "alert_key": alert["alert_key"],
+                        "summary_kind": alert["summary_kind"],
+                        "channel": channel,
+                        "status": "sent",
+                        "delivery_id": delivery_id,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                delivery_id = _record_notification_delivery(
+                    connection,
+                    summary_date=alert["alert_key"],
+                    summary_kind=alert["summary_kind"],
+                    channel=channel,
+                    status="failed",
+                    subject=alert["subject"],
+                    message_text=alert["message_text"],
+                    payload=alert["payload"],
+                    error_text=str(exc),
+                )
+                next_attempt = now_utc + timedelta(minutes=int(config.get("notifications", {}).get("retry_backoff_minutes", 30)))
+                _upsert_notification_state(
+                    connection,
+                    summary_kind=alert["summary_kind"],
+                    channel=channel,
+                    summary_date=alert["alert_key"],
+                    last_attempt_at=now_utc.isoformat(timespec="seconds"),
+                    next_attempt_after=next_attempt.isoformat(timespec="seconds"),
+                    attempt_count=attempt_count,
+                    last_status="failed",
+                    last_error_text=str(exc),
+                )
+                append_audit_log(
+                    connection,
+                    "broker_alert_failed",
+                    {
+                        "alert_key": alert["alert_key"],
+                        "summary_kind": alert["summary_kind"],
+                        "channel": channel,
+                        "delivery_id": delivery_id,
+                        "error": str(exc),
+                    },
+                )
+                sent.append(
+                    {
+                        "alert_key": alert["alert_key"],
+                        "summary_kind": alert["summary_kind"],
+                        "channel": channel,
+                        "status": "failed",
+                        "delivery_id": delivery_id,
+                        "error": str(exc),
+                    }
+                )
+    return {"status": "ok", "alerts": pending_alerts, "sent": sent}
 
 
 def dispatch_daily_summary_if_due(

@@ -26,7 +26,12 @@ from saxo_daytrader_xai.execution_engine import (
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
-from saxo_daytrader_xai.notifications import build_summary, dispatch_summaries_if_due, fetch_notification_deliveries
+from saxo_daytrader_xai.notifications import (
+    build_summary,
+    dispatch_broker_alerts_if_due,
+    dispatch_summaries_if_due,
+    fetch_notification_deliveries,
+)
 from saxo_daytrader_xai.portfolio import (
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -566,10 +571,22 @@ with tab_notifications:
     notif_col4.metric("Quarterly Enabled", "Yes" if config["notifications"].get("quarterly_summary_enabled") else "No")
     notif_col5.metric("YTD Enabled", "Yes" if config["notifications"].get("ytd_summary_enabled") else "No")
 
-    if st.button("Send All Digests Now"):
+    alert_col1, alert_col2, alert_col3 = st.columns(3)
+    alerts_cfg = config["notifications"].get("alerts", {})
+    alert_col1.metric("Fill Alerts", "Yes" if alerts_cfg.get("broker_fill_enabled") else "No")
+    alert_col2.metric("Reject Alerts", "Yes" if alerts_cfg.get("broker_reject_enabled") else "No")
+    alert_col3.metric("Cancel Alerts", "Yes" if alerts_cfg.get("broker_cancel_enabled") else "No")
+
+    action_col1, action_col2 = st.columns(2)
+    if action_col1.button("Send All Digests Now"):
         with st.spinner("Dispatching summaries..."):
             summary_result = dispatch_summaries_if_due(connection, config, force=True)
         st.success(f"Summary dispatch status: {summary_result['status']}")
+        st.rerun()
+    if action_col2.button("Send Broker Alerts Now"):
+        with st.spinner("Dispatching broker alerts..."):
+            alert_result = dispatch_broker_alerts_if_due(connection, config, force=True)
+        st.success(f"Broker alert dispatch status: {alert_result['status']}")
         st.rerun()
 
     st.markdown("**Daily Summary Preview**")

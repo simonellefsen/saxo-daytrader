@@ -138,3 +138,7 @@ notifications:
     password: ENV:SMTP_PASSWORD
     from_address: ENV:SMTP_FROM_ADDRESS
     to_addresses_csv: ENV:SMTP_TO_ADDRESSES
+  alerts:
+    broker_fill_enabled: false
+    broker_reject_enabled: false
+    broker_cancel_enabled: false
