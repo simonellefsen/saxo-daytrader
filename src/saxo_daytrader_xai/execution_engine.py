@@ -14,6 +14,7 @@ from saxo_daytrader_xai.db import append_audit_log, connect, init_db
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
 from saxo_daytrader_xai.identifier_lookup import resolve_instrument_identity
 from saxo_daytrader_xai.market_data import fetch_live_prices
+from saxo_daytrader_xai.market_schedule import get_market_status
 from saxo_daytrader_xai.saxo_openapi import (
     SaxoOrderNotFoundError,
     SaxoSessionError,
@@ -21,6 +22,7 @@ from saxo_daytrader_xai.saxo_openapi import (
     cancel_order,
     change_order,
     ensure_access_token,
+    get_balance_snapshot,
     get_open_order,
     get_order_activity_last,
     place_order,
@@ -74,6 +76,67 @@ def _current_position_map(connection, batch_id: str | None = None) -> dict[str, 
 def _get_live_price_map(symbols: list[str], config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     quotes = fetch_live_prices(symbols, timeout_seconds=config["market_data"]["request_timeout_seconds"])
     return {row["symbol"]: row for row in quotes}
+
+
+def _symbol_exchange_code(symbol: str) -> str | None:
+    if ":" not in symbol:
+        return None
+    return symbol.split(":", 1)[1].upper()
+
+
+def _market_status_for_symbol(symbol: str, config: dict[str, Any]) -> dict[str, Any] | None:
+    exchange_code = _symbol_exchange_code(symbol)
+    if not exchange_code:
+        return None
+    rows = get_market_status(config)
+    return next((row for row in rows if str(row.get("code")) == exchange_code), None)
+
+
+def _should_auto_submit_live_orders(config: dict[str, Any]) -> bool:
+    return (
+        str(config["execution"]["mode"]) == "live"
+        and not bool(config["execution"].get("require_approval_live", True))
+        and not bool(config["app"].get("dry_run", True))
+    )
+
+
+def _approval_required_for_order(config: dict[str, Any]) -> bool:
+    return str(config["execution"]["mode"]) == "live" and bool(config["execution"].get("require_approval_live", True))
+
+
+def _cash_gate_enabled(config: dict[str, Any]) -> bool:
+    return bool(config["execution"].get("require_settled_cash_for_live_buys", True))
+
+
+def _to_dkk_amount(amount: float | None, currency: str | None, fx_snapshot: dict[str, Any]) -> float:
+    if amount is None:
+        return 0.0
+    return float(amount) * fx_rate_to_dkk(currency or "DKK", fx_snapshot)
+
+
+def _evaluate_live_buy_cash_gate(order: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    balance = get_balance_snapshot(config, session)
+    fx_snapshot = fetch_ecb_fx_rates()
+    balance_currency = str(balance.get("Currency") or "DKK")
+    required_dkk = float(order.get("estimated_value_dkk") or 0.0)
+    cash_available_dkk = _to_dkk_amount(balance.get("CashAvailableForTrading"), balance_currency, fx_snapshot)
+    funds_for_settlement_dkk = _to_dkk_amount(balance.get("FundsAvailableForSettlement"), balance_currency, fx_snapshot)
+    transactions_not_booked_dkk = _to_dkk_amount(balance.get("TransactionsNotBooked"), balance_currency, fx_snapshot)
+
+    has_cash = cash_available_dkk >= required_dkk
+    settlement_ready = funds_for_settlement_dkk >= required_dkk
+    pending_unbooked = abs(transactions_not_booked_dkk) > 1e-9
+
+    allowed = has_cash and (settlement_ready or not pending_unbooked)
+    return {
+        "allowed": allowed,
+        "required_dkk": required_dkk,
+        "cash_available_dkk": cash_available_dkk,
+        "funds_for_settlement_dkk": funds_for_settlement_dkk,
+        "transactions_not_booked_dkk": transactions_not_booked_dkk,
+        "balance_currency": balance_currency,
+        "raw_balance": balance,
+    }
 
 
 def _estimate_price_and_fx(
@@ -252,6 +315,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     min_trade_value_dkk = float(config["execution"]["min_trade_value_dkk"])
     remaining_capacity = _remaining_daily_order_capacity(connection, config)
     remaining_cash_dkk = float(fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)["cash_balance_dkk"])
+    approval_required = _approval_required_for_order(config)
 
     for suggestion in suggestions:
         if remaining_capacity <= 0:
@@ -279,7 +343,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
                     "price_local": None,
                     "currency": None,
                     "estimated_value_dkk": 0.0,
-                    "approval_required": 1 if config["execution"]["mode"] == "live" else 0,
+                    "approval_required": 1 if approval_required else 0,
                     "request_json": json.dumps(suggestion, ensure_ascii=False, sort_keys=True),
                     "execution_result_json": None,
                     "error_text": str(exc),
@@ -347,14 +411,14 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
                 "symbol": symbol,
                 "action": action,
                 "mode": config["execution"]["mode"],
-                "status": "pending_approval" if config["execution"]["mode"] == "live" else "pending_execution",
+                "status": "pending_approval" if approval_required else "pending_execution",
                 "adapter": config["execution"]["adapter"],
                 "requested_weight_pct": requested_weight_pct,
                 "quantity": float(whole_quantity),
                 "price_local": price_local,
                 "currency": currency,
                 "estimated_value_dkk": estimated_value_dkk,
-                "approval_required": 1 if config["execution"]["mode"] == "live" else 0,
+                "approval_required": 1 if approval_required else 0,
                 "request_json": json.dumps(suggestion, ensure_ascii=False, sort_keys=True),
                 "execution_result_json": None,
                 "error_text": None,
@@ -1108,10 +1172,41 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 (float(normalized_quantity), order_id),
             )
             resolved_connection.commit()
-        if order["status"] not in {"pending_execution", "pending_approval"}:
+        if order["status"] not in {"pending_execution", "pending_approval", "waiting_for_market_open"}:
             return {"status": order["status"], "order_id": order_id}
         if order["mode"] == "live" and order["approval_required"] and not approved:
             return {"status": "approval_required", "order_id": order_id}
+        market_row = _market_status_for_symbol(str(order["symbol"]), resolved_config)
+        if market_row is not None and not bool(market_row.get("is_open")):
+            error_text = f"Exchange closed for {order['symbol']}: {market_row.get('status_reason')}"
+            payload = {
+                "symbol": order["symbol"],
+                "exchange_code": market_row.get("code"),
+                "market": market_row.get("market"),
+                "status_reason": market_row.get("status_reason"),
+                "next_open": market_row.get("next_open"),
+                "next_open_at_utc": market_row.get("next_open_at_utc"),
+            }
+            resolved_connection.execute(
+                """
+                UPDATE execution_orders
+                SET status = ?, error_text = ?, execution_result_json = ?
+                WHERE id = ?
+                """,
+                (
+                    "waiting_for_market_open",
+                    error_text,
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    order_id,
+                ),
+            )
+            resolved_connection.commit()
+            return {
+                "status": "waiting_for_market_open",
+                "order_id": order_id,
+                "error": error_text,
+                "market": payload,
+            }
         if order["mode"] == "live" and resolved_config["app"]["dry_run"]:
             resolved_connection.execute(
                 """
@@ -1151,6 +1246,36 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 return {"status": "execution_failed", "order_id": order_id, "error": error_text}
             try:
                 session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+                if order["action"] == "BUY" and _cash_gate_enabled(resolved_config):
+                    cash_gate = _evaluate_live_buy_cash_gate(order, resolved_config, session)
+                    if not cash_gate["allowed"]:
+                        error_text = (
+                            f"Waiting for settled cash before buying {order['symbol']}. "
+                            f"Required {cash_gate['required_dkk']:.2f} DKK, "
+                            f"cash available {cash_gate['cash_available_dkk']:.2f} DKK, "
+                            f"funds for settlement {cash_gate['funds_for_settlement_dkk']:.2f} DKK, "
+                            f"transactions not booked {cash_gate['transactions_not_booked_dkk']:.2f} DKK."
+                        )
+                        resolved_connection.execute(
+                            """
+                            UPDATE execution_orders
+                            SET status = ?, error_text = ?, execution_result_json = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "waiting_for_cash_settlement",
+                                error_text,
+                                json.dumps({"cash_gate": cash_gate}, ensure_ascii=False, sort_keys=True),
+                                order_id,
+                            ),
+                        )
+                        resolved_connection.commit()
+                        return {
+                            "status": "waiting_for_cash_settlement",
+                            "order_id": order_id,
+                            "error": error_text,
+                            "cash_gate": cash_gate,
+                        }
                 payload = build_market_order_payload(
                     symbol=order["symbol"],
                     action=order["action"],
@@ -1460,18 +1585,44 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
         report = fetch_latest_decision_report(resolved_connection)
-        if not report or report["status"] != "completed":
-            return {"status": "no_completed_report"}
-        orders = _create_or_fetch_orders(resolved_connection, resolved_config, report)
+        orders = []
+        if report and report["status"] == "completed":
+            orders = _create_or_fetch_orders(resolved_connection, resolved_config, report)
         executed = []
-        if resolved_config["execution"]["mode"] == "simulation" and resolved_config["execution"]["auto_execute_simulation"]:
-            for order in orders:
-                if order["status"] == "pending_execution":
-                    executed.append(execute_order(order["id"], config=resolved_config, connection=resolved_connection))
+        executable_statuses = {"pending_execution", "waiting_for_market_open", "waiting_for_cash_settlement"}
+        auto_execute_queue = (
+            (
+                resolved_config["execution"]["mode"] == "simulation"
+                and resolved_config["execution"]["auto_execute_simulation"]
+            )
+            or _should_auto_submit_live_orders(resolved_config)
+        )
+        if auto_execute_queue:
+            if _should_auto_submit_live_orders(resolved_config):
+                executable_statuses.add("pending_approval")
+            queue_rows = resolved_connection.execute(
+                f"""
+                SELECT *
+                FROM execution_orders
+                WHERE mode = ?
+                  AND status IN ({",".join("?" for _ in executable_statuses)})
+                ORDER BY id ASC
+                """,
+                (str(resolved_config["execution"]["mode"]), *tuple(executable_statuses)),
+            ).fetchall()
+            for order in queue_rows:
+                executed.append(
+                    execute_order(
+                        int(order["id"]),
+                        config=resolved_config,
+                        connection=resolved_connection,
+                        approved=_should_auto_submit_live_orders(resolved_config),
+                    )
+                )
         broker_sync = sync_broker_order_statuses(config=resolved_config, connection=resolved_connection)
         alert_result = _dispatch_execution_alerts(resolved_connection, resolved_config)
         return {
-            "status": "ok",
+            "status": "ok" if report and report["status"] == "completed" else "processed_existing_queue",
             "orders": orders,
             "executed": executed,
             "broker_sync": broker_sync,

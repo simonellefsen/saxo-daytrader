@@ -14,6 +14,7 @@ from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_r
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
 from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
+from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
 
@@ -127,6 +128,21 @@ def run_scheduler_cycle(
             scheduler_pid=os.getpid(),
         )
         calendar_refresh = refresh_market_calendars(resolved_config)
+        session_keepalive = None
+        if (
+            str(resolved_config["execution"].get("mode")) == "live"
+            and str(resolved_config["execution"].get("adapter")) == "saxo"
+        ):
+            try:
+                session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+                session_keepalive = {
+                    "status": "ok",
+                    "access_token_expires_at": session.get("access_token_expires_at"),
+                    "refresh_token_expires_at": session.get("refresh_token_expires_at"),
+                    "last_refreshed_at": session.get("last_refreshed_at"),
+                }
+            except SaxoSessionError as exc:
+                session_keepalive = {"status": "error", "error": str(exc)}
         market_status = get_market_status(resolved_config)
         analysis_summary = summarize_analysis_window(market_status)
         should_generate = force_decision or should_auto_run_decision_report(
@@ -162,6 +178,7 @@ def run_scheduler_cycle(
             "status": "ok",
             "timestamp": datetime.now(UTC).isoformat(timespec="seconds"),
             "calendar_refresh": calendar_refresh,
+            "saxo_session_keepalive": session_keepalive,
             "analysis_window_active": analysis_summary["analysis_window_active"],
             "active_markets": analysis_summary["active_markets"],
             "generated_decision": decision_result is not None,

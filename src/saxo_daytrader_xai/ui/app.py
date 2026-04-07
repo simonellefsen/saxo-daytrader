@@ -288,11 +288,23 @@ col3.metric("Cash", _format_dkk(summary["cash_balance_dkk"]))
 col4.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
 col5.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
 
-tab_portfolio, tab_performance, tab_watchlist, tab_news, tab_market, tab_decision, tab_execution, tab_notifications = st.tabs(
-    ["Portfolio", "Performance", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
+tab_labels = ["Portfolio", "Performance", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
+query_tab = st.query_params.get("tab", "Portfolio")
+if isinstance(query_tab, list):
+    query_tab = query_tab[0] if query_tab else "Portfolio"
+if "active_tab" not in st.session_state or st.session_state["active_tab"] not in tab_labels:
+    st.session_state["active_tab"] = query_tab if query_tab in tab_labels else "Portfolio"
+active_tab = st.segmented_control(
+    "View",
+    tab_labels,
+    key="active_tab",
+    selection_mode="single",
+    width="stretch",
 )
+if active_tab and st.query_params.get("tab") != active_tab:
+    st.query_params["tab"] = active_tab
 
-with tab_portfolio:
+if active_tab == "Portfolio":
     st.subheader("Portfolio Snapshot")
     cash_col1, cash_col2, cash_col3, cash_col4 = st.columns(4)
     daily_delta = summary["total_daily_pnl_dkk"]
@@ -421,7 +433,7 @@ with tab_portfolio:
     else:
         st.caption("No trades recorded yet. Trade execution arrives in later phases.")
 
-with tab_performance:
+if active_tab == "Performance":
     st.subheader("Portfolio Value History")
     goal_periods = goal_tracking["periods"]
     goal_col1, goal_col2, goal_col3, goal_col4, goal_col5 = st.columns(5)
@@ -572,7 +584,7 @@ with tab_performance:
     else:
         st.caption("No portfolio value history has been recorded yet. The first point is created on CSV import and then refreshed by the 5-minute price monitor.")
 
-with tab_watchlist:
+if active_tab == "Watchlist":
     st.subheader("Daily Refreshed Watchlists")
     st.caption(f"Generated at {watchlists['generated_at']}")
 
@@ -614,7 +626,7 @@ with tab_watchlist:
         hide_index=True,
     )
 
-with tab_news:
+if active_tab == "News":
     st.subheader("News and Events")
     st.caption(f"Generated at {market_intelligence['generated_at']}")
 
@@ -639,7 +651,7 @@ with tab_news:
     else:
         st.caption("No macro feeds were available.")
 
-with tab_market:
+if active_tab == "Market Status":
     st.subheader("Exchange Status")
     scheduler_health = assess_scheduler_worker_health(
         scheduler_status,
@@ -742,7 +754,7 @@ with tab_market:
         "and marks a market as analysis-active when the current local exchange time is between 60 and 90 minutes after that market's actual session open."
     )
 
-with tab_decision:
+if active_tab == "Decision Report":
     st.subheader("xAI Decision Report")
     button_col1, button_col2, button_col3 = st.columns(3)
     if button_col1.button("Run Decision Now", type="primary"):
@@ -831,7 +843,7 @@ with tab_decision:
     else:
         st.caption("No decision report has been generated yet.")
 
-with tab_execution:
+if active_tab == "Execution":
     st.subheader("Execution Queue")
     execution_orders = fetch_execution_orders(connection, limit=100)
     execution_fills = fetch_execution_fills(connection, limit=100)
@@ -852,7 +864,10 @@ with tab_execution:
         f"max_daily_orders={config['execution']['max_daily_orders']}"
     )
     if config["execution"]["mode"] == "live":
-        st.info("Approved live orders are submitted to Saxo and stored as broker submissions. They are not booked into the local trade ledger as executed fills yet.")
+        if bool(config["execution"].get("require_approval_live", True)):
+            st.info("Approved live orders are submitted to Saxo and stored as broker submissions. They are not booked into the local trade ledger as executed fills yet.")
+        else:
+            st.info("Live orders are submitted to Saxo automatically without approval when the exchange is open. If the exchange is closed, orders wait in the queue until the next open.")
 
     action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     if action_col1.button("Run Queue Processor"):
@@ -1045,7 +1060,7 @@ with tab_execution:
     else:
         st.caption("No broker lifecycle events have been synchronized yet.")
 
-with tab_notifications:
+if active_tab == "Notifications":
     st.subheader("Notifications")
     notif_col1, notif_col2, notif_col3, notif_col4, notif_col5 = st.columns(5)
     notif_col1.metric("Daily Enabled", "Yes" if config["notifications"]["daily_summary_enabled"] else "No")

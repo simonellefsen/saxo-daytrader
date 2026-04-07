@@ -390,6 +390,16 @@ def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[s
     return _raise_for_saxo_response(response, action="Order placement")
 
 
+def get_balance_snapshot(config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.get(
+        f"{base_url}/port/v1/balances/me",
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    return _raise_for_saxo_response(response, action="Balance snapshot")
+
+
 def change_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
     response = requests.patch(

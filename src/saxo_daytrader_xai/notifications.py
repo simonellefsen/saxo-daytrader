@@ -652,7 +652,7 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
             """
             SELECT *
             FROM execution_orders
-            WHERE status IN ('pending_approval', 'blocked_by_dry_run', 'invalid_quantity')
+            WHERE status IN ('pending_approval', 'blocked_by_dry_run', 'invalid_quantity', 'waiting_for_market_open', 'waiting_for_cash_settlement')
             ORDER BY id DESC
             LIMIT ?
             """,
