@@ -253,10 +253,13 @@ ytd_summary_preview = build_summary(connection, config, summary_kind="ytd")
 
 if should_auto_run_decision_report(connection, config, analysis_summary["analysis_window_active"]):
     with st.spinner("Generating xAI decision report..."):
-        generated_report = generate_decision_report(config=config, connection=connection)
-        queue_and_maybe_execute_latest_report(config=config, connection=connection)
-        latest_decision_report = fetch_latest_decision_report(connection)
-        st.toast(f"Decision report generated with status: {generated_report['status']}")
+        try:
+            generated_report = generate_decision_report(config=config, connection=connection)
+            queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            latest_decision_report = fetch_latest_decision_report(connection)
+            st.toast(f"Decision report generated with status: {generated_report['status']}")
+        except Exception as exc:
+            st.error(f"Automatic decision cycle failed: {exc}")
 
 st.title("saxo-daytrader-xai")
 st.caption("Phase 36 dashboard with autonomous simulation support, live broker workflow, quote-aware daily P/L tracking, portfolio-value history, scheduler controls, route-aware notifications, scheduler cycle history, stale-worker detection, automatic history retention, and invalid simulation trade repair.")
@@ -759,32 +762,44 @@ if active_tab == "Decision Report":
     button_col1, button_col2, button_col3 = st.columns(3)
     if button_col1.button("Run Decision Now", type="primary"):
         with st.spinner("Calling xAI decision engine..."):
-            result = generate_decision_report(config=config, connection=connection)
-            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
-            latest_decision_report = fetch_latest_decision_report(connection)
-        st.success(
-            f"Decision report status: {result['status']} | "
-            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
-        )
-        st.rerun()
+            try:
+                result = generate_decision_report(config=config, connection=connection)
+                queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
+                latest_decision_report = fetch_latest_decision_report(connection)
+            except Exception as exc:
+                st.error(f"Decision report run failed: {exc}")
+            else:
+                st.success(
+                    f"Decision report status: {result['status']} | "
+                    f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+                )
+                st.rerun()
     if button_col2.button("Run Mock Decision"):
         with st.spinner("Generating mock decision report..."):
-            result = generate_decision_report(config=config, connection=connection, force_mock=True)
-            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
-            latest_decision_report = fetch_latest_decision_report(connection)
-        st.info(
-            f"Mock decision report status: {result['status']} | "
-            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
-        )
-        st.rerun()
+            try:
+                result = generate_decision_report(config=config, connection=connection, force_mock=True)
+                queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
+                latest_decision_report = fetch_latest_decision_report(connection)
+            except Exception as exc:
+                st.error(f"Mock decision run failed: {exc}")
+            else:
+                st.info(
+                    f"Mock decision report status: {result['status']} | "
+                    f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+                )
+                st.rerun()
     if button_col3.button("Queue Latest Suggestions"):
         with st.spinner("Queuing latest report suggestions..."):
-            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
-        st.info(
-            f"Queue result: {queue_result['status']} | "
-            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
-        )
-        st.rerun()
+            try:
+                queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            except Exception as exc:
+                st.error(f"Queueing latest suggestions failed: {exc}")
+            else:
+                st.info(
+                    f"Queue result: {queue_result['status']} | "
+                    f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+                )
+                st.rerun()
 
     if latest_decision_report:
         report = latest_decision_report["report_json"] or {}
@@ -872,12 +887,16 @@ if active_tab == "Execution":
     action_col1, action_col2, action_col3, action_col4 = st.columns(4)
     if action_col1.button("Run Queue Processor"):
         with st.spinner("Processing queued execution orders..."):
-            queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
-        st.success(
-            f"Queue processor status: {queue_result['status']} | "
-            f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
-        )
-        st.rerun()
+            try:
+                queue_result = queue_and_maybe_execute_latest_report(config=config, connection=connection)
+            except Exception as exc:
+                st.error(f"Queue processor failed: {exc}")
+            else:
+                st.success(
+                    f"Queue processor status: {queue_result['status']} | "
+                    f"trade alerts sent: {_sent_alert_count(queue_result.get('alerts'))}"
+                )
+                st.rerun()
 
     if action_col2.button("Export Audit Bundle"):
         export_dir = ROOT / "exports" / datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -886,9 +905,13 @@ if active_tab == "Execution":
 
     if action_col3.button("Sync Broker Status"):
         with st.spinner("Synchronizing Saxo broker order statuses..."):
-            sync_result = sync_broker_order_statuses(config=config, connection=connection)
-        st.success(f"Broker sync updated {sync_result['updated']} orders")
-        st.rerun()
+            try:
+                sync_result = sync_broker_order_statuses(config=config, connection=connection)
+            except Exception as exc:
+                st.error(f"Broker sync failed: {exc}")
+            else:
+                st.success(f"Broker sync updated {sync_result['updated']} orders")
+                st.rerun()
     if action_col4.button("Repair Invalid Simulation Trades"):
         with st.spinner("Repairing invalid simulation trades..."):
             repair_result = repair_invalid_simulation_trades(config=config, connection=connection)

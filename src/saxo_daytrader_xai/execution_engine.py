@@ -114,14 +114,41 @@ def _to_dkk_amount(amount: float | None, currency: str | None, fx_snapshot: dict
     return float(amount) * fx_rate_to_dkk(currency or "DKK", fx_snapshot)
 
 
+def _first_numeric(payload: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = payload.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _evaluate_live_buy_cash_gate(order: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     balance = get_balance_snapshot(config, session)
     fx_snapshot = fetch_ecb_fx_rates()
     balance_currency = str(balance.get("Currency") or "DKK")
     required_dkk = float(order.get("estimated_value_dkk") or 0.0)
-    cash_available_dkk = _to_dkk_amount(balance.get("CashAvailableForTrading"), balance_currency, fx_snapshot)
-    funds_for_settlement_dkk = _to_dkk_amount(balance.get("FundsAvailableForSettlement"), balance_currency, fx_snapshot)
-    transactions_not_booked_dkk = _to_dkk_amount(balance.get("TransactionsNotBooked"), balance_currency, fx_snapshot)
+    cash_available = _first_numeric(
+        balance,
+        "CashAvailableForTrading",
+        "CashBalance",
+        "CollateralAvailable",
+        "MarginAvailableForTrading",
+    )
+    funds_for_settlement = _first_numeric(
+        balance,
+        "FundsAvailableForSettlement",
+        "CashAvailableForTrading",
+        "CashBalance",
+        "CollateralAvailable",
+    )
+    transactions_not_booked = _first_numeric(balance, "TransactionsNotBooked", "SettlementValue") or 0.0
+    cash_available_dkk = _to_dkk_amount(cash_available, balance_currency, fx_snapshot)
+    funds_for_settlement_dkk = _to_dkk_amount(funds_for_settlement, balance_currency, fx_snapshot)
+    transactions_not_booked_dkk = _to_dkk_amount(transactions_not_booked, balance_currency, fx_snapshot)
 
     has_cash = cash_available_dkk >= required_dkk
     settlement_ready = funds_for_settlement_dkk >= required_dkk
@@ -814,6 +841,109 @@ def _sync_incremental_live_fill(
     }
 
 
+def _record_unreconciled_broker_fill(
+    connection,
+    *,
+    order: dict[str, Any],
+    broker_order_id: str,
+    activity_status: str,
+    activity_substatus: str,
+    broker_quantity: float | None,
+    broker_price: float | None,
+    payload: dict[str, Any],
+    error_text: str,
+) -> int | None:
+    event_payload = {
+        **payload,
+        "reconciliation_error": error_text,
+    }
+    event_id = _record_execution_event(
+        connection,
+        order=order,
+        broker_order_id=broker_order_id,
+        event_type="broker_fill_unreconciled",
+        broker_status=activity_status,
+        broker_substatus=activity_substatus,
+        broker_quantity=broker_quantity,
+        broker_price_local=broker_price,
+        payload=event_payload,
+    )
+    connection.execute(
+        """
+        UPDATE execution_orders
+        SET status = ?, error_text = ?, execution_result_json = ?
+        WHERE id = ?
+        """,
+        (
+            "broker_fill_unreconciled",
+            error_text,
+            json.dumps(event_payload, ensure_ascii=False, sort_keys=True),
+            order["id"],
+        ),
+    )
+    append_audit_log(
+        connection,
+        "execution_order_fill_unreconciled",
+        {
+            "order_id": order["id"],
+            "broker_order_id": broker_order_id,
+            "error": error_text,
+            "event_id": event_id,
+        },
+    )
+    return event_id
+
+
+def _record_broker_sync_error(
+    connection,
+    *,
+    order: dict[str, Any],
+    broker_order_id: str | None,
+    event_type: str,
+    payload: dict[str, Any],
+    error_text: str,
+) -> int | None:
+    event_payload = {
+        **payload,
+        "sync_error": error_text,
+    }
+    event_id = _record_execution_event(
+        connection,
+        order=order,
+        broker_order_id=broker_order_id,
+        event_type=event_type,
+        broker_status=str(order.get("status") or ""),
+        broker_substatus="error",
+        broker_quantity=_coerce_float(order.get("quantity")),
+        broker_price_local=_coerce_float(order.get("price_local")),
+        payload=event_payload,
+    )
+    connection.execute(
+        """
+        UPDATE execution_orders
+        SET error_text = ?, execution_result_json = ?
+        WHERE id = ?
+        """,
+        (
+            error_text,
+            json.dumps(event_payload, ensure_ascii=False, sort_keys=True),
+            order["id"],
+        ),
+    )
+    append_audit_log(
+        connection,
+        "execution_order_broker_sync_error",
+        {
+            "order_id": order["id"],
+            "broker_order_id": broker_order_id,
+            "event_type": event_type,
+            "event_id": event_id,
+            "error": error_text,
+        },
+    )
+    return event_id
+
+
 def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connection=None, limit: int = 25) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
@@ -830,7 +960,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                   'broker_replace_requested',
                   'broker_cancel_requested'
               )
-            ORDER BY id DESC
+            ORDER BY id ASC
             LIMIT ?
             """,
             (limit,),
@@ -851,61 +981,247 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                 continue
 
             try:
-                open_order = get_open_order(str(broker_order_id), resolved_config, session)
-                broker_status = str(open_order.get("Status") or "Working")
-                broker_quantity = _extract_broker_quantity(open_order)
-                broker_price = _extract_broker_price(open_order)
-                quantity_changed = broker_quantity is not None and abs(broker_quantity - float(order["quantity"])) > 1e-9
-                price_changed = (
-                    broker_price is not None
-                    and order.get("price_local") is not None
-                    and abs(broker_price - float(order["price_local"])) > 1e-9
-                )
-                if broker_status.lower() in {"working", "placed"}:
-                    new_status = (
-                        "broker_amended"
-                        if quantity_changed or price_changed or order["status"] == "broker_amended"
-                        else "broker_working"
+                try:
+                    open_order = get_open_order(str(broker_order_id), resolved_config, session)
+                    broker_status = str(open_order.get("Status") or "Working")
+                    broker_quantity = _extract_broker_quantity(open_order)
+                    broker_price = _extract_broker_price(open_order)
+                    quantity_changed = broker_quantity is not None and abs(broker_quantity - float(order["quantity"])) > 1e-9
+                    price_changed = (
+                        broker_price is not None
+                        and order.get("price_local") is not None
+                        and abs(broker_price - float(order["price_local"])) > 1e-9
                     )
-                elif broker_status.lower() == "fill":
-                    new_status = "broker_partially_filled"
-                else:
-                    new_status = order["status"]
+                    if broker_status.lower() in {"working", "placed"}:
+                        new_status = (
+                            "broker_amended"
+                            if quantity_changed or price_changed or order["status"] == "broker_amended"
+                            else "broker_working"
+                        )
+                    elif broker_status.lower() == "fill":
+                        new_status = "broker_partially_filled"
+                    else:
+                        new_status = order["status"]
+                    payload = {
+                        **execution_result,
+                        "open_order": open_order,
+                        "broker_quantity": broker_quantity,
+                        "broker_price_local": broker_price,
+                        "quantity_changed": quantity_changed,
+                        "price_changed": price_changed,
+                        "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    }
+                    event_id = _record_execution_event(
+                        resolved_connection,
+                        order=order,
+                        broker_order_id=str(broker_order_id),
+                        event_type=new_status,
+                        broker_status=broker_status,
+                        broker_substatus=str(open_order.get("SubStatus") or ""),
+                        broker_quantity=broker_quantity,
+                        broker_price_local=broker_price,
+                        payload=payload,
+                    )
+                    resolved_connection.execute(
+                        """
+                        UPDATE execution_orders
+                        SET status = ?, quantity = COALESCE(?, quantity), price_local = COALESCE(?, price_local), execution_result_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            new_status,
+                            broker_quantity,
+                            broker_price,
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                            order["id"],
+                        ),
+                    )
+                    if new_status == "broker_amended":
+                        append_audit_log(
+                            resolved_connection,
+                            "execution_order_amended",
+                            {
+                                "order_id": order["id"],
+                                "broker_order_id": broker_order_id,
+                                "broker_quantity": broker_quantity,
+                                "broker_price_local": broker_price,
+                                "event_id": event_id,
+                            },
+                        )
+                    updates.append({"order_id": order["id"], "status": new_status})
+                    continue
+                except SaxoOrderNotFoundError:
+                    activity = get_order_activity_last(str(broker_order_id), resolved_config, session)
+
+                activity_status = str(activity.get("Status") or "")
+                activity_substatus = str(activity.get("SubStatus") or "")
+                broker_quantity = _extract_broker_quantity(activity)
+                broker_price = _extract_broker_price(activity) or _coerce_float(activity.get("AveragePrice"))
                 payload = {
                     **execution_result,
-                    "open_order": open_order,
+                    "last_activity": activity,
                     "broker_quantity": broker_quantity,
                     "broker_price_local": broker_price,
-                    "quantity_changed": quantity_changed,
-                    "price_changed": price_changed,
                     "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 }
-                event_id = _record_execution_event(
-                    resolved_connection,
-                    order=order,
-                    broker_order_id=str(broker_order_id),
-                    event_type=new_status,
-                    broker_status=broker_status,
-                    broker_substatus=str(open_order.get("SubStatus") or ""),
-                    broker_quantity=broker_quantity,
-                    broker_price_local=broker_price,
-                    payload=payload,
-                )
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET status = ?, quantity = COALESCE(?, quantity), price_local = COALESCE(?, price_local), execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        new_status,
-                        broker_quantity,
-                        broker_price,
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                        order["id"],
-                    ),
-                )
-                if new_status == "broker_amended":
+
+                if activity_status == "FinalFill" and activity_substatus == "Confirmed":
+                    try:
+                        result = _sync_incremental_live_fill(
+                            resolved_connection,
+                            resolved_config,
+                            order,
+                            activity,
+                            broker_order_id=str(broker_order_id),
+                            fill_status="FinalFill",
+                        )
+                        event_id = _record_execution_event(
+                            resolved_connection,
+                            order=order,
+                            broker_order_id=str(broker_order_id),
+                            event_type="broker_final_fill",
+                            broker_status=activity_status,
+                            broker_substatus=activity_substatus,
+                            broker_quantity=broker_quantity,
+                            broker_price_local=broker_price,
+                            payload=payload,
+                        )
+                        resolved_connection.execute(
+                            """
+                            UPDATE execution_orders
+                            SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
+                            WHERE id = ?
+                            """,
+                            ("executed", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                        )
+                        append_audit_log(
+                            resolved_connection,
+                            "execution_order_fill_synced",
+                            {
+                                "order_id": order["id"],
+                                "ledger_id": result["ledger_id"],
+                                "broker_order_id": broker_order_id,
+                                "delta_quantity": result["delta_quantity"],
+                                "cumulative_quantity": result["cumulative_quantity"],
+                                "event_id": event_id,
+                            },
+                        )
+                        updates.append({"order_id": order["id"], "status": "executed", "ledger_id": result["ledger_id"]})
+                    except ValueError as exc:
+                        event_id = _record_unreconciled_broker_fill(
+                            resolved_connection,
+                            order=order,
+                            broker_order_id=str(broker_order_id),
+                            activity_status=activity_status,
+                            activity_substatus=activity_substatus,
+                            broker_quantity=broker_quantity,
+                            broker_price=broker_price,
+                            payload=payload,
+                            error_text=str(exc),
+                        )
+                        updates.append(
+                            {
+                                "order_id": order["id"],
+                                "status": "broker_fill_unreconciled",
+                                "event_id": event_id,
+                                "error": str(exc),
+                            }
+                        )
+                elif activity_status == "Fill" and activity_substatus == "Confirmed":
+                    try:
+                        result = _sync_incremental_live_fill(
+                            resolved_connection,
+                            resolved_config,
+                            order,
+                            activity,
+                            broker_order_id=str(broker_order_id),
+                            fill_status="Fill",
+                        )
+                        event_id = _record_execution_event(
+                            resolved_connection,
+                            order=order,
+                            broker_order_id=str(broker_order_id),
+                            event_type="broker_fill",
+                            broker_status=activity_status,
+                            broker_substatus=activity_substatus,
+                            broker_quantity=broker_quantity,
+                            broker_price_local=broker_price,
+                            payload=payload,
+                        )
+                        resolved_connection.execute(
+                            """
+                            UPDATE execution_orders
+                            SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
+                            WHERE id = ?
+                            """,
+                            ("broker_partially_filled", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                        )
+                        append_audit_log(
+                            resolved_connection,
+                            "execution_order_partial_fill_synced",
+                            {
+                                "order_id": order["id"],
+                                "ledger_id": result["ledger_id"],
+                                "broker_order_id": broker_order_id,
+                                "delta_quantity": result["delta_quantity"],
+                                "cumulative_quantity": result["cumulative_quantity"],
+                                "event_id": event_id,
+                            },
+                        )
+                        updates.append(
+                            {
+                                "order_id": order["id"],
+                                "status": "broker_partially_filled",
+                                "ledger_id": result["ledger_id"],
+                                "delta_quantity": result["delta_quantity"],
+                            }
+                        )
+                    except ValueError as exc:
+                        event_id = _record_unreconciled_broker_fill(
+                            resolved_connection,
+                            order=order,
+                            broker_order_id=str(broker_order_id),
+                            activity_status=activity_status,
+                            activity_substatus=activity_substatus,
+                            broker_quantity=broker_quantity,
+                            broker_price=broker_price,
+                            payload=payload,
+                            error_text=str(exc),
+                        )
+                        updates.append(
+                            {
+                                "order_id": order["id"],
+                                "status": "broker_fill_unreconciled",
+                                "event_id": event_id,
+                                "error": str(exc),
+                            }
+                        )
+                elif activity_status in {"Changed", "Replaced", "Amended"} and activity_substatus == "Confirmed":
+                    event_id = _record_execution_event(
+                        resolved_connection,
+                        order=order,
+                        broker_order_id=str(broker_order_id),
+                        event_type="broker_amended",
+                        broker_status=activity_status,
+                        broker_substatus=activity_substatus,
+                        broker_quantity=broker_quantity,
+                        broker_price_local=broker_price,
+                        payload=payload,
+                    )
+                    resolved_connection.execute(
+                        """
+                        UPDATE execution_orders
+                        SET status = ?, quantity = COALESCE(?, quantity), price_local = COALESCE(?, price_local), execution_result_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            "broker_amended",
+                            broker_quantity,
+                            broker_price,
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                            order["id"],
+                        ),
+                    )
                     append_audit_log(
                         resolved_connection,
                         "execution_order_amended",
@@ -917,227 +1233,105 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                             "event_id": event_id,
                         },
                     )
-                updates.append({"order_id": order["id"], "status": new_status})
-                continue
-            except SaxoOrderNotFoundError:
-                activity = get_order_activity_last(str(broker_order_id), resolved_config, session)
-
-            activity_status = str(activity.get("Status") or "")
-            activity_substatus = str(activity.get("SubStatus") or "")
-            broker_quantity = _extract_broker_quantity(activity)
-            broker_price = _extract_broker_price(activity) or _coerce_float(activity.get("AveragePrice"))
-            payload = {
-                **execution_result,
-                "last_activity": activity,
-                "broker_quantity": broker_quantity,
-                "broker_price_local": broker_price,
-                "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            }
-
-            if activity_status == "FinalFill" and activity_substatus == "Confirmed":
-                result = _sync_incremental_live_fill(
-                    resolved_connection,
-                    resolved_config,
-                    order,
-                    activity,
-                    broker_order_id=str(broker_order_id),
-                    fill_status="FinalFill",
-                )
-                event_id = _record_execution_event(
+                    updates.append({"order_id": order["id"], "status": "broker_amended"})
+                elif activity_status in {"Cancelled", "Expired"} and activity_substatus == "Confirmed":
+                    new_status = "broker_cancelled" if activity_status == "Cancelled" else "broker_expired"
+                    event_id = _record_execution_event(
+                        resolved_connection,
+                        order=order,
+                        broker_order_id=str(broker_order_id),
+                        event_type=new_status,
+                        broker_status=activity_status,
+                        broker_substatus=activity_substatus,
+                        broker_quantity=broker_quantity,
+                        broker_price_local=broker_price,
+                        payload=payload,
+                    )
+                    resolved_connection.execute(
+                        """
+                        UPDATE execution_orders
+                        SET status = ?, execution_result_json = ?
+                        WHERE id = ?
+                        """,
+                        (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                    )
+                    append_audit_log(
+                        resolved_connection,
+                        "execution_order_closed_without_fill",
+                        {
+                            "order_id": order["id"],
+                            "broker_order_id": broker_order_id,
+                            "status": new_status,
+                            "event_id": event_id,
+                        },
+                    )
+                    updates.append({"order_id": order["id"], "status": new_status})
+                elif activity_status in {"Rejected", "Failed"}:
+                    event_id = _record_execution_event(
+                        resolved_connection,
+                        order=order,
+                        broker_order_id=str(broker_order_id),
+                        event_type="broker_rejected",
+                        broker_status=activity_status,
+                        broker_substatus=activity_substatus,
+                        broker_quantity=broker_quantity,
+                        broker_price_local=broker_price,
+                        payload=payload,
+                    )
+                    resolved_connection.execute(
+                        """
+                        UPDATE execution_orders
+                        SET status = ?, error_text = ?, execution_result_json = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            "broker_rejected",
+                            json.dumps(activity, ensure_ascii=False, sort_keys=True),
+                            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                            order["id"],
+                        ),
+                    )
+                    append_audit_log(
+                        resolved_connection,
+                        "execution_order_rejected",
+                        {
+                            "order_id": order["id"],
+                            "broker_order_id": broker_order_id,
+                            "event_id": event_id,
+                        },
+                    )
+                    updates.append({"order_id": order["id"], "status": "broker_rejected"})
+                else:
+                    resolved_connection.execute(
+                        """
+                        UPDATE execution_orders
+                        SET execution_result_json = ?
+                        WHERE id = ?
+                        """,
+                        (json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
+                    )
+                    updates.append({"order_id": order["id"], "status": order["status"]})
+            except Exception as exc:
+                fallback_payload = {
+                    **execution_result,
+                    "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                }
+                event_id = _record_broker_sync_error(
                     resolved_connection,
                     order=order,
                     broker_order_id=str(broker_order_id),
-                    event_type="broker_final_fill",
-                    broker_status=activity_status,
-                    broker_substatus=activity_substatus,
-                    broker_quantity=broker_quantity,
-                    broker_price_local=broker_price,
-                    payload=payload,
-                )
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    ("executed", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
-                )
-                append_audit_log(
-                    resolved_connection,
-                    "execution_order_fill_synced",
-                    {
-                        "order_id": order["id"],
-                        "ledger_id": result["ledger_id"],
-                        "broker_order_id": broker_order_id,
-                        "delta_quantity": result["delta_quantity"],
-                        "cumulative_quantity": result["cumulative_quantity"],
-                        "event_id": event_id,
-                    },
-                )
-                updates.append({"order_id": order["id"], "status": "executed", "ledger_id": result["ledger_id"]})
-            elif activity_status == "Fill" and activity_substatus == "Confirmed":
-                result = _sync_incremental_live_fill(
-                    resolved_connection,
-                    resolved_config,
-                    order,
-                    activity,
-                    broker_order_id=str(broker_order_id),
-                    fill_status="Fill",
-                )
-                event_id = _record_execution_event(
-                    resolved_connection,
-                    order=order,
-                    broker_order_id=str(broker_order_id),
-                    event_type="broker_fill",
-                    broker_status=activity_status,
-                    broker_substatus=activity_substatus,
-                    broker_quantity=broker_quantity,
-                    broker_price_local=broker_price,
-                    payload=payload,
-                )
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    ("broker_partially_filled", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
-                )
-                append_audit_log(
-                    resolved_connection,
-                    "execution_order_partial_fill_synced",
-                    {
-                        "order_id": order["id"],
-                        "ledger_id": result["ledger_id"],
-                        "broker_order_id": broker_order_id,
-                        "delta_quantity": result["delta_quantity"],
-                        "cumulative_quantity": result["cumulative_quantity"],
-                        "event_id": event_id,
-                    },
+                    event_type="broker_sync_failed",
+                    payload=fallback_payload,
+                    error_text=str(exc),
                 )
                 updates.append(
                     {
                         "order_id": order["id"],
-                        "status": "broker_partially_filled",
-                        "ledger_id": result["ledger_id"],
-                        "delta_quantity": result["delta_quantity"],
+                        "status": order["status"],
+                        "event_id": event_id,
+                        "error": str(exc),
                     }
                 )
-            elif activity_status in {"Changed", "Replaced", "Amended"} and activity_substatus == "Confirmed":
-                event_id = _record_execution_event(
-                    resolved_connection,
-                    order=order,
-                    broker_order_id=str(broker_order_id),
-                    event_type="broker_amended",
-                    broker_status=activity_status,
-                    broker_substatus=activity_substatus,
-                    broker_quantity=broker_quantity,
-                    broker_price_local=broker_price,
-                    payload=payload,
-                )
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET status = ?, quantity = COALESCE(?, quantity), price_local = COALESCE(?, price_local), execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        "broker_amended",
-                        broker_quantity,
-                        broker_price,
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                        order["id"],
-                    ),
-                )
-                append_audit_log(
-                    resolved_connection,
-                    "execution_order_amended",
-                    {
-                        "order_id": order["id"],
-                        "broker_order_id": broker_order_id,
-                        "broker_quantity": broker_quantity,
-                        "broker_price_local": broker_price,
-                        "event_id": event_id,
-                    },
-                )
-                updates.append({"order_id": order["id"], "status": "broker_amended"})
-            elif activity_status in {"Cancelled", "Expired"} and activity_substatus == "Confirmed":
-                new_status = "broker_cancelled" if activity_status == "Cancelled" else "broker_expired"
-                event_id = _record_execution_event(
-                    resolved_connection,
-                    order=order,
-                    broker_order_id=str(broker_order_id),
-                    event_type=new_status,
-                    broker_status=activity_status,
-                    broker_substatus=activity_substatus,
-                    broker_quantity=broker_quantity,
-                    broker_price_local=broker_price,
-                    payload=payload,
-                )
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET status = ?, execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    (new_status, json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
-                )
-                append_audit_log(
-                    resolved_connection,
-                    "execution_order_closed_without_fill",
-                    {
-                        "order_id": order["id"],
-                        "broker_order_id": broker_order_id,
-                        "status": new_status,
-                        "event_id": event_id,
-                    },
-                )
-                updates.append({"order_id": order["id"], "status": new_status})
-            elif activity_status in {"Rejected", "Failed"}:
-                event_id = _record_execution_event(
-                    resolved_connection,
-                    order=order,
-                    broker_order_id=str(broker_order_id),
-                    event_type="broker_rejected",
-                    broker_status=activity_status,
-                    broker_substatus=activity_substatus,
-                    broker_quantity=broker_quantity,
-                    broker_price_local=broker_price,
-                    payload=payload,
-                )
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET status = ?, error_text = ?, execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        "broker_rejected",
-                        json.dumps(activity, ensure_ascii=False, sort_keys=True),
-                        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-                        order["id"],
-                    ),
-                )
-                append_audit_log(
-                    resolved_connection,
-                    "execution_order_rejected",
-                    {
-                        "order_id": order["id"],
-                        "broker_order_id": broker_order_id,
-                        "event_id": event_id,
-                    },
-                )
-                updates.append({"order_id": order["id"], "status": "broker_rejected"})
-            else:
-                resolved_connection.execute(
-                    """
-                    UPDATE execution_orders
-                    SET execution_result_json = ?
-                    WHERE id = ?
-                    """,
-                    (json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
-                )
-                updates.append({"order_id": order["id"], "status": order["status"]})
 
         resolved_connection.commit()
         return {"status": "ok", "updated": len(updates), "orders": updates}
