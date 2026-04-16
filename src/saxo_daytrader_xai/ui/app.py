@@ -26,6 +26,7 @@ from saxo_daytrader_xai.execution_engine import (
     manage_live_order,
     queue_and_maybe_execute_latest_report,
     repair_invalid_simulation_trades,
+    retry_failed_execution_orders,
     sync_broker_order_statuses,
 )
 from saxo_daytrader_xai.market_data import fetch_live_prices
@@ -309,6 +310,8 @@ if active_tab and st.query_params.get("tab") != active_tab:
 
 if active_tab == "Portfolio":
     st.subheader("Portfolio Snapshot")
+    portfolio_table_limit = 25
+    portfolio_table_visible_rows = 25
     cash_col1, cash_col2, cash_col3, cash_col4 = st.columns(4)
     daily_delta = summary["total_daily_pnl_dkk"]
     cash_col1.metric("Daily P/L Since 06:00", _format_dkk(daily_delta), delta=f"{daily_delta:+,.2f} DKK")
@@ -328,11 +331,12 @@ if active_tab == "Portfolio":
                     "ISIN": row["isin"],
                     "Qty": row["quantity"],
                     "Currency": row["currency"],
-                    "Open Price": row["open_price_local"],
+                    "Paid Price": row.get("paid_price_local"),
                     "Current Price": row["current_price_local"],
                     "Cost Basis DKK": row["cost_basis_dkk"],
                     "Market Value DKK": row["market_value_dkk"],
                     "Unrealised P/L DKK": row["unrealised_pnl_dkk"],
+                    "FX Gain/Loss DKK": row.get("fx_unrealised_pnl_dkk"),
                     "Daily P/L DKK": row["daily_pnl_dkk"],
                     "Allocation": row["allocation_pct"],
                     "Asset Class": row["asset_class"],
@@ -340,30 +344,34 @@ if active_tab == "Portfolio":
                     "Quote Updated": row.get("latest_quote_updated_at") or "n/a",
                     "Value Date": row["value_date"],
                 }
-                for row in positions
+                for row in positions[:portfolio_table_limit]
             ]
         )
         display_df = position_df.copy()
         display_df["Symbol"] = display_df["Symbol"].map(_yahoo_finance_quote_url)
         display_df["Qty"] = display_df["Qty"].map(_format_qty)
-        display_df["Open Price"] = [
-            _format_money(row["Open Price"], row["Currency"])
+        display_df["Paid Price"] = [
+            _format_money(row["Paid Price"], row["Currency"])
             for _, row in position_df.iterrows()
         ]
         display_df["Current Price"] = [
             _format_money(row["Current Price"], row["Currency"])
             for _, row in position_df.iterrows()
         ]
-        for column in ["Cost Basis DKK", "Market Value DKK", "Unrealised P/L DKK", "Daily P/L DKK"]:
+        for column in ["Cost Basis DKK", "Market Value DKK", "Unrealised P/L DKK", "FX Gain/Loss DKK", "Daily P/L DKK"]:
             display_df[column] = display_df[column].map(_format_dkk)
+        display_df.loc[position_df["Currency"].isin(["DKK", "EUR"]), "FX Gain/Loss DKK"] = "n/a"
         display_df["Allocation"] = display_df["Allocation"].map(_format_pct)
         styled_positions = (
             display_df.style
-            .map(_signed_color, subset=["Daily P/L DKK", "Unrealised P/L DKK"])
+            .map(_signed_color, subset=["Daily P/L DKK", "Unrealised P/L DKK", "FX Gain/Loss DKK"])
         )
+        visible_row_count = min(len(display_df), portfolio_table_visible_rows)
+        table_height = max(420, 36 * (visible_row_count + 1) + 4)
         st.dataframe(
             styled_positions,
             width="stretch",
+            height=table_height,
             hide_index=True,
             column_config={
                 "Symbol": st.column_config.LinkColumn(
@@ -866,6 +874,7 @@ if active_tab == "Execution":
     invalid_simulation_trades = fetch_invalid_simulation_trades(connection, limit=25)
     pending_approvals = [row for row in execution_orders if row["status"] == "pending_approval"]
     executed_orders = [row for row in execution_orders if row["status"] == "executed"]
+    failed_orders = [row for row in execution_orders if row["status"] == "execution_failed"]
 
     mode_col1, mode_col2, mode_col3, mode_col4, mode_col5 = st.columns(5)
     mode_col1.metric("Execution Mode", str(config["execution"]["mode"]).upper())
@@ -884,7 +893,7 @@ if active_tab == "Execution":
         else:
             st.info("Live orders are submitted to Saxo automatically without approval when the exchange is open. If the exchange is closed, orders wait in the queue until the next open.")
 
-    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+    action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(5)
     if action_col1.button("Run Queue Processor"):
         with st.spinner("Processing queued execution orders..."):
             try:
@@ -920,6 +929,24 @@ if active_tab == "Execution":
             f"{len(repair_result['execution_orders_repaired'])} execution orders"
         )
         st.rerun()
+    if action_col5.button("Retry Failed Orders"):
+        with st.spinner("Requeueing recoverable failed orders..."):
+            retry_result = retry_failed_execution_orders(config=config, connection=connection, recoverable_only=True)
+        st.success(
+            f"Requeued {len(retry_result['retried'])} failed orders; "
+            f"skipped {len(retry_result['skipped'])} non-retryable orders"
+        )
+        st.rerun()
+
+    if failed_orders:
+        retryable_failures = [
+            row for row in failed_orders if "refresh token" in str(row.get("error_text") or "").casefold()
+            or "rate limit exceeded" in str(row.get("error_text") or "").casefold()
+        ]
+        st.warning(
+            f"{len(failed_orders)} failed live orders are currently parked. "
+            f"{len(retryable_failures)} look retryable after renewing the Saxo session."
+        )
 
     if invalid_simulation_trades:
         st.markdown("**Invalid Simulation Trades**")

@@ -2,7 +2,7 @@ PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
 PORT ?= 8501
 
-.PHONY: help install run run-headless run-ui-only scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 validate-phase25 validate-phase26 validate-phase27 validate-phase28 validate-phase29 validate-phase30 validate-phase31 validate-phase32 validate-phase33 validate-phase34 validate-phase35 validate-phase36 validate-phase37 validate-phase38 validate-phase39 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
+.PHONY: help install run run-headless run-ui-only stop restart scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 validate-phase25 validate-phase26 validate-phase27 validate-phase28 validate-phase29 validate-phase30 validate-phase31 validate-phase32 validate-phase33 validate-phase34 validate-phase35 validate-phase36 validate-phase37 validate-phase38 validate-phase39 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
 
 help:
 	@printf "%s\n" \
@@ -11,6 +11,8 @@ help:
 		"  make run                Run the dashboard and autonomous scheduler" \
 		"  make run-ui-only        Run only the Streamlit dashboard" \
 		"  make run-headless       Run dashboard+scheduler headless on PORT=$(PORT)" \
+		"  make stop               Stop tracked dashboard and scheduler processes" \
+		"  make restart            Stop tracked processes, then run dashboard+scheduler" \
 		"  make scheduler          Run the APScheduler worker continuously" \
 		"  make scheduler-once     Run one scheduler cycle in mock-decision mode" \
 		"  make sync               Import the CSV into ledger.db without starting Streamlit" \
@@ -72,6 +74,13 @@ run-ui-only:
 
 run-headless:
 	$(PYTHON) main.py --with-scheduler --headless --no-browser --port $(PORT)
+
+stop:
+	$(PYTHON) scripts/stop_runtime.py
+
+restart:
+	$(PYTHON) scripts/stop_runtime.py
+	$(PYTHON) main.py --with-scheduler
 
 scheduler:
 	$(PYTHON) scripts/run_scheduler.py

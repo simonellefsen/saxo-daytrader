@@ -141,6 +141,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
     for row in base_rows:
         base_quantity = float(row["quantity"] or 0.0)
         current_price_local = float(row["current_price_local"] or row["open_price_local"] or 0.0)
+        cost_basis_local_total = base_quantity * float(row["cost_basis_local"] or 0.0)
         fx_rate = (
             float(row["market_value_dkk"] or 0.0) / max(float(row["market_value_local"] or (base_quantity * current_price_local or 0.0)), 1e-9)
             if current_price_local > 0
@@ -151,6 +152,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
             "asset_class": _normalize_asset_class(row.get("asset_class")),
             "quantity": base_quantity,
             "cost_basis_dkk": float(row["cost_basis_dkk"] or 0.0),
+            "cost_basis_local_total": cost_basis_local_total,
             "current_price_local": current_price_local,
             "latest_fx_rate": fx_rate,
             "base_quantity": base_quantity,
@@ -176,6 +178,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
                 "current_price_local": price_local,
                 "cost_basis_local": None,
                 "cost_basis_dkk": 0.0,
+                "cost_basis_local_total": 0.0,
                 "market_value_local": 0.0,
                 "market_value_dkk": 0.0,
                 "unrealised_pnl_dkk": 0.0,
@@ -203,6 +206,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
         if trade["side"] == "BUY":
             state["quantity"] = float(state["quantity"]) + quantity
             state["cost_basis_dkk"] = float(state["cost_basis_dkk"]) + gross_amount_dkk + float(trade["commission_dkk"] or 0.0)
+            state["cost_basis_local_total"] = float(state.get("cost_basis_local_total") or 0.0) + (quantity * price_local)
         else:
             available_quantity = float(state["quantity"] or 0.0)
             if quantity > available_quantity + 1e-9:
@@ -210,6 +214,10 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
             state["quantity"] = max(available_quantity - quantity, 0.0)
             state["cost_basis_dkk"] = max(
                 float(state["cost_basis_dkk"]) - float(trade["cost_basis_sold_dkk"] or 0.0),
+                0.0,
+            )
+            state["cost_basis_local_total"] = max(
+                float(state.get("cost_basis_local_total") or 0.0) - float(trade.get("cost_basis_sold_local") or 0.0),
                 0.0,
             )
 
@@ -238,15 +246,28 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
             quantity_scale = effective_quantity / base_quantity if base_quantity > 0 else 0.0
             daily_pnl_dkk = float(state.get("base_daily_pnl_dkk") or 0.0) * quantity_scale
         effective_market_value_dkk = effective_quantity * current_price_local * fx_rate
+        cost_basis_local_total = float(state.get("cost_basis_local_total") or 0.0)
+        paid_price_local = cost_basis_local_total / effective_quantity if effective_quantity > 0 and cost_basis_local_total > 0 else None
+        cost_basis_fx_rate_to_dkk = (
+            float(state["cost_basis_dkk"] or 0.0) / max(cost_basis_local_total, 1e-9)
+            if cost_basis_local_total > 0
+            else 1.0
+        )
+        fx_unrealised_pnl_dkk = 0.0
+        if str(state.get("currency") or "").upper() not in {"DKK", "EUR"} and cost_basis_local_total > 0:
+            fx_unrealised_pnl_dkk = cost_basis_local_total * (fx_rate - cost_basis_fx_rate_to_dkk)
         positions.append(
             {
                 **state,
                 "quantity": effective_quantity,
+                "paid_price_local": paid_price_local,
                 "current_price_local": current_price_local,
                 "market_value_local": effective_quantity * current_price_local,
                 "market_value_dkk": effective_market_value_dkk,
                 "unrealised_pnl_dkk": effective_market_value_dkk - float(state["cost_basis_dkk"] or 0.0),
+                "fx_unrealised_pnl_dkk": fx_unrealised_pnl_dkk,
                 "daily_pnl_dkk": daily_pnl_dkk,
+                "cost_basis_fx_rate_to_dkk": cost_basis_fx_rate_to_dkk,
                 "day_baseline_price_local": baseline_price_local,
                 "day_baseline_fx_rate_to_dkk": baseline_fx_rate,
                 "current_fx_rate_to_dkk": fx_rate,

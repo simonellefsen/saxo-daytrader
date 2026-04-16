@@ -11,11 +11,48 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
+RUNTIME_DIR = ROOT / ".run"
+LAUNCHER_PID_PATH = RUNTIME_DIR / "launcher.pid"
+DASHBOARD_PID_PATH = RUNTIME_DIR / "dashboard.pid"
+SCHEDULER_PID_PATH = RUNTIME_DIR / "scheduler.pid"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.importer import sync_portfolio
+
+
+def _write_pid(path: Path, pid: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{pid}\n", encoding="utf-8")
+
+
+def _remove_pid(path: Path) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+
+
+def _write_runtime_state(
+    *,
+    launcher_pid: int | None = None,
+    dashboard_pid: int | None = None,
+    scheduler_pid: int | None = None,
+) -> None:
+    if launcher_pid is not None:
+        _write_pid(LAUNCHER_PID_PATH, launcher_pid)
+    if dashboard_pid is not None:
+        _write_pid(DASHBOARD_PID_PATH, dashboard_pid)
+    if scheduler_pid is not None:
+        _write_pid(SCHEDULER_PID_PATH, scheduler_pid)
+
+
+def _clear_runtime_state(*, dashboard: bool = True, scheduler: bool = True, launcher: bool = False) -> None:
+    if dashboard:
+        _remove_pid(DASHBOARD_PID_PATH)
+    if scheduler:
+        _remove_pid(SCHEDULER_PID_PATH)
+    if launcher:
+        _remove_pid(LAUNCHER_PID_PATH)
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes] | None, *, sig: int) -> None:
@@ -56,13 +93,17 @@ def _wait_for_children(
         scheduler_code = scheduler_process.poll() if scheduler_process is not None else None
 
         if dashboard_code is not None:
+            _clear_runtime_state(dashboard=True, scheduler=scheduler_process is None)
             if scheduler_process is not None and scheduler_code is None:
                 _terminate_process_group(scheduler_process, sig=signal.SIGTERM)
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     scheduler_process.wait(timeout=5)
+            if scheduler_process is not None:
+                _clear_runtime_state(scheduler=True)
             return int(dashboard_code)
 
         if scheduler_process is not None and scheduler_code not in (None, 0):
+            _clear_runtime_state(scheduler=True)
             if (
                 scheduler_cmd is not None
                 and scheduler_restart_enabled
@@ -76,11 +117,13 @@ def _wait_for_children(
                 )
                 time.sleep(scheduler_restart_delay_seconds)
                 scheduler_process = _spawn_process(scheduler_cmd)
+                _write_runtime_state(scheduler_pid=scheduler_process.pid)
                 continue
             print("Scheduler exited unexpectedly; stopping dashboard...", file=sys.stderr)
             _terminate_process_group(dashboard_process, sig=signal.SIGTERM)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 dashboard_process.wait(timeout=5)
+            _clear_runtime_state(dashboard=True)
             return int(scheduler_code)
 
         time.sleep(0.2)
@@ -98,6 +141,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config = load_config(args.config)
+    _write_runtime_state(launcher_pid=os.getpid())
     sync_result = sync_portfolio(config)
     print(
         f"Imported batch {sync_result.batch_id} from {sync_result.source_csv} "
@@ -137,8 +181,10 @@ def main() -> int:
         ]
         print("Launching background scheduler alongside dashboard...")
         scheduler_process = _spawn_process(scheduler_cmd)
+        _write_runtime_state(scheduler_pid=scheduler_process.pid)
 
     dashboard_process = _spawn_process(dashboard_cmd)
+    _write_runtime_state(dashboard_pid=dashboard_process.pid)
     try:
         return _wait_for_children(
             dashboard_process,
@@ -151,9 +197,11 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\nStopping dashboard...", file=sys.stderr)
         _terminate_process_group(dashboard_process, sig=signal.SIGTERM)
+        _clear_runtime_state(dashboard=True)
         if scheduler_process is not None:
             print("Stopping scheduler...", file=sys.stderr)
             _terminate_process_group(scheduler_process, sig=signal.SIGTERM)
+            _clear_runtime_state(scheduler=True)
         try:
             dashboard_process.wait(timeout=5)
             if scheduler_process is not None:
@@ -169,6 +217,8 @@ def main() -> int:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     scheduler_process.wait(timeout=2)
             return 0
+    finally:
+        _clear_runtime_state(dashboard=True, scheduler=True, launcher=True)
 
 
 if __name__ == "__main__":
