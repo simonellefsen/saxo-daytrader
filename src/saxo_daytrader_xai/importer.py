@@ -149,13 +149,15 @@ def _build_lot_row(batch_id: str, imported_at: str, snapshot_row: dict[str, Any]
 
 def sync_portfolio(config: dict[str, Any]) -> ImportResult:
     portfolio_cfg = config["portfolio"]
-    source_csv = Path(portfolio_cfg["source_csv"]).resolve()
+    source_csv_value = str(portfolio_cfg.get("source_csv", "") or "").strip()
+    source_csv = Path(source_csv_value).resolve() if source_csv_value else None
     database_path = Path(portfolio_cfg["database_path"]).resolve()
     excluded_symbols = set(config.get("risk", {}).get("excluded_symbols", []))
-    detail_rows = _load_detail_rows(source_csv)
+    detail_rows = _load_detail_rows(source_csv) if source_csv is not None else []
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     imported_at = datetime.now(UTC).isoformat(timespec="seconds")
-    snapshot_rows = [_build_snapshot_row(row, str(source_csv), excluded_symbols) for row in detail_rows]
+    source_reference = str(source_csv) if source_csv is not None else ""
+    snapshot_rows = [_build_snapshot_row(row, source_reference, excluded_symbols) for row in detail_rows]
     excluded_positions = sum(row["excluded"] for row in snapshot_rows)
     imported_positions = len(snapshot_rows) - excluded_positions
     active_lot_rows = [_build_lot_row(batch_id, imported_at, row) for row in snapshot_rows if not row["excluded"]]
@@ -177,11 +179,11 @@ def sync_portfolio(config: dict[str, Any]) -> ImportResult:
         (
             batch_id,
             imported_at,
-            str(source_csv),
+            source_reference,
             len(detail_rows),
             imported_positions,
             excluded_positions,
-            "Phase 1 CSV import",
+            "Empty baseline import" if source_csv is None else "Phase 1 CSV import",
         ),
     )
     connection.executemany(
@@ -309,7 +311,7 @@ def sync_portfolio(config: dict[str, Any]) -> ImportResult:
         "portfolio_import",
         {
             "batch_id": batch_id,
-            "source_csv": str(source_csv),
+            "source_csv": source_reference,
             "source_positions": len(detail_rows),
             "imported_positions": imported_positions,
             "excluded_positions": excluded_positions,
@@ -320,7 +322,7 @@ def sync_portfolio(config: dict[str, Any]) -> ImportResult:
     connection.close()
     return ImportResult(
         batch_id=batch_id,
-        source_csv=str(source_csv),
+        source_csv=source_reference,
         source_positions=len(detail_rows),
         imported_positions=imported_positions,
         excluded_positions=excluded_positions,

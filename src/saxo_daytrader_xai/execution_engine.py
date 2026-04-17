@@ -315,6 +315,130 @@ def _mark_execution_failed(
     return {"status": "execution_failed", "order_id": order_id, "error": error_text}
 
 
+def _is_retryable_execution_failure(error_text: str | None) -> bool:
+    text = str(error_text or "").casefold()
+    if not text:
+        return False
+    retryable_markers = (
+        "no valid refresh token is available",
+        "rate limit exceeded",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection aborted",
+        "connection reset",
+        "service unavailable",
+        "too many requests",
+    )
+    return any(marker in text for marker in retryable_markers)
+
+
+def retry_execution_order(
+    order_id: int,
+    *,
+    config: dict[str, Any] | None = None,
+    connection=None,
+    force: bool = False,
+) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        row = resolved_connection.execute("SELECT * FROM execution_orders WHERE id = ?", (order_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Unknown execution order {order_id}")
+        order = dict(row)
+        if order["status"] != "execution_failed":
+            return {"status": "not_failed", "order_id": order_id, "current_status": order["status"]}
+        if not force and not _is_retryable_execution_failure(order.get("error_text")):
+            return {"status": "not_retryable", "order_id": order_id, "error": order.get("error_text")}
+
+        approval_required = bool(order.get("approval_required")) and bool(
+            resolved_config.get("execution", {}).get("require_approval_live", True)
+        )
+        new_status = "pending_approval" if approval_required else "pending_execution"
+        previous_error = str(order.get("error_text") or "")
+        payload = _execution_result(order)
+        if previous_error:
+            payload["retry"] = {
+                "previous_error": previous_error,
+                "retried_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            }
+        resolved_connection.execute(
+            """
+            UPDATE execution_orders
+            SET status = ?, error_text = NULL, execution_result_json = ?
+            WHERE id = ?
+            """,
+            (
+                new_status,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                order_id,
+            ),
+        )
+        resolved_connection.commit()
+        append_audit_log(
+            resolved_connection,
+            "execution_order_requeued",
+            {
+                "order_id": order_id,
+                "from_status": order["status"],
+                "to_status": new_status,
+                "previous_error": previous_error,
+                "forced": bool(force),
+            },
+        )
+        return {
+            "status": "requeued",
+            "order_id": order_id,
+            "new_status": new_status,
+            "previous_error": previous_error,
+        }
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
+def retry_failed_execution_orders(
+    *,
+    config: dict[str, Any] | None = None,
+    connection=None,
+    recoverable_only: bool = True,
+    limit: int = 100,
+) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        rows = resolved_connection.execute(
+            """
+            SELECT id
+            FROM execution_orders
+            WHERE status = 'execution_failed'
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        retried: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        for row in rows:
+            result = retry_execution_order(
+                int(row["id"]),
+                config=resolved_config,
+                connection=resolved_connection,
+                force=not recoverable_only,
+            )
+            if result["status"] == "requeued":
+                retried.append(result)
+            else:
+                skipped.append(result)
+        return {
+            "status": "ok",
+            "retried": retried,
+            "skipped": skipped,
+        }
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
 def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
     existing = connection.execute(
         "SELECT * FROM execution_orders WHERE report_id = ? ORDER BY id",

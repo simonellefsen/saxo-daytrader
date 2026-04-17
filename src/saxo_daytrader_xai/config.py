@@ -60,7 +60,8 @@ def load_config(config_path: str | os.PathLike[str] = "config.yaml") -> dict[str
     config = _resolve_env(config)
     portfolio_cfg = config.setdefault("portfolio", {})
     portfolio_cfg["database_path"] = str((path.parent / portfolio_cfg.get("database_path", "ledger.db")).resolve())
-    portfolio_cfg["source_csv"] = str((path.parent / portfolio_cfg["source_csv"]).resolve())
+    source_csv = str(portfolio_cfg.get("source_csv", "") or "").strip()
+    portfolio_cfg["source_csv"] = str((path.parent / source_csv).resolve()) if source_csv else ""
     risk_cfg = config.setdefault("risk", {})
     merged_exclusions: list[str] = []
     for symbol in _normalize_symbol_list(risk_cfg.get("excluded_symbols")) + _normalize_symbol_list(

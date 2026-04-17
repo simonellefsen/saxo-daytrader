@@ -10,9 +10,9 @@ app:
 
 portfolio:
   base_currency: DKK
-  source_csv: Positioner_05-apr-2026_12_16_34.csv
+  source_csv: ""
   database_path: ledger.db
-  initial_cash_dkk: 25000.0
+  initial_cash_dkk: 250000.0
 
 market_data:
   refresh_interval_seconds: 300
