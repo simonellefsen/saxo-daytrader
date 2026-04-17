@@ -312,6 +312,73 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_portfolio_value_history_recorded
         ON portfolio_value_history(recorded_at DESC);
 
+        CREATE TABLE IF NOT EXISTS broker_position_snapshots (
+            symbol TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            instrument_name TEXT,
+            isin TEXT,
+            uic INTEGER,
+            asset_type TEXT,
+            quantity REAL NOT NULL,
+            currency TEXT,
+            open_price_local REAL,
+            open_price_including_costs_local REAL,
+            execution_time_open TEXT,
+            value_date TEXT,
+            market_state TEXT,
+            can_be_closed INTEGER,
+            raw_payload_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_broker_position_snapshots_updated
+        ON broker_position_snapshots(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS broker_balance_snapshots (
+            singleton_key TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            currency TEXT,
+            cash_available_for_trading REAL,
+            margin_available_for_trading REAL,
+            cash_balance REAL,
+            transactions_not_booked REAL,
+            settlement_value REAL,
+            total_value REAL,
+            raw_payload_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_account_snapshots (
+            singleton_key TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            account_key TEXT,
+            account_id TEXT,
+            account_currency TEXT,
+            is_trial_account INTEGER,
+            fractional_order_enabled INTEGER,
+            fractional_order_enabled_asset_types_json TEXT,
+            can_use_cash_positions_as_margin_collateral INTEGER,
+            use_cash_positions_as_margin_collateral INTEGER,
+            legal_asset_types_json TEXT,
+            raw_payload_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS broker_instrument_exposures (
+            symbol TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            uic INTEGER,
+            asset_type TEXT,
+            quantity REAL,
+            average_open_price REAL,
+            profit_loss_on_trade REAL,
+            instrument_price_day_percent_change REAL,
+            currency TEXT,
+            calculation_reliability TEXT,
+            can_be_closed INTEGER,
+            raw_payload_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_broker_instrument_exposures_updated
+        ON broker_instrument_exposures(updated_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

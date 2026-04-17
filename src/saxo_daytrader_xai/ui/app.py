@@ -45,8 +45,10 @@ from saxo_daytrader_xai.scheduler_service import (
     run_manual_scheduler_cycle,
 )
 from saxo_daytrader_xai.portfolio import (
+    fetch_broker_account_summary,
     fetch_goal_tracking,
     fetch_latest_batch_id,
+    fetch_portfolio_integrity_status,
     fetch_portfolio_positions,
     fetch_portfolio_value_history,
     fetch_realised_tax_summary,
@@ -231,7 +233,16 @@ init_db(connection)
 
 batch_id = fetch_latest_batch_id(connection)
 initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
-summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+prefer_broker_cash = (
+    str(config.get("execution", {}).get("mode")) == "live"
+    and str(config.get("execution", {}).get("adapter")) == "saxo"
+)
+summary = fetch_portfolio_summary(
+    connection,
+    batch_id=batch_id,
+    initial_cash_dkk=initial_cash_dkk,
+    prefer_broker_cash=prefer_broker_cash,
+)
 unrealised_after_tax_summary = fetch_unrealised_after_tax_summary(
     connection,
     config,
@@ -239,7 +250,18 @@ unrealised_after_tax_summary = fetch_unrealised_after_tax_summary(
     initial_cash_dkk=initial_cash_dkk,
 )
 goal_tracking = fetch_goal_tracking(connection, config)
-positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+positions = fetch_portfolio_positions(
+    connection,
+    batch_id=batch_id,
+    initial_cash_dkk=initial_cash_dkk,
+    prefer_broker_cash=prefer_broker_cash,
+)
+portfolio_integrity = fetch_portfolio_integrity_status(
+    connection,
+    batch_id=batch_id,
+    initial_cash_dkk=initial_cash_dkk,
+)
+broker_account_summary = fetch_broker_account_summary(connection)
 portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
 trade_ledger = fetch_trade_ledger(connection)
 tax_summary = fetch_realised_tax_summary(connection, tax_year=2026)
@@ -287,8 +309,13 @@ if excluded_symbols:
 else:
     st.info("No globally excluded symbols are configured.")
 
+if not portfolio_integrity["healthy"]:
+    st.warning("Portfolio integrity warning: " + " ".join(portfolio_integrity["warnings"]))
+
 if analysis_summary["analysis_window_active"]:
-    st.success(f"Analysis window active: {', '.join(analysis_summary['active_markets'])}")
+    st.success(f"Analysis window active: {', '.join(analysis_summary['active_windows'])}")
+elif analysis_summary.get("pre_sync_markets"):
+    st.info(f"Pre-analysis broker alignment active: {', '.join(analysis_summary['pre_sync_markets'])}")
 else:
     st.warning("Analysis window inactive right now.")
 
@@ -303,6 +330,18 @@ col5.metric(
     delta=f"After tax {unrealised_after_tax_summary['after_tax_unrealised_pnl_dkk']:+,.2f} DKK",
     delta_color="off",
 )
+if summary.get("cash_source") == "broker_balance_snapshot":
+    st.caption(
+        f"Cash source: Saxo broker balance"
+        f" ({summary.get('broker_cash_available'):.2f} {summary.get('broker_cash_currency')})"
+        f" updated at {summary.get('broker_cash_updated_at')}."
+    )
+if broker_account_summary:
+    st.caption(
+        f"Saxo account: trial={bool(broker_account_summary.get('is_trial_account'))}, "
+        f"fractional orders={bool(broker_account_summary.get('fractional_order_enabled'))}, "
+        f"cash collateral={bool(broker_account_summary.get('can_use_cash_positions_as_margin_collateral'))}."
+    )
 
 tab_labels = ["Portfolio", "Performance", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
 query_tab = st.query_params.get("tab", "Portfolio")
@@ -760,9 +799,16 @@ if active_tab == "Market Status":
                 "Session Open": row["session_open_local"],
                 "Session Close": row["session_close_local"],
                 "Open": row["is_open"],
+                "Tradable": row["is_tradable"],
+                "Pre-Sync": row["pre_analysis_sync_active"],
+                "Open Window": row["open_analysis_window_active"],
+                "Close Window": row["close_analysis_window_active"],
                 "Analysis Window Active": row["analysis_window_active"],
-                "Analysis Window Start": row["analysis_window_start"],
-                "Analysis Window End": row["analysis_window_end"],
+                "Pre-Sync Start": row["pre_analysis_sync_start"],
+                "Open Window Start": row["open_analysis_window_start"],
+                "Open Window End": row["open_analysis_window_end"],
+                "Close Window Start": row["close_analysis_window_start"],
+                "Close Window End": row["close_analysis_window_end"],
                 "Next Open": row["next_open"],
                 "Calendar Source": row["calendar_source"],
                 "Last Checked": row["calendar_last_checked"],
@@ -774,7 +820,7 @@ if active_tab == "Market Status":
     )
     st.write(
         "The system checks refreshed exchange calendars for each market, including holiday closures and daylight-saving shifts, "
-        "and marks a market as analysis-active when the current local exchange time is between 60 and 90 minutes after that market's actual session open."
+        "and marks a market as analysis-active both after the opening period and again into the last trading hour before close."
     )
 
 if active_tab == "Decision Report":

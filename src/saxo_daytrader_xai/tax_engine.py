@@ -325,9 +325,23 @@ def update_ledger(
         created_at = datetime.now(UTC).isoformat(timespec="seconds")
         batch_id = trade_dict.get("batch_id") or fetch_latest_batch_id(resolved_connection)
         initial_cash_dkk = float(resolved_config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+        prefer_broker_cash = (
+            str(resolved_config.get("execution", {}).get("mode")) == "live"
+            and str(resolved_config.get("execution", {}).get("adapter")) == "saxo"
+        )
         portfolio_before = {
-            "summary": fetch_portfolio_summary(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
-            "positions": fetch_portfolio_positions(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+            "summary": fetch_portfolio_summary(
+                resolved_connection,
+                batch_id=batch_id,
+                initial_cash_dkk=initial_cash_dkk,
+                prefer_broker_cash=prefer_broker_cash,
+            ),
+            "positions": fetch_portfolio_positions(
+                resolved_connection,
+                batch_id=batch_id,
+                initial_cash_dkk=initial_cash_dkk,
+                prefer_broker_cash=prefer_broker_cash,
+            ),
         }
 
         cursor = resolved_connection.execute(
@@ -433,8 +447,18 @@ def update_ledger(
         )
         resolved_connection.commit()
         portfolio_after = {
-            "summary": fetch_portfolio_summary(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
-            "positions": fetch_portfolio_positions(resolved_connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+            "summary": fetch_portfolio_summary(
+                resolved_connection,
+                batch_id=batch_id,
+                initial_cash_dkk=initial_cash_dkk,
+                prefer_broker_cash=prefer_broker_cash,
+            ),
+            "positions": fetch_portfolio_positions(
+                resolved_connection,
+                batch_id=batch_id,
+                initial_cash_dkk=initial_cash_dkk,
+                prefer_broker_cash=prefer_broker_cash,
+            ),
         }
         resolved_connection.execute(
             "UPDATE trade_ledger SET portfolio_after_json = ? WHERE id = ?",

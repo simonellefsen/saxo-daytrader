@@ -127,10 +127,15 @@ def refresh_portfolio_price_state(
 
         batch_id = fetch_latest_batch_id(resolved_connection)
         initial_cash_dkk = float(resolved_config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+        prefer_broker_cash = (
+            str(resolved_config.get("execution", {}).get("mode")) == "live"
+            and str(resolved_config.get("execution", {}).get("adapter")) == "saxo"
+        )
         positions = fetch_portfolio_positions(
             resolved_connection,
             batch_id=batch_id,
             initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
         )
         if not positions:
             return {"status": "no_positions", "updated": 0, "baseline_session_date": None}
@@ -221,6 +226,7 @@ def refresh_portfolio_price_state(
             recorded_at=updated_at,
             snapshot_type="price_monitor",
             initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
             batch_id=batch_id,
             baseline_session_date=baseline_session_date,
             source="price_monitor",

@@ -13,6 +13,7 @@ from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
 from saxo_daytrader_xai.portfolio import (
+    fetch_broker_account_summary,
     fetch_goal_tracking,
     fetch_latest_batch_id,
     fetch_portfolio_positions,
@@ -167,8 +168,22 @@ def _summarize_market_regime(
 def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     batch_id = fetch_latest_batch_id(connection)
     initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
-    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
-    portfolio_positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    prefer_broker_cash = (
+        str(config.get("execution", {}).get("mode")) == "live"
+        and str(config.get("execution", {}).get("adapter")) == "saxo"
+    )
+    portfolio_summary = fetch_portfolio_summary(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
+    portfolio_positions = fetch_portfolio_positions(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
     portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
     goal_tracking = fetch_goal_tracking(connection, config)
     watchlists = build_watchlists(config)
@@ -176,6 +191,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     market_news = fetch_market_intelligence(config, portfolio_symbols[:8], watchlist_symbols[:8])
     market_status_rows = get_market_status(config)
     analysis_summary = summarize_analysis_window(market_status_rows)
+    broker_account = fetch_broker_account_summary(connection)
     live_quotes = fetch_live_prices(
         portfolio_symbols[:10],
         timeout_seconds=config["market_data"]["request_timeout_seconds"],
@@ -210,6 +226,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
             "global": watchlists["global"][:15],
         },
         "goal_tracking": goal_tracking,
+        "broker_account": broker_account,
         "market_news": market_news,
         "market_status": market_status_rows,
         "analysis_summary": analysis_summary,
@@ -258,6 +275,9 @@ Market status JSON:
 
 Goal tracking JSON:
 {json.dumps(context['goal_tracking'], ensure_ascii=False, indent=2)}
+
+Broker account JSON:
+{json.dumps(context['broker_account'], ensure_ascii=False, indent=2)}
 
 Task:
 1. Assess the current market regime for a day-trading horizon.

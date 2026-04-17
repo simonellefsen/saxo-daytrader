@@ -400,6 +400,65 @@ def get_balance_snapshot(config: dict[str, Any], session: dict[str, Any]) -> dic
     return _raise_for_saxo_response(response, action="Balance snapshot")
 
 
+def get_positions_snapshot(
+    config: dict[str, Any],
+    session: dict[str, Any],
+    *,
+    top: int = 200,
+) -> list[dict[str, Any]]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.get(
+        f"{base_url}/port/v1/positions/me",
+        params={
+            "$top": int(top),
+            "FieldGroups": "DisplayAndFormat,PositionBase,PositionView",
+        },
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    payload = _raise_for_saxo_response(response, action="Positions snapshot")
+    return [dict(row) for row in payload.get("Data", [])]
+
+
+def get_accounts_snapshot(
+    config: dict[str, Any],
+    session: dict[str, Any],
+    *,
+    top: int = 100,
+) -> list[dict[str, Any]]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.get(
+        f"{base_url}/port/v1/accounts/me",
+        params={"$top": int(top)},
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    payload = _raise_for_saxo_response(response, action="Accounts snapshot")
+    return [dict(row) for row in payload.get("Data", [])]
+
+
+def get_instrument_exposures(
+    config: dict[str, Any],
+    session: dict[str, Any],
+) -> list[dict[str, Any]]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    response = requests.get(
+        f"{base_url}/port/v1/exposure/instruments/me",
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    payload = _response_json_or_none(response)
+    status_code = int(getattr(response, "status_code", 200))
+    if status_code >= 400:
+        error_text = _extract_saxo_error(payload)
+        if error_text:
+            raise SaxoSessionError(f"Instrument exposures failed: {error_text}")
+        raise SaxoSessionError(f"Instrument exposures failed: HTTP {status_code}")
+    if isinstance(payload, list):
+        return [dict(row) for row in payload]
+    return [dict(row) for row in (payload or {}).get("Data", [])]
+
+
 def change_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
     response = requests.patch(

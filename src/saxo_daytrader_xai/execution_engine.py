@@ -23,8 +23,11 @@ from saxo_daytrader_xai.saxo_openapi import (
     change_order,
     ensure_access_token,
     get_balance_snapshot,
+    get_accounts_snapshot,
+    get_instrument_exposures,
     get_open_order,
     get_order_activity_last,
+    get_positions_snapshot,
     place_order,
     precheck_order,
 )
@@ -106,6 +109,13 @@ def _approval_required_for_order(config: dict[str, Any]) -> bool:
 
 def _cash_gate_enabled(config: dict[str, Any]) -> bool:
     return bool(config["execution"].get("require_settled_cash_for_live_buys", True))
+
+
+def _prefer_broker_state(config: dict[str, Any]) -> bool:
+    return (
+        str(config.get("execution", {}).get("mode")) == "live"
+        and str(config.get("execution", {}).get("adapter")) == "saxo"
+    )
 
 
 def _to_dkk_amount(amount: float | None, currency: str | None, fx_snapshot: dict[str, Any]) -> float:
@@ -451,10 +461,21 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     suggestions = report_json.get("suggested_trades", [])
     batch_id = fetch_latest_batch_id(connection)
     initial_cash_dkk = _initial_cash_dkk(config)
-    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    prefer_broker_cash = _prefer_broker_state(config)
+    portfolio_summary = fetch_portfolio_summary(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
     position_map = {
         row["symbol"]: {**row, "quantity_open": row["quantity"]}
-        for row in fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+        for row in fetch_portfolio_positions(
+            connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        )
     }
     live_symbols = list({item.get("symbol") for item in suggestions if item.get("symbol")})
     live_symbols.extend(position_map.keys())
@@ -465,7 +486,13 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     max_position_weight = float(config["risk"]["max_position_weight"])
     min_trade_value_dkk = float(config["execution"]["min_trade_value_dkk"])
     remaining_capacity = _remaining_daily_order_capacity(connection, config)
-    remaining_cash_dkk = float(fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)["cash_balance_dkk"])
+    remaining_cash_dkk = float(
+        fetch_cash_summary(
+            connection,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        )["cash_balance_dkk"]
+    )
     approval_required = _approval_required_for_order(config)
 
     for suggestion in suggestions:
@@ -621,9 +648,20 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     quantity = float(_whole_share_quantity(float(order["quantity"])))
     currency = order["currency"]
     initial_cash_dkk = _initial_cash_dkk(config)
+    prefer_broker_cash = _prefer_broker_state(config)
     portfolio_before = {
-        "summary": fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
-        "positions": fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+        "summary": fetch_portfolio_summary(
+            connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        ),
+        "positions": fetch_portfolio_positions(
+            connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        ),
     }
     fx_snapshot = fetch_ecb_fx_rates()
     fx_rate = fx_rate_to_dkk(currency, fx_snapshot)
@@ -715,8 +753,18 @@ def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any],
     )
     connection.commit()
     portfolio_after = {
-        "summary": fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
-        "positions": fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk),
+        "summary": fetch_portfolio_summary(
+            connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        ),
+        "positions": fetch_portfolio_positions(
+            connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        ),
     }
     connection.execute(
         "UPDATE trade_ledger SET portfolio_after_json = ? WHERE id = ?",
@@ -1068,6 +1116,264 @@ def _record_broker_sync_error(
     return event_id
 
 
+def refresh_broker_position_snapshots(
+    connection,
+    config: dict[str, Any],
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    snapshot_rows = get_positions_snapshot(config, session)
+    refreshed_at = datetime.now(UTC).isoformat(timespec="seconds")
+    aggregated_rows: dict[str, dict[str, Any]] = {}
+    for row in snapshot_rows:
+        display = dict(row.get("DisplayAndFormat") or {})
+        position_base = dict(row.get("PositionBase") or {})
+        position_view = dict(row.get("PositionView") or {})
+        symbol = str(display.get("Symbol") or "").strip()
+        if not symbol:
+            continue
+        quantity = float(position_base.get("Amount") or 0.0)
+        open_price_local = float(position_base.get("OpenPrice") or 0.0)
+        open_price_including_costs_local = float(position_base.get("OpenPriceIncludingCosts") or open_price_local or 0.0)
+        existing = aggregated_rows.get(symbol)
+        if existing is None:
+            aggregated_rows[symbol] = {
+                "symbol": symbol,
+                "updated_at": refreshed_at,
+                "instrument_name": display.get("Description") or display.get("InstrumentType") or symbol,
+                "isin": display.get("IsinCode"),
+                "uic": position_base.get("Uic"),
+                "asset_type": position_base.get("AssetType"),
+                "quantity": quantity,
+                "currency": display.get("Currency"),
+                "open_price_local": open_price_local,
+                "open_price_including_costs_local": open_price_including_costs_local,
+                "execution_time_open": position_base.get("ExecutionTimeOpen"),
+                "value_date": position_base.get("ValueDate"),
+                "market_state": position_view.get("MarketState"),
+                "can_be_closed": 1 if bool(position_base.get("CanBeClosed")) else 0,
+                "raw_payload_json": json.dumps([row], ensure_ascii=False, sort_keys=True),
+            }
+            continue
+        combined_quantity = float(existing["quantity"]) + quantity
+        if combined_quantity > 0:
+            existing["open_price_local"] = (
+                (float(existing["open_price_local"] or 0.0) * float(existing["quantity"]) + open_price_local * quantity)
+                / combined_quantity
+            )
+            existing["open_price_including_costs_local"] = (
+                (
+                    float(existing["open_price_including_costs_local"] or 0.0) * float(existing["quantity"])
+                    + open_price_including_costs_local * quantity
+                )
+                / combined_quantity
+            )
+        existing["quantity"] = combined_quantity
+        existing["execution_time_open"] = min(
+            [
+                value
+                for value in [existing.get("execution_time_open"), position_base.get("ExecutionTimeOpen")]
+                if value
+            ],
+            default=existing.get("execution_time_open"),
+        )
+        raw_payload = json.loads(existing["raw_payload_json"])
+        raw_payload.append(row)
+        existing["raw_payload_json"] = json.dumps(raw_payload, ensure_ascii=False, sort_keys=True)
+    resolved_rows = list(aggregated_rows.values())
+    connection.execute("DELETE FROM broker_position_snapshots")
+    if resolved_rows:
+        connection.executemany(
+            """
+            INSERT INTO broker_position_snapshots (
+                symbol, updated_at, instrument_name, isin, uic, asset_type, quantity, currency,
+                open_price_local, open_price_including_costs_local, execution_time_open, value_date,
+                market_state, can_be_closed, raw_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["symbol"],
+                    row["updated_at"],
+                    row["instrument_name"],
+                    row["isin"],
+                    row["uic"],
+                    row["asset_type"],
+                    row["quantity"],
+                    row["currency"],
+                    row["open_price_local"],
+                    row["open_price_including_costs_local"],
+                    row["execution_time_open"],
+                    row["value_date"],
+                    row["market_state"],
+                    row["can_be_closed"],
+                    row["raw_payload_json"],
+                )
+                for row in resolved_rows
+            ],
+        )
+    connection.commit()
+    append_audit_log(
+        connection,
+        "broker_positions_refreshed",
+        {"updated_at": refreshed_at, "count": len(resolved_rows)},
+    )
+    return {
+        "status": "ok",
+        "updated": len(resolved_rows),
+        "updated_at": refreshed_at,
+    }
+
+
+def refresh_broker_balance_snapshot(
+    connection,
+    config: dict[str, Any],
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    payload = get_balance_snapshot(config, session)
+    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    effective_cash_available = _first_numeric(
+        payload,
+        "CashAvailableForTrading",
+        "MarginAvailableForTrading",
+        "CashBalance",
+        "CollateralAvailable",
+    )
+    connection.execute(
+        """
+        INSERT INTO broker_balance_snapshots (
+            singleton_key, updated_at, currency, cash_available_for_trading, margin_available_for_trading,
+            cash_balance, transactions_not_booked, settlement_value, total_value, raw_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton_key) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            currency = excluded.currency,
+            cash_available_for_trading = excluded.cash_available_for_trading,
+            margin_available_for_trading = excluded.margin_available_for_trading,
+            cash_balance = excluded.cash_balance,
+            transactions_not_booked = excluded.transactions_not_booked,
+            settlement_value = excluded.settlement_value,
+            total_value = excluded.total_value,
+            raw_payload_json = excluded.raw_payload_json
+        """,
+        (
+            "main",
+            updated_at,
+            payload.get("Currency"),
+            effective_cash_available,
+            payload.get("MarginAvailableForTrading"),
+            payload.get("CashBalance"),
+            payload.get("TransactionsNotBooked"),
+            payload.get("SettlementValue"),
+            payload.get("TotalValue"),
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    connection.commit()
+    append_audit_log(
+        connection,
+        "broker_balance_refreshed",
+        {"updated_at": updated_at, "currency": payload.get("Currency")},
+    )
+    return {
+        "status": "ok",
+        "updated_at": updated_at,
+        "currency": payload.get("Currency"),
+        "cash_available_for_trading": effective_cash_available,
+    }
+
+
+def refresh_broker_account_snapshot(
+    connection,
+    config: dict[str, Any],
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    accounts = get_accounts_snapshot(config, session)
+    account_key = str(config["saxo"].get("account_key") or session.get("account_key") or "")
+    selected = next((row for row in accounts if str(row.get("AccountKey") or "") == account_key), accounts[0] if accounts else None)
+    if not selected:
+        return {"status": "ok", "updated_at": datetime.now(UTC).isoformat(timespec="seconds"), "account": None}
+    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    connection.execute(
+        """
+        INSERT INTO broker_account_snapshots (
+            singleton_key, updated_at, account_key, account_id, account_currency, is_trial_account,
+            fractional_order_enabled, fractional_order_enabled_asset_types_json,
+            can_use_cash_positions_as_margin_collateral, use_cash_positions_as_margin_collateral,
+            legal_asset_types_json, raw_payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(singleton_key) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            account_key = excluded.account_key,
+            account_id = excluded.account_id,
+            account_currency = excluded.account_currency,
+            is_trial_account = excluded.is_trial_account,
+            fractional_order_enabled = excluded.fractional_order_enabled,
+            fractional_order_enabled_asset_types_json = excluded.fractional_order_enabled_asset_types_json,
+            can_use_cash_positions_as_margin_collateral = excluded.can_use_cash_positions_as_margin_collateral,
+            use_cash_positions_as_margin_collateral = excluded.use_cash_positions_as_margin_collateral,
+            legal_asset_types_json = excluded.legal_asset_types_json,
+            raw_payload_json = excluded.raw_payload_json
+        """,
+        (
+            "main",
+            updated_at,
+            selected.get("AccountKey"),
+            selected.get("AccountId"),
+            selected.get("Currency"),
+            1 if bool(selected.get("IsTrialAccount")) else 0,
+            1 if bool(selected.get("FractionalOrderEnabled")) else 0,
+            json.dumps(selected.get("FractionalOrderEnabledAssetTypes") or [], ensure_ascii=False, sort_keys=True),
+            1 if bool(selected.get("CanUseCashPositionsAsMarginCollateral")) else 0,
+            1 if bool(selected.get("UseCashPositionsAsMarginCollateral")) else 0,
+            json.dumps(selected.get("LegalAssetTypes") or [], ensure_ascii=False, sort_keys=True),
+            json.dumps(selected, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    connection.commit()
+    append_audit_log(connection, "broker_account_refreshed", {"updated_at": updated_at, "account_key": selected.get("AccountKey")})
+    return {"status": "ok", "updated_at": updated_at, "account_key": selected.get("AccountKey")}
+
+
+def refresh_broker_instrument_exposures(
+    connection,
+    config: dict[str, Any],
+    session: dict[str, Any],
+) -> dict[str, Any]:
+    exposures = get_instrument_exposures(config, session)
+    updated_at = datetime.now(UTC).isoformat(timespec="seconds")
+    connection.execute("DELETE FROM broker_instrument_exposures")
+    if exposures:
+        connection.executemany(
+            """
+            INSERT INTO broker_instrument_exposures (
+                symbol, updated_at, uic, asset_type, quantity, average_open_price, profit_loss_on_trade,
+                instrument_price_day_percent_change, currency, calculation_reliability, can_be_closed, raw_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    str((row.get("DisplayAndFormat") or {}).get("Symbol") or ""),
+                    updated_at,
+                    row.get("Uic"),
+                    row.get("AssetType"),
+                    row.get("Amount"),
+                    row.get("AverageOpenPrice"),
+                    row.get("ProfitLossOnTrade"),
+                    row.get("InstrumentPriceDayPercentChange"),
+                    (row.get("DisplayAndFormat") or {}).get("Currency"),
+                    row.get("CalculationReliability"),
+                    1 if bool(row.get("CanBeClosed")) else 0,
+                    json.dumps(row, ensure_ascii=False, sort_keys=True),
+                )
+                for row in exposures
+                if str((row.get("DisplayAndFormat") or {}).get("Symbol") or "").strip()
+            ],
+        )
+    connection.commit()
+    append_audit_log(connection, "broker_exposures_refreshed", {"updated_at": updated_at, "count": len(exposures)})
+    return {"status": "ok", "updated_at": updated_at, "updated": len(exposures)}
+
+
 def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connection=None, limit: int = 25) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
@@ -1089,10 +1395,22 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             """,
             (limit,),
         ).fetchall()
-        if not rows:
-            return {"status": "ok", "updated": 0, "orders": []}
-
         session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+        broker_positions = refresh_broker_position_snapshots(resolved_connection, resolved_config, session)
+        broker_balance = refresh_broker_balance_snapshot(resolved_connection, resolved_config, session)
+        broker_account = refresh_broker_account_snapshot(resolved_connection, resolved_config, session)
+        broker_exposures = refresh_broker_instrument_exposures(resolved_connection, resolved_config, session)
+        if not rows:
+            return {
+                "status": "ok",
+                "updated": 0,
+                "orders": [],
+                "broker_positions": broker_positions,
+                "broker_balance": broker_balance,
+                "broker_account": broker_account,
+                "broker_exposures": broker_exposures,
+            }
+
         updates: list[dict[str, Any]] = []
 
         for row in rows:
@@ -1458,7 +1776,24 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                 )
 
         resolved_connection.commit()
-        return {"status": "ok", "updated": len(updates), "orders": updates}
+        broker_positions_after = broker_positions
+        broker_balance_after = broker_balance
+        broker_account_after = broker_account
+        broker_exposures_after = broker_exposures
+        if updates:
+            broker_positions_after = refresh_broker_position_snapshots(resolved_connection, resolved_config, session)
+            broker_balance_after = refresh_broker_balance_snapshot(resolved_connection, resolved_config, session)
+            broker_account_after = refresh_broker_account_snapshot(resolved_connection, resolved_config, session)
+            broker_exposures_after = refresh_broker_instrument_exposures(resolved_connection, resolved_config, session)
+        return {
+            "status": "ok",
+            "updated": len(updates),
+            "orders": updates,
+            "broker_positions": broker_positions_after,
+            "broker_balance": broker_balance_after,
+            "broker_account": broker_account_after,
+            "broker_exposures": broker_exposures_after,
+        }
     finally:
         if should_close:
             resolved_connection.close()
@@ -1495,7 +1830,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
         if order["mode"] == "live" and order["approval_required"] and not approved:
             return {"status": "approval_required", "order_id": order_id}
         market_row = _market_status_for_symbol(str(order["symbol"]), resolved_config)
-        if market_row is not None and not bool(market_row.get("is_open")):
+        if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
             error_text = f"Exchange closed for {order['symbol']}: {market_row.get('status_reason')}"
             payload = {
                 "symbol": order["symbol"],

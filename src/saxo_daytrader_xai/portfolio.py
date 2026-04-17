@@ -7,6 +7,8 @@ from typing import Any
 
 import pytz
 
+from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
+
 
 ACTIVE_LEDGER_STATUSES = {"executed", "approved", "recorded"}
 
@@ -112,7 +114,107 @@ def _latest_price_state_by_symbol(connection: sqlite3.Connection) -> dict[str, d
     return {row["symbol"]: dict(row) for row in rows}
 
 
-def fetch_cash_summary(connection: sqlite3.Connection, *, initial_cash_dkk: float = 0.0) -> dict[str, Any]:
+def _broker_position_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            symbol,
+            updated_at,
+            instrument_name,
+            isin,
+            uic,
+            asset_type,
+            quantity,
+            currency,
+            open_price_local,
+            open_price_including_costs_local,
+            execution_time_open,
+            value_date,
+            market_state,
+            can_be_closed
+        FROM broker_position_snapshots
+        ORDER BY updated_at DESC, symbol ASC
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _broker_balance_row(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            updated_at,
+            currency,
+            cash_available_for_trading,
+            margin_available_for_trading,
+            cash_balance,
+            transactions_not_booked,
+            settlement_value,
+            total_value
+        FROM broker_balance_snapshots
+        WHERE singleton_key = 'main'
+        """
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _broker_account_row(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT
+            updated_at,
+            account_key,
+            account_id,
+            account_currency,
+            is_trial_account,
+            fractional_order_enabled,
+            fractional_order_enabled_asset_types_json,
+            can_use_cash_positions_as_margin_collateral,
+            use_cash_positions_as_margin_collateral,
+            legal_asset_types_json
+        FROM broker_account_snapshots
+        WHERE singleton_key = 'main'
+        """
+    ).fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    for key in ("fractional_order_enabled_asset_types_json", "legal_asset_types_json"):
+        data[key] = json.loads(data[key]) if data.get(key) else []
+    return data
+
+
+def fetch_broker_account_summary(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    return _broker_account_row(connection)
+
+
+def _broker_exposure_rows(connection: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            symbol,
+            updated_at,
+            uic,
+            asset_type,
+            quantity,
+            average_open_price,
+            profit_loss_on_trade,
+            instrument_price_day_percent_change,
+            currency,
+            calculation_reliability,
+            can_be_closed
+        FROM broker_instrument_exposures
+        """
+    ).fetchall()
+    return {row["symbol"]: dict(row) for row in rows}
+
+
+def fetch_cash_summary(
+    connection: sqlite3.Connection,
+    *,
+    initial_cash_dkk: float = 0.0,
+    prefer_broker_cash: bool = False,
+) -> dict[str, Any]:
     cash_from_trades = 0.0
     invalid_trade_ids: list[int] = []
     invalid_rows = {
@@ -126,17 +228,50 @@ def fetch_cash_summary(connection: sqlite3.Connection, *, initial_cash_dkk: floa
             invalid_trade_ids.append(int(row["id"]))
             continue
         cash_from_trades += float(row["net_amount_dkk"] or 0.0)
+    broker_balance = _broker_balance_row(connection) if prefer_broker_cash else None
+    if broker_balance:
+        fx_snapshot = fetch_ecb_fx_rates()
+        broker_currency = str(broker_balance.get("currency") or "DKK")
+        broker_cash_available = float(broker_balance.get("cash_available_for_trading") or 0.0)
+        broker_cash_balance_dkk = broker_cash_available * fx_rate_to_dkk(broker_currency, fx_snapshot)
+        return {
+            "initial_cash_dkk": float(initial_cash_dkk or 0.0),
+            "cash_from_trades_dkk": cash_from_trades,
+            "cash_balance_dkk": broker_cash_balance_dkk,
+            "ignored_invalid_trade_ids": invalid_trade_ids,
+            "cash_source": "broker_balance_snapshot",
+            "broker_cash_available": broker_cash_available,
+            "broker_cash_currency": broker_currency,
+            "broker_cash_updated_at": broker_balance.get("updated_at"),
+        }
     return {
         "initial_cash_dkk": float(initial_cash_dkk or 0.0),
         "cash_from_trades_dkk": cash_from_trades,
         "cash_balance_dkk": float(initial_cash_dkk or 0.0) + cash_from_trades,
         "ignored_invalid_trade_ids": invalid_trade_ids,
+        "cash_source": "local_ledger_overlay",
+        "broker_cash_available": None,
+        "broker_cash_currency": None,
+        "broker_cash_updated_at": None,
     }
 
 
-def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initial_cash_dkk: float = 0.0) -> list[dict[str, Any]]:
+def _effective_positions(
+    connection: sqlite3.Connection,
+    batch_id: str,
+    *,
+    initial_cash_dkk: float = 0.0,
+    prefer_broker_cash: bool = False,
+    use_broker_positions: bool = True,
+) -> list[dict[str, Any]]:
     base_rows = _base_snapshot_rows(connection, batch_id)
     latest_price_state = _latest_price_state_by_symbol(connection)
+    broker_rows = _broker_position_rows(connection) if use_broker_positions else []
+    broker_exposure_rows = _broker_exposure_rows(connection) if use_broker_positions else {}
+    broker_account_summary = _broker_account_row(connection) if use_broker_positions else None
+    account_currency = str((broker_account_summary or {}).get("account_currency") or "DKK")
+    account_fx_snapshot = fetch_ecb_fx_rates() if broker_account_summary else None
+    broker_symbols = {str(row["symbol"]) for row in broker_rows}
     states: dict[str, dict[str, Any]] = {}
     for row in base_rows:
         base_quantity = float(row["quantity"] or 0.0)
@@ -221,8 +356,74 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
                 0.0,
             )
 
+    for broker in broker_rows:
+        symbol = str(broker["symbol"])
+        broker_quantity = float(broker["quantity"] or 0.0)
+        if broker_quantity <= 1e-9:
+            states.pop(symbol, None)
+            continue
+        broker_currency = broker.get("currency")
+        broker_open_price = float(
+            broker.get("open_price_including_costs_local")
+            or broker.get("open_price_local")
+            or 0.0
+        )
+        state = states.get(symbol)
+        if state is None:
+            state = {
+                "instrument_name": broker.get("instrument_name") or symbol,
+                "symbol": symbol,
+                "isin": broker.get("isin"),
+                "uic": broker.get("uic"),
+                "asset_type": broker.get("asset_type"),
+                "quantity": broker_quantity,
+                "currency": broker_currency,
+                "open_price_local": broker_open_price,
+                "current_price_local": broker_open_price,
+                "cost_basis_local": broker_open_price,
+                "cost_basis_dkk": 0.0,
+                "cost_basis_local_total": broker_quantity * broker_open_price,
+                "market_value_local": 0.0,
+                "market_value_dkk": 0.0,
+                "unrealised_pnl_dkk": 0.0,
+                "daily_pnl_dkk": 0.0,
+                "allocation_pct": 0.0,
+                "asset_class": "Equity",
+                "market_status": "Saxo broker snapshot",
+                "value_date": broker.get("value_date"),
+                "latest_fx_rate": 1.0,
+                "base_quantity": broker_quantity,
+                "base_daily_pnl_dkk": 0.0,
+            }
+            states[symbol] = state
+        else:
+            previous_quantity = float(state.get("quantity") or 0.0)
+            if previous_quantity > 0 and abs(previous_quantity - broker_quantity) > 1e-9:
+                unit_cost_dkk = float(state.get("cost_basis_dkk") or 0.0) / previous_quantity
+                unit_cost_local = float(state.get("cost_basis_local_total") or 0.0) / previous_quantity
+                state["cost_basis_dkk"] = unit_cost_dkk * broker_quantity
+                state["cost_basis_local_total"] = unit_cost_local * broker_quantity
+            state["quantity"] = broker_quantity
+            state["base_quantity"] = broker_quantity
+            state["market_status"] = "Saxo broker snapshot"
+            state["value_date"] = broker.get("value_date") or state.get("value_date")
+        if broker_open_price > 0:
+            state["open_price_local"] = broker_open_price
+            state["current_price_local"] = broker_open_price if not latest_price_state.get(symbol) else state.get("current_price_local")
+        if broker_currency:
+            state["currency"] = broker_currency
+        if broker.get("instrument_name"):
+            state["instrument_name"] = broker["instrument_name"]
+        if broker.get("isin"):
+            state["isin"] = broker["isin"]
+        state["asset_class"] = _normalize_asset_class(state.get("asset_class") or broker.get("asset_type") or "Equity")
+        if broker_open_price > 0 and broker_quantity > 0:
+            state["cost_basis_local_total"] = broker_quantity * broker_open_price if float(state.get("cost_basis_local_total") or 0.0) <= 0 else float(state.get("cost_basis_local_total") or 0.0)
+
     positions: list[dict[str, Any]] = []
     for state in states.values():
+        if broker_symbols and state["symbol"] not in broker_symbols and float(state.get("base_quantity") or 0.0) <= 1e-9:
+            continue
         effective_quantity = float(state["quantity"] or 0.0)
         if effective_quantity <= 1e-9:
             continue
@@ -234,6 +435,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
             or 0.0
         )
         fx_rate = float(price_state.get("current_fx_rate_to_dkk") or state["latest_fx_rate"] or 1.0)
+        exposure = broker_exposure_rows.get(state["symbol"], {})
         baseline_price_local = price_state.get("baseline_price_local")
         baseline_fx_rate = price_state.get("baseline_fx_rate_to_dkk")
         if baseline_price_local not in (None, "") and baseline_fx_rate not in (None, ""):
@@ -256,6 +458,10 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
         fx_unrealised_pnl_dkk = 0.0
         if str(state.get("currency") or "").upper() not in {"DKK", "EUR"} and cost_basis_local_total > 0:
             fx_unrealised_pnl_dkk = cost_basis_local_total * (fx_rate - cost_basis_fx_rate_to_dkk)
+        unrealised_pnl_dkk = effective_market_value_dkk - float(state["cost_basis_dkk"] or 0.0)
+        exposure_profit = exposure.get("profit_loss_on_trade")
+        if exposure_profit not in (None, ""):
+            unrealised_pnl_dkk = float(exposure_profit) * fx_rate_to_dkk(account_currency, account_fx_snapshot or {})
         positions.append(
             {
                 **state,
@@ -264,7 +470,7 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
                 "current_price_local": current_price_local,
                 "market_value_local": effective_quantity * current_price_local,
                 "market_value_dkk": effective_market_value_dkk,
-                "unrealised_pnl_dkk": effective_market_value_dkk - float(state["cost_basis_dkk"] or 0.0),
+                "unrealised_pnl_dkk": unrealised_pnl_dkk,
                 "fx_unrealised_pnl_dkk": fx_unrealised_pnl_dkk,
                 "daily_pnl_dkk": daily_pnl_dkk,
                 "cost_basis_fx_rate_to_dkk": cost_basis_fx_rate_to_dkk,
@@ -274,11 +480,19 @@ def _effective_positions(connection: sqlite3.Connection, batch_id: str, *, initi
                 "latest_quote_updated_at": price_state.get("updated_at"),
                 "baseline_session_date": price_state.get("baseline_session_date"),
                 "quote_status": price_state.get("status"),
+                "broker_profit_loss_on_trade": exposure_profit,
+                "broker_calculation_reliability": exposure.get("calculation_reliability"),
             }
         )
 
     invested_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
-    total_portfolio_value_dkk = invested_market_value_dkk + float(fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)["cash_balance_dkk"])
+    total_portfolio_value_dkk = invested_market_value_dkk + float(
+        fetch_cash_summary(
+            connection,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        )["cash_balance_dkk"]
+    )
     for row in positions:
         row["allocation_pct"] = (
             float(row["market_value_dkk"] or 0.0) / total_portfolio_value_dkk
@@ -294,11 +508,19 @@ def fetch_portfolio_positions(
     batch_id: str | None = None,
     *,
     initial_cash_dkk: float = 0.0,
+    prefer_broker_cash: bool = False,
+    use_broker_positions: bool = True,
 ) -> list[dict[str, Any]]:
     batch_id = batch_id or fetch_latest_batch_id(connection)
     if not batch_id:
         return []
-    return _effective_positions(connection, batch_id, initial_cash_dkk=initial_cash_dkk)
+    return _effective_positions(
+        connection,
+        batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+        use_broker_positions=use_broker_positions,
+    )
 
 
 def fetch_portfolio_summary(
@@ -306,6 +528,8 @@ def fetch_portfolio_summary(
     batch_id: str | None = None,
     *,
     initial_cash_dkk: float = 0.0,
+    prefer_broker_cash: bool = False,
+    use_broker_positions: bool = True,
 ) -> dict[str, Any]:
     batch_id = batch_id or fetch_latest_batch_id(connection)
     if not batch_id:
@@ -321,9 +545,19 @@ def fetch_portfolio_summary(
             "total_unrealised_pnl_dkk": 0.0,
             "total_daily_pnl_dkk": 0.0,
         }
-    positions = _effective_positions(connection, batch_id, initial_cash_dkk=initial_cash_dkk)
+    positions = _effective_positions(
+        connection,
+        batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+        use_broker_positions=use_broker_positions,
+    )
     invested_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
-    cash_summary = fetch_cash_summary(connection, initial_cash_dkk=initial_cash_dkk)
+    cash_summary = fetch_cash_summary(
+        connection,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
     return {
         "batch_id": batch_id,
         "position_count": len(positions),
@@ -332,9 +566,82 @@ def fetch_portfolio_summary(
         "cash_balance_dkk": float(cash_summary["cash_balance_dkk"]),
         "initial_cash_dkk": float(cash_summary["initial_cash_dkk"]),
         "cash_from_trades_dkk": float(cash_summary["cash_from_trades_dkk"]),
+        "cash_source": cash_summary.get("cash_source"),
+        "broker_cash_available": cash_summary.get("broker_cash_available"),
+        "broker_cash_currency": cash_summary.get("broker_cash_currency"),
+        "broker_cash_updated_at": cash_summary.get("broker_cash_updated_at"),
         "total_cost_basis_dkk": sum(float(row["cost_basis_dkk"] or 0.0) for row in positions),
         "total_unrealised_pnl_dkk": sum(float(row["unrealised_pnl_dkk"] or 0.0) for row in positions),
         "total_daily_pnl_dkk": sum(float(row["daily_pnl_dkk"] or 0.0) for row in positions),
+    }
+
+
+def fetch_portfolio_integrity_status(
+    connection: sqlite3.Connection,
+    *,
+    batch_id: str | None = None,
+    initial_cash_dkk: float = 0.0,
+) -> dict[str, Any]:
+    batch_id = batch_id or fetch_latest_batch_id(connection)
+    if not batch_id:
+        return {"healthy": True, "warnings": [], "mismatches": [], "unreconciled_orders": []}
+
+    local_positions = fetch_portfolio_positions(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        use_broker_positions=False,
+    )
+    broker_positions = _broker_position_rows(connection)
+    local_qty = {row["symbol"]: float(row["quantity"] or 0.0) for row in local_positions}
+    broker_qty = {row["symbol"]: float(row["quantity"] or 0.0) for row in broker_positions if float(row["quantity"] or 0.0) > 1e-9}
+    mismatches: list[dict[str, Any]] = []
+    for symbol in sorted(set(local_qty) | set(broker_qty)):
+        local_value = float(local_qty.get(symbol, 0.0))
+        broker_value = float(broker_qty.get(symbol, 0.0))
+        if abs(local_value - broker_value) > 1e-9:
+            mismatches.append(
+                {
+                    "symbol": symbol,
+                    "local_quantity": local_value,
+                    "broker_quantity": broker_value,
+                }
+            )
+
+    unreconciled_rows = connection.execute(
+        """
+        SELECT id, symbol, status, error_text, broker_order_id
+        FROM execution_orders
+        WHERE status IN ('broker_fill_unreconciled', 'execution_failed')
+          AND (
+              status = 'broker_fill_unreconciled'
+              OR error_text LIKE '%NotOwned%'
+          )
+        ORDER BY id DESC
+        LIMIT 20
+        """
+    ).fetchall()
+    unreconciled_orders = [dict(row) for row in unreconciled_rows]
+
+    warnings: list[str] = []
+    if mismatches:
+        sample = ", ".join(
+            f"{row['symbol']} (local {row['local_quantity']:.0f} vs broker {row['broker_quantity']:.0f})"
+            for row in mismatches[:3]
+        )
+        warnings.append(f"Broker holdings differ from local ledger for {len(mismatches)} symbol(s): {sample}.")
+    if unreconciled_orders:
+        sample = ", ".join(
+            f"{row['symbol']} [{row['status']}]"
+            for row in unreconciled_orders[:3]
+        )
+        warnings.append(f"There are {len(unreconciled_orders)} unreconciled/ownership-related live order(s): {sample}.")
+
+    return {
+        "healthy": not warnings,
+        "warnings": warnings,
+        "mismatches": mismatches,
+        "unreconciled_orders": unreconciled_orders,
     }
 
 
@@ -630,12 +937,18 @@ def record_portfolio_value_snapshot(
     recorded_at: str,
     snapshot_type: str,
     initial_cash_dkk: float = 0.0,
+    prefer_broker_cash: bool = False,
     batch_id: str | None = None,
     baseline_session_date: str | None = None,
     source: str | None = None,
     extra_payload: dict[str, Any] | None = None,
 ) -> int:
-    summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    summary = fetch_portfolio_summary(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
     payload = {
         "summary": summary,
         "snapshot_type": snapshot_type,

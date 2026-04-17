@@ -46,6 +46,8 @@ price_monitor:
 analysis_windows:
   offset_minutes_after_open: 60
   duration_minutes: 45
+  pre_sync_minutes_before_analysis: 5
+  close_offset_minutes_before_close: 60
   calendar_refresh_interval_minutes: 360
   calendar_lookback_days: 7
   calendar_lookahead_days: 45

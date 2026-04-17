@@ -83,10 +83,15 @@ def _summary_execution_stats(connection, config: dict[str, Any], start_date: dat
 
 def _summary_top_positions(connection, config: dict[str, Any]) -> list[dict[str, Any]]:
     batch_id = fetch_latest_batch_id(connection)
+    prefer_broker_cash = (
+        str(config.get("execution", {}).get("mode")) == "live"
+        and str(config.get("execution", {}).get("adapter")) == "saxo"
+    )
     positions = fetch_portfolio_positions(
         connection,
         batch_id=batch_id,
         initial_cash_dkk=float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0),
+        prefer_broker_cash=prefer_broker_cash,
     )
     return positions[:5]
 
@@ -132,7 +137,16 @@ def build_summary(
     start_date, end_date, summary_label = _period_descriptor(summary_kind, local_now, config)
     batch_id = fetch_latest_batch_id(connection)
     initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
-    portfolio_summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    prefer_broker_cash = (
+        str(config.get("execution", {}).get("mode")) == "live"
+        and str(config.get("execution", {}).get("adapter")) == "saxo"
+    )
+    portfolio_summary = fetch_portfolio_summary(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
     tax_summary = fetch_realised_tax_summary(connection, tax_year=end_date.year)
     trade_stats = _summary_trade_stats(connection, config, start_date, end_date)
     execution_stats = _summary_execution_stats(connection, config, start_date, end_date)
