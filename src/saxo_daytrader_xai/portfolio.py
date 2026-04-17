@@ -440,6 +440,51 @@ def fetch_realised_tax_summary(connection: sqlite3.Connection, tax_year: int) ->
     return dict(row) if row else {"realised_gain_dkk": 0.0, "tax_dkk": 0.0, "commission_dkk": 0.0, "trade_count": 0}
 
 
+def _tax_due_for_share_income(income_dkk: float, brackets: list[dict[str, Any]]) -> float:
+    taxable_income = max(income_dkk, 0.0)
+    tax_due = 0.0
+    lower_bound = 0.0
+    for bracket in brackets:
+        upper_raw = bracket.get("up_to_dkk")
+        upper_bound = float(upper_raw) if upper_raw not in (None, "") else None
+        rate = float(bracket["rate"])
+        if upper_bound is None:
+            tax_due += max(taxable_income - lower_bound, 0.0) * rate
+            break
+        taxable_slice = max(min(taxable_income, upper_bound) - lower_bound, 0.0)
+        tax_due += taxable_slice * rate
+        lower_bound = upper_bound
+        if taxable_income <= lower_bound:
+            break
+    return tax_due
+
+
+def fetch_unrealised_after_tax_summary(
+    connection: sqlite3.Connection,
+    config: dict[str, Any],
+    batch_id: str | None = None,
+    *,
+    initial_cash_dkk: float = 0.0,
+    tax_year: int | None = None,
+) -> dict[str, Any]:
+    effective_tax_year = int(tax_year or datetime.now(UTC).year)
+    summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    total_unrealised_pnl_dkk = float(summary["total_unrealised_pnl_dkk"] or 0.0)
+    realised_summary = fetch_realised_tax_summary(connection, tax_year=effective_tax_year)
+    realised_gain_ytd = float(realised_summary["realised_gain_dkk"] or 0.0)
+    brackets = config["taxation"]["share_income"]["brackets"]
+    tax_before = _tax_due_for_share_income(realised_gain_ytd, brackets)
+    tax_after = _tax_due_for_share_income(realised_gain_ytd + total_unrealised_pnl_dkk, brackets)
+    estimated_tax_dkk = tax_after - tax_before
+    return {
+        "tax_year": effective_tax_year,
+        "gross_unrealised_pnl_dkk": total_unrealised_pnl_dkk,
+        "estimated_tax_dkk": estimated_tax_dkk,
+        "after_tax_unrealised_pnl_dkk": total_unrealised_pnl_dkk - estimated_tax_dkk,
+        "realised_gain_ytd_dkk": realised_gain_ytd,
+    }
+
+
 def _price_monitor_timezone(config: dict[str, Any]):
     return pytz.timezone(str(config.get("price_monitor", {}).get("timezone", "Europe/Copenhagen")))
 

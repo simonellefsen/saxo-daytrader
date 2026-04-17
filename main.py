@@ -59,7 +59,22 @@ def _terminate_process_group(process: subprocess.Popen[bytes] | None, *, sig: in
     if process is None:
         return
     with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, sig)
+        try:
+            os.killpg(process.pid, sig)
+            return
+        except PermissionError:
+            pass
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        process.send_signal(sig)
+
+
+def _wait_process(process: subprocess.Popen[bytes] | None, *, timeout: float) -> int | None:
+    if process is None:
+        return None
+    try:
+        return process.wait(timeout=timeout)
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        return None
 
 
 def _spawn_process(cmd: list[str]) -> subprocess.Popen[bytes]:
@@ -96,8 +111,7 @@ def _wait_for_children(
             _clear_runtime_state(dashboard=True, scheduler=scheduler_process is None)
             if scheduler_process is not None and scheduler_code is None:
                 _terminate_process_group(scheduler_process, sig=signal.SIGTERM)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    scheduler_process.wait(timeout=5)
+                _wait_process(scheduler_process, timeout=5)
             if scheduler_process is not None:
                 _clear_runtime_state(scheduler=True)
             return int(dashboard_code)
@@ -121,8 +135,7 @@ def _wait_for_children(
                 continue
             print("Scheduler exited unexpectedly; stopping dashboard...", file=sys.stderr)
             _terminate_process_group(dashboard_process, sig=signal.SIGTERM)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                dashboard_process.wait(timeout=5)
+            _wait_process(dashboard_process, timeout=5)
             _clear_runtime_state(dashboard=True)
             return int(scheduler_code)
 
@@ -202,21 +215,20 @@ def main() -> int:
             print("Stopping scheduler...", file=sys.stderr)
             _terminate_process_group(scheduler_process, sig=signal.SIGTERM)
             _clear_runtime_state(scheduler=True)
-        try:
-            dashboard_process.wait(timeout=5)
-            if scheduler_process is not None:
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    scheduler_process.wait(timeout=5)
-            return 0
-        except subprocess.TimeoutExpired:
+        dashboard_stopped = _wait_process(dashboard_process, timeout=5) is not None
+        scheduler_stopped = (
+            _wait_process(scheduler_process, timeout=5) is not None
+            if scheduler_process is not None
+            else True
+        )
+        if not dashboard_stopped or not scheduler_stopped:
             _terminate_process_group(dashboard_process, sig=signal.SIGKILL)
             if scheduler_process is not None:
                 _terminate_process_group(scheduler_process, sig=signal.SIGKILL)
-            dashboard_process.wait()
+            _wait_process(dashboard_process, timeout=2)
             if scheduler_process is not None:
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    scheduler_process.wait(timeout=2)
-            return 0
+                _wait_process(scheduler_process, timeout=2)
+        return 0
     finally:
         _clear_runtime_state(dashboard=True, scheduler=True, launcher=True)
 

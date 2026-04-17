@@ -53,6 +53,7 @@ from saxo_daytrader_xai.portfolio import (
     fetch_portfolio_summary,
     fetch_portfolio_symbols,
     fetch_trade_ledger,
+    fetch_unrealised_after_tax_summary,
 )
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import (
@@ -231,6 +232,12 @@ init_db(connection)
 batch_id = fetch_latest_batch_id(connection)
 initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
 summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+unrealised_after_tax_summary = fetch_unrealised_after_tax_summary(
+    connection,
+    config,
+    batch_id=batch_id,
+    initial_cash_dkk=initial_cash_dkk,
+)
 goal_tracking = fetch_goal_tracking(connection, config)
 positions = fetch_portfolio_positions(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
 portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
@@ -290,7 +297,12 @@ col1.metric("Positions", summary["position_count"])
 col2.metric("Portfolio Value", _format_dkk(summary["total_market_value_dkk"]))
 col3.metric("Cash", _format_dkk(summary["cash_balance_dkk"]))
 col4.metric("Cost Basis", _format_dkk(summary["total_cost_basis_dkk"]))
-col5.metric("Unrealised P/L", _format_dkk(summary["total_unrealised_pnl_dkk"]))
+col5.metric(
+    "Unrealised P/L",
+    _format_dkk(summary["total_unrealised_pnl_dkk"]),
+    delta=f"After tax {unrealised_after_tax_summary['after_tax_unrealised_pnl_dkk']:+,.2f} DKK",
+    delta_color="off",
+)
 
 tab_labels = ["Portfolio", "Performance", "Watchlist", "News", "Market Status", "Decision Report", "Execution", "Notifications"]
 query_tab = st.query_params.get("tab", "Portfolio")
