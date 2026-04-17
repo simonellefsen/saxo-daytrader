@@ -25,6 +25,7 @@ from saxo_daytrader_xai.execution_engine import (
     fetch_invalid_simulation_trades,
     manage_live_order,
     queue_and_maybe_execute_latest_report,
+    reconcile_portfolio_to_broker,
     repair_invalid_simulation_trades,
     retry_failed_execution_orders,
     sync_broker_order_statuses,
@@ -330,11 +331,16 @@ col5.metric(
     delta=f"After tax {unrealised_after_tax_summary['after_tax_unrealised_pnl_dkk']:+,.2f} DKK",
     delta_color="off",
 )
-if summary.get("cash_source") == "broker_balance_snapshot":
+if summary.get("cash_source") in {"broker_balance_snapshot", "broker_balance_snapshot_virtual_cap"}:
     st.caption(
         f"Cash source: Saxo broker balance"
         f" ({summary.get('broker_cash_available'):.2f} {summary.get('broker_cash_currency')})"
         f" updated at {summary.get('broker_cash_updated_at')}."
+        + (
+            f" Virtual cap applied: {_format_dkk(summary.get('broker_cash_cap_dkk'))}."
+            if summary.get("cash_source") == "broker_balance_snapshot_virtual_cap"
+            else ""
+        )
     )
 if broker_account_summary:
     st.caption(
@@ -951,7 +957,7 @@ if active_tab == "Execution":
         else:
             st.info("Live orders are submitted to Saxo automatically without approval when the exchange is open. If the exchange is closed, orders wait in the queue until the next open.")
 
-    action_col1, action_col2, action_col3, action_col4, action_col5 = st.columns(5)
+    action_col1, action_col2, action_col3, action_col4, action_col5, action_col6 = st.columns(6)
     if action_col1.button("Run Queue Processor"):
         with st.spinner("Processing queued execution orders..."):
             try:
@@ -994,6 +1000,17 @@ if active_tab == "Execution":
             f"Requeued {len(retry_result['retried'])} failed orders; "
             f"skipped {len(retry_result['skipped'])} non-retryable orders"
         )
+        st.rerun()
+    if action_col6.button("Reconcile Portfolio To Saxo"):
+        with st.spinner("Reconciling local portfolio state to Saxo broker holdings..."):
+            reconcile_result = reconcile_portfolio_to_broker(config=config, connection=connection)
+        if reconcile_result["reconciled_symbols"]:
+            st.success(
+                f"Reconciled {len(reconcile_result['reconciled_symbols'])} symbol(s): "
+                + ", ".join(reconcile_result["reconciled_symbols"])
+            )
+        else:
+            st.info("No portfolio differences were found between the local ledger and Saxo broker holdings.")
         st.rerun()
 
     if failed_orders:

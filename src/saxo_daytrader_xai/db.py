@@ -379,6 +379,25 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_broker_instrument_exposures_updated
         ON broker_instrument_exposures(updated_at DESC);
 
+        CREATE TABLE IF NOT EXISTS portfolio_reconciliation_adjustments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            instrument_name TEXT,
+            isin TEXT,
+            currency TEXT,
+            quantity_delta REAL NOT NULL,
+            cost_basis_local_delta REAL NOT NULL,
+            cost_basis_dkk_delta REAL NOT NULL,
+            local_quantity_before REAL NOT NULL,
+            broker_quantity_target REAL NOT NULL,
+            note TEXT,
+            raw_payload_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_portfolio_reconciliation_adjustments_symbol
+        ON portfolio_reconciliation_adjustments(symbol, created_at DESC);
+
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,

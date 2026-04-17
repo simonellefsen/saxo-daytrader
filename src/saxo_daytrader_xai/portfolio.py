@@ -209,11 +209,35 @@ def _broker_exposure_rows(connection: sqlite3.Connection) -> dict[str, dict[str,
     return {row["symbol"]: dict(row) for row in rows}
 
 
+def _reconciliation_adjustment_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            created_at,
+            symbol,
+            instrument_name,
+            isin,
+            currency,
+            quantity_delta,
+            cost_basis_local_delta,
+            cost_basis_dkk_delta,
+            local_quantity_before,
+            broker_quantity_target,
+            note
+        FROM portfolio_reconciliation_adjustments
+        ORDER BY created_at, id
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def fetch_cash_summary(
     connection: sqlite3.Connection,
     *,
     initial_cash_dkk: float = 0.0,
     prefer_broker_cash: bool = False,
+    broker_cash_cap_dkk: float | None = None,
+    invested_market_value_dkk: float = 0.0,
 ) -> dict[str, Any]:
     cash_from_trades = 0.0
     invalid_trade_ids: list[int] = []
@@ -234,15 +258,26 @@ def fetch_cash_summary(
         broker_currency = str(broker_balance.get("currency") or "DKK")
         broker_cash_available = float(broker_balance.get("cash_available_for_trading") or 0.0)
         broker_cash_balance_dkk = broker_cash_available * fx_rate_to_dkk(broker_currency, fx_snapshot)
+        effective_cash_balance_dkk = broker_cash_balance_dkk
+        cash_source = "broker_balance_snapshot"
+        if broker_cash_cap_dkk not in (None, 0):
+            virtual_cash_overlay_dkk = float(broker_cash_cap_dkk or 0.0) + cash_from_trades
+            effective_cash_balance_dkk = min(
+                broker_cash_balance_dkk,
+                max(virtual_cash_overlay_dkk, 0.0),
+            )
+            cash_source = "broker_balance_snapshot_virtual_cap"
         return {
             "initial_cash_dkk": float(initial_cash_dkk or 0.0),
             "cash_from_trades_dkk": cash_from_trades,
-            "cash_balance_dkk": broker_cash_balance_dkk,
+            "cash_balance_dkk": effective_cash_balance_dkk,
             "ignored_invalid_trade_ids": invalid_trade_ids,
-            "cash_source": "broker_balance_snapshot",
+            "cash_source": cash_source,
             "broker_cash_available": broker_cash_available,
+            "broker_cash_balance_dkk": broker_cash_balance_dkk,
             "broker_cash_currency": broker_currency,
             "broker_cash_updated_at": broker_balance.get("updated_at"),
+            "broker_cash_cap_dkk": float(broker_cash_cap_dkk or 0.0),
         }
     return {
         "initial_cash_dkk": float(initial_cash_dkk or 0.0),
@@ -251,8 +286,10 @@ def fetch_cash_summary(
         "ignored_invalid_trade_ids": invalid_trade_ids,
         "cash_source": "local_ledger_overlay",
         "broker_cash_available": None,
+        "broker_cash_balance_dkk": None,
         "broker_cash_currency": None,
         "broker_cash_updated_at": None,
+        "broker_cash_cap_dkk": float(broker_cash_cap_dkk or 0.0),
     }
 
 
@@ -268,6 +305,7 @@ def _effective_positions(
     latest_price_state = _latest_price_state_by_symbol(connection)
     broker_rows = _broker_position_rows(connection) if use_broker_positions else []
     broker_exposure_rows = _broker_exposure_rows(connection) if use_broker_positions else {}
+    reconciliation_adjustments = _reconciliation_adjustment_rows(connection)
     broker_account_summary = _broker_account_row(connection) if use_broker_positions else None
     account_currency = str((broker_account_summary or {}).get("account_currency") or "DKK")
     account_fx_snapshot = fetch_ecb_fx_rates() if broker_account_summary else None
@@ -355,6 +393,55 @@ def _effective_positions(
                 float(state.get("cost_basis_local_total") or 0.0) - float(trade.get("cost_basis_sold_local") or 0.0),
                 0.0,
             )
+
+    for adjustment in reconciliation_adjustments:
+        symbol = str(adjustment["symbol"])
+        quantity_delta = float(adjustment["quantity_delta"] or 0.0)
+        if abs(quantity_delta) <= 1e-9:
+            continue
+        state = states.setdefault(
+            symbol,
+            {
+                "instrument_name": adjustment.get("instrument_name") or symbol,
+                "symbol": symbol,
+                "isin": adjustment.get("isin"),
+                "figi": None,
+                "quantity": 0.0,
+                "currency": adjustment.get("currency"),
+                "open_price_local": None,
+                "current_price_local": None,
+                "cost_basis_local": None,
+                "cost_basis_dkk": 0.0,
+                "cost_basis_local_total": 0.0,
+                "market_value_local": 0.0,
+                "market_value_dkk": 0.0,
+                "unrealised_pnl_dkk": 0.0,
+                "daily_pnl_dkk": 0.0,
+                "allocation_pct": 0.0,
+                "asset_class": "Equity",
+                "market_status": "Portfolio reconciliation",
+                "value_date": None,
+                "latest_fx_rate": 1.0,
+                "base_quantity": 0.0,
+                "base_daily_pnl_dkk": 0.0,
+            },
+        )
+        state["quantity"] = max(float(state.get("quantity") or 0.0) + quantity_delta, 0.0)
+        state["cost_basis_dkk"] = max(
+            float(state.get("cost_basis_dkk") or 0.0) + float(adjustment.get("cost_basis_dkk_delta") or 0.0),
+            0.0,
+        )
+        state["cost_basis_local_total"] = max(
+            float(state.get("cost_basis_local_total") or 0.0) + float(adjustment.get("cost_basis_local_delta") or 0.0),
+            0.0,
+        )
+        state["market_status"] = "Portfolio reconciliation"
+        if adjustment.get("instrument_name"):
+            state["instrument_name"] = adjustment["instrument_name"]
+        if adjustment.get("isin"):
+            state["isin"] = adjustment["isin"]
+        if adjustment.get("currency"):
+            state["currency"] = adjustment["currency"]
 
     for broker in broker_rows:
         symbol = str(broker["symbol"])
@@ -486,11 +573,14 @@ def _effective_positions(
         )
 
     invested_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
+    broker_cash_cap_dkk = float(initial_cash_dkk or 0.0) if prefer_broker_cash else None
     total_portfolio_value_dkk = invested_market_value_dkk + float(
         fetch_cash_summary(
             connection,
             initial_cash_dkk=initial_cash_dkk,
             prefer_broker_cash=prefer_broker_cash,
+            broker_cash_cap_dkk=broker_cash_cap_dkk,
+            invested_market_value_dkk=invested_market_value_dkk,
         )["cash_balance_dkk"]
     )
     for row in positions:
@@ -557,6 +647,8 @@ def fetch_portfolio_summary(
         connection,
         initial_cash_dkk=initial_cash_dkk,
         prefer_broker_cash=prefer_broker_cash,
+        broker_cash_cap_dkk=float(initial_cash_dkk or 0.0) if prefer_broker_cash else None,
+        invested_market_value_dkk=invested_market_value_dkk,
     )
     return {
         "batch_id": batch_id,
@@ -615,7 +707,7 @@ def fetch_portfolio_integrity_status(
         WHERE status IN ('broker_fill_unreconciled', 'execution_failed')
           AND (
               status = 'broker_fill_unreconciled'
-              OR error_text LIKE '%NotOwned%'
+              OR (error_text LIKE '%NotOwned%' AND error_text NOT LIKE '%reconciled to Saxo broker holdings%')
           )
         ORDER BY id DESC
         LIMIT 20

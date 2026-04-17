@@ -176,6 +176,34 @@ def _evaluate_live_buy_cash_gate(order: dict[str, Any], config: dict[str, Any], 
     }
 
 
+def _evaluate_virtual_buy_budget_gate(order: dict[str, Any], config: dict[str, Any], connection) -> dict[str, Any]:
+    batch_id = fetch_latest_batch_id(connection)
+    initial_cash_dkk = _initial_cash_dkk(config)
+    prefer_broker_cash = _prefer_broker_state(config)
+    portfolio_summary = fetch_portfolio_summary(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        prefer_broker_cash=prefer_broker_cash,
+    )
+    fx_snapshot = fetch_ecb_fx_rates()
+    fx_rate = fx_rate_to_dkk(order["currency"], fx_snapshot)
+    gross_local = float(order["price_local"] or 0.0) * float(order["quantity"] or 0.0)
+    gross_dkk = gross_local * fx_rate
+    commission = _calculate_buy_commission(order["symbol"], gross_local, gross_dkk, order["currency"], fx_rate, config)
+    required_dkk = gross_dkk + commission["commission_dkk"]
+    available_dkk = float(portfolio_summary["cash_balance_dkk"] or 0.0)
+    capital_limit_dkk = _virtual_cash_cap_dkk(config)
+    return {
+        "allowed": available_dkk + 1e-9 >= required_dkk,
+        "required_dkk": required_dkk,
+        "available_dkk": available_dkk,
+        "capital_limit_dkk": capital_limit_dkk,
+        "invested_market_value_dkk": float(portfolio_summary["invested_market_value_dkk"] or 0.0),
+        "cash_source": portfolio_summary.get("cash_source"),
+    }
+
+
 def _estimate_price_and_fx(
     symbol: str,
     position_map: dict[str, dict[str, Any]],
@@ -260,6 +288,16 @@ def _whole_share_quantity(quantity: float) -> int:
 
 def _initial_cash_dkk(config: dict[str, Any]) -> float:
     return float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
+
+
+def _virtual_cash_cap_dkk(config: dict[str, Any]) -> float:
+    portfolio_cfg = config.get("portfolio", {})
+    return float(
+        portfolio_cfg.get("virtual_cap_dkk")
+        or portfolio_cfg.get("live_virtual_cap_dkk")
+        or portfolio_cfg.get("initial_cash_dkk", 0.0)
+        or 0.0
+    )
 
 
 def _max_affordable_buy_quantity(
@@ -486,13 +524,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     max_position_weight = float(config["risk"]["max_position_weight"])
     min_trade_value_dkk = float(config["execution"]["min_trade_value_dkk"])
     remaining_capacity = _remaining_daily_order_capacity(connection, config)
-    remaining_cash_dkk = float(
-        fetch_cash_summary(
-            connection,
-            initial_cash_dkk=initial_cash_dkk,
-            prefer_broker_cash=prefer_broker_cash,
-        )["cash_balance_dkk"]
-    )
+    remaining_cash_dkk = float(portfolio_summary["cash_balance_dkk"] or 0.0)
     approval_required = _approval_required_for_order(config)
 
     for suggestion in suggestions:
@@ -1825,7 +1857,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 (float(normalized_quantity), order_id),
             )
             resolved_connection.commit()
-        if order["status"] not in {"pending_execution", "pending_approval", "waiting_for_market_open"}:
+        if order["status"] not in {"pending_execution", "pending_approval", "waiting_for_market_open", "waiting_for_virtual_cash_budget"}:
             return {"status": order["status"], "order_id": order_id}
         if order["mode"] == "live" and order["approval_required"] and not approved:
             return {"status": "approval_required", "order_id": order_id}
@@ -1900,6 +1932,34 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
             try:
                 session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
                 if order["action"] == "BUY" and _cash_gate_enabled(resolved_config):
+                    virtual_budget_gate = _evaluate_virtual_buy_budget_gate(order, resolved_config, resolved_connection)
+                    if not virtual_budget_gate["allowed"]:
+                        error_text = (
+                            f"Waiting for virtual cash budget before buying {order['symbol']}. "
+                            f"Required {virtual_budget_gate['required_dkk']:.2f} DKK, "
+                            f"virtual cash available {virtual_budget_gate['available_dkk']:.2f} DKK, "
+                            f"capital limit {virtual_budget_gate['capital_limit_dkk']:.2f} DKK."
+                        )
+                        resolved_connection.execute(
+                            """
+                            UPDATE execution_orders
+                            SET status = ?, error_text = ?, execution_result_json = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "waiting_for_virtual_cash_budget",
+                                error_text,
+                                json.dumps({"virtual_budget_gate": virtual_budget_gate}, ensure_ascii=False, sort_keys=True),
+                                order_id,
+                            ),
+                        )
+                        resolved_connection.commit()
+                        return {
+                            "status": "waiting_for_virtual_cash_budget",
+                            "order_id": order_id,
+                            "error": error_text,
+                            "virtual_budget_gate": virtual_budget_gate,
+                        }
                     cash_gate = _evaluate_live_buy_cash_gate(order, resolved_config, session)
                     if not cash_gate["allowed"]:
                         error_text = (
@@ -2242,7 +2302,12 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
         if report and report["status"] == "completed":
             orders = _create_or_fetch_orders(resolved_connection, resolved_config, report)
         executed = []
-        executable_statuses = {"pending_execution", "waiting_for_market_open", "waiting_for_cash_settlement"}
+        executable_statuses = {
+            "pending_execution",
+            "waiting_for_market_open",
+            "waiting_for_cash_settlement",
+            "waiting_for_virtual_cash_budget",
+        }
         auto_execute_queue = (
             (
                 resolved_config["execution"]["mode"] == "simulation"
@@ -2402,6 +2467,133 @@ def repair_invalid_simulation_trades(*, connection, config: dict[str, Any] | Non
             "ledger_rows_repaired": repaired_ids,
             "execution_orders_repaired": repaired_order_ids,
         }
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
+def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        batch_id = fetch_latest_batch_id(resolved_connection)
+        initial_cash_dkk = _initial_cash_dkk(resolved_config)
+        local_positions = fetch_portfolio_positions(
+            resolved_connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            use_broker_positions=False,
+        )
+        local_by_symbol = {row["symbol"]: row for row in local_positions}
+        broker_rows = resolved_connection.execute(
+            """
+            SELECT symbol, instrument_name, isin, currency, quantity, open_price_including_costs_local, open_price_local
+            FROM broker_position_snapshots
+            """
+        ).fetchall()
+        broker_by_symbol = {row["symbol"]: dict(row) for row in broker_rows}
+        symbols = sorted(set(local_by_symbol) | set(broker_by_symbol))
+        fx_snapshot = fetch_ecb_fx_rates()
+        created_at = datetime.now(UTC).isoformat(timespec="seconds")
+        adjustments: list[dict[str, Any]] = []
+
+        for symbol in symbols:
+            local_row = local_by_symbol.get(symbol)
+            broker_row = broker_by_symbol.get(symbol)
+            local_quantity = float((local_row or {}).get("quantity") or 0.0)
+            broker_quantity = float((broker_row or {}).get("quantity") or 0.0)
+            quantity_delta = broker_quantity - local_quantity
+            if abs(quantity_delta) <= 1e-9:
+                continue
+
+            currency = str((broker_row or local_row or {}).get("currency") or "DKK")
+            instrument_name = (broker_row or local_row or {}).get("instrument_name") or symbol
+            isin = (broker_row or local_row or {}).get("isin")
+            fx_rate = fx_rate_to_dkk(currency, fx_snapshot)
+
+            if quantity_delta > 0:
+                paid_price_local = float(
+                    (broker_row or {}).get("open_price_including_costs_local")
+                    or (broker_row or {}).get("open_price_local")
+                    or (local_row or {}).get("paid_price_local")
+                    or 0.0
+                )
+                cost_basis_local_delta = quantity_delta * paid_price_local
+                cost_basis_dkk_delta = cost_basis_local_delta * fx_rate
+            else:
+                local_cost_basis_dkk = float((local_row or {}).get("cost_basis_dkk") or 0.0)
+                local_cost_basis_local_total = float((local_row or {}).get("cost_basis_local_total") or 0.0)
+                unit_cost_dkk = local_cost_basis_dkk / local_quantity if local_quantity > 0 else 0.0
+                unit_cost_local = local_cost_basis_local_total / local_quantity if local_quantity > 0 else 0.0
+                cost_basis_dkk_delta = quantity_delta * unit_cost_dkk
+                cost_basis_local_delta = quantity_delta * unit_cost_local
+
+            payload = {
+                "symbol": symbol,
+                "instrument_name": instrument_name,
+                "isin": isin,
+                "currency": currency,
+                "quantity_delta": quantity_delta,
+                "cost_basis_local_delta": cost_basis_local_delta,
+                "cost_basis_dkk_delta": cost_basis_dkk_delta,
+                "local_quantity_before": local_quantity,
+                "broker_quantity_target": broker_quantity,
+                "note": "Reconciled local portfolio state to Saxo broker holdings.",
+            }
+            resolved_connection.execute(
+                """
+                INSERT INTO portfolio_reconciliation_adjustments (
+                    created_at, symbol, instrument_name, isin, currency, quantity_delta,
+                    cost_basis_local_delta, cost_basis_dkk_delta, local_quantity_before,
+                    broker_quantity_target, note, raw_payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    symbol,
+                    instrument_name,
+                    isin,
+                    currency,
+                    quantity_delta,
+                    cost_basis_local_delta,
+                    cost_basis_dkk_delta,
+                    local_quantity,
+                    broker_quantity,
+                    payload["note"],
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            adjustments.append(payload)
+
+        if adjustments:
+            affected_symbols = tuple({row["symbol"] for row in adjustments})
+            placeholders = ",".join("?" for _ in affected_symbols)
+            resolved_connection.execute(
+                f"""
+                UPDATE execution_orders
+                SET status = CASE
+                        WHEN status = 'broker_fill_unreconciled' THEN 'reconciled_to_broker'
+                        ELSE status
+                    END,
+                    error_text = CASE
+                        WHEN error_text IS NULL OR error_text = '' THEN 'Resolved by portfolio reconciliation to Saxo broker holdings.'
+                        ELSE error_text || ' | reconciled to Saxo broker holdings'
+                    END
+                WHERE symbol IN ({placeholders})
+                  AND (
+                      status = 'broker_fill_unreconciled'
+                      OR (status = 'execution_failed' AND error_text LIKE '%NotOwned%')
+                  )
+                """,
+                affected_symbols,
+            )
+
+        append_audit_log(
+            resolved_connection,
+            "portfolio_reconciled_to_broker",
+            {"created_at": created_at, "adjustments": adjustments},
+        )
+        resolved_connection.commit()
+        return {"status": "ok", "adjustments": adjustments, "reconciled_symbols": [row["symbol"] for row in adjustments]}
     finally:
         if should_close:
             resolved_connection.close()
