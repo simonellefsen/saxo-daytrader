@@ -221,24 +221,27 @@ def calculate_sell_outcome(
         if current_price <= 0:
             raise ValueError("current_price must be greater than 0")
 
-        snapshot = _fetch_position_snapshot(resolved_connection, symbol, batch_id=batch_id)
-        effective_position = _fetch_effective_position(resolved_connection, symbol, batch_id=batch_id)
-        if snapshot is None or effective_position is None:
-            raise ValueError(f"No active position found for symbol {symbol}")
-        if qty_to_sell > float(effective_position["quantity"]) + 1e-9:
-            raise ValueError(
-                f"Cannot sell {qty_to_sell}; only {float(effective_position['quantity'])} available for {symbol}"
-            )
-
         open_lots = _fetch_open_lots(resolved_connection, symbol)
         if not open_lots:
             raise ValueError(f"No open lots available for symbol {symbol}")
+        open_lot_quantity = sum(float(row["quantity_remaining"] or 0.0) for row in open_lots)
+        if qty_to_sell > open_lot_quantity + 1e-9:
+            raise ValueError(
+                f"Cannot sell {qty_to_sell}; only {open_lot_quantity} open lot quantity available for {symbol}"
+            )
 
-        currency = snapshot["currency"]
+        snapshot = _fetch_position_snapshot(resolved_connection, symbol, batch_id=batch_id)
+        effective_position = _fetch_effective_position(resolved_connection, symbol, batch_id=batch_id)
+
+        currency = (
+            (snapshot or {}).get("currency")
+            or (effective_position or {}).get("currency")
+            or open_lots[0]["currency"]
+        )
         current_fx_rate = 1.0
         if currency != resolved_config["portfolio"]["base_currency"]:
-            market_value_local = effective_position.get("market_value_local")
-            market_value_dkk = effective_position.get("market_value_dkk")
+            market_value_local = (effective_position or {}).get("market_value_local")
+            market_value_dkk = (effective_position or {}).get("market_value_dkk")
             if market_value_local not in (None, 0) and market_value_dkk not in (None, 0):
                 current_fx_rate = float(market_value_dkk) / float(market_value_local)
             else:
@@ -279,8 +282,8 @@ def calculate_sell_outcome(
 
         return {
             "symbol": symbol,
-            "isin": snapshot["isin"],
-            "instrument_name": snapshot.get("instrument_name"),
+            "isin": (snapshot or {}).get("isin") or open_lots[0].get("isin"),
+            "instrument_name": (snapshot or {}).get("instrument_name") or open_lots[0].get("instrument_name") or symbol,
             "currency": currency,
             "qty_to_sell": qty_to_sell,
             "current_price": current_price,
@@ -307,7 +310,7 @@ def calculate_sell_outcome(
             "realised_share_income_before_trade_DKK": realised_share_income_before,
             "realised_share_income_after_trade_DKK": realised_share_income_before + realised_gain_dkk,
             "lot_allocations": allocation_result["allocations"],
-            "batch_id": snapshot["batch_id"],
+            "batch_id": (snapshot or {}).get("batch_id") or open_lots[0].get("batch_id") or batch_id or fetch_latest_batch_id(resolved_connection),
         }
     finally:
         if should_close:

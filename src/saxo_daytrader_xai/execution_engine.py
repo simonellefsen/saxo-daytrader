@@ -1420,7 +1420,8 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                   'broker_partially_filled',
                   'broker_amended',
                   'broker_replace_requested',
-                  'broker_cancel_requested'
+                  'broker_cancel_requested',
+                  'broker_fill_unreconciled'
               )
             ORDER BY id ASC
             LIMIT ?
@@ -1538,6 +1539,8 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                     "broker_price_local": broker_price,
                     "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 }
+                payload.pop("reconciliation_error", None)
+                payload.pop("sync_error", None)
 
                 if activity_status == "FinalFill" and activity_substatus == "Confirmed":
                     try:
@@ -1563,7 +1566,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                         resolved_connection.execute(
                             """
                             UPDATE execution_orders
-                            SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
+                            SET status = ?, ledger_id = COALESCE(?, ledger_id), error_text = NULL, execution_result_json = ?
                             WHERE id = ?
                             """,
                             ("executed", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
@@ -1625,7 +1628,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                         resolved_connection.execute(
                             """
                             UPDATE execution_orders
-                            SET status = ?, ledger_id = COALESCE(?, ledger_id), execution_result_json = ?
+                            SET status = ?, ledger_id = COALESCE(?, ledger_id), error_text = NULL, execution_result_json = ?
                             WHERE id = ?
                             """,
                             ("broker_partially_filled", result["ledger_id"], json.dumps(payload, ensure_ascii=False, sort_keys=True), order["id"]),
@@ -2491,7 +2494,19 @@ def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None =
             """
         ).fetchall()
         broker_by_symbol = {row["symbol"]: dict(row) for row in broker_rows}
-        symbols = sorted(set(local_by_symbol) | set(broker_by_symbol))
+        not_owned_symbols = {
+            str(row["symbol"])
+            for row in resolved_connection.execute(
+                """
+                SELECT DISTINCT symbol
+                FROM execution_orders
+                WHERE status = 'execution_failed'
+                  AND error_text LIKE '%NotOwned%'
+                  AND error_text NOT LIKE '%reconciled to Saxo broker holdings%'
+                """
+            ).fetchall()
+        }
+        symbols = sorted(set(local_by_symbol) | set(broker_by_symbol) | not_owned_symbols)
         fx_snapshot = fetch_ecb_fx_rates()
         created_at = datetime.now(UTC).isoformat(timespec="seconds")
         adjustments: list[dict[str, Any]] = []
@@ -2564,8 +2579,8 @@ def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None =
             )
             adjustments.append(payload)
 
-        if adjustments:
-            affected_symbols = tuple({row["symbol"] for row in adjustments})
+        affected_symbols = tuple({row["symbol"] for row in adjustments})
+        if affected_symbols:
             placeholders = ",".join("?" for _ in affected_symbols)
             resolved_connection.execute(
                 f"""
@@ -2585,6 +2600,23 @@ def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None =
                   )
                 """,
                 affected_symbols,
+            )
+        aligned_symbols = tuple(symbols)
+        if aligned_symbols:
+            placeholders = ",".join("?" for _ in aligned_symbols)
+            resolved_connection.execute(
+                f"""
+                UPDATE execution_orders
+                SET error_text = CASE
+                        WHEN error_text IS NULL OR error_text = '' THEN 'Resolved by portfolio reconciliation to Saxo broker holdings.'
+                        ELSE error_text || ' | reconciled to Saxo broker holdings'
+                    END
+                WHERE symbol IN ({placeholders})
+                  AND status = 'execution_failed'
+                  AND error_text LIKE '%NotOwned%'
+                  AND error_text NOT LIKE '%reconciled to Saxo broker holdings%'
+                """,
+                aligned_symbols,
             )
 
         append_audit_log(

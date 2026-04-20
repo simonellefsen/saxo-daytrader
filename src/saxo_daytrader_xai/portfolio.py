@@ -718,10 +718,13 @@ def fetch_portfolio_integrity_status(
     warnings: list[str] = []
     if mismatches:
         sample = ", ".join(
-            f"{row['symbol']} (local {row['local_quantity']:.0f} vs broker {row['broker_quantity']:.0f})"
+            f"{row['symbol']} (local ledger {row['local_quantity']:.0f} vs broker {row['broker_quantity']:.0f})"
             for row in mismatches[:3]
         )
-        warnings.append(f"Broker holdings differ from local ledger for {len(mismatches)} symbol(s): {sample}.")
+        warnings.append(
+            f"Broker holdings differ from local ledger/tax lots for {len(mismatches)} symbol(s): {sample}. "
+            "The portfolio table displays Saxo broker holdings when live broker snapshots are available."
+        )
     if unreconciled_orders:
         sample = ", ".join(
             f"{row['symbol']} [{row['status']}]"
