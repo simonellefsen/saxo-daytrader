@@ -191,6 +191,10 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     market_news = fetch_market_intelligence(config, portfolio_symbols[:8], watchlist_symbols[:8])
     market_status_rows = get_market_status(config)
     analysis_summary = summarize_analysis_window(market_status_rows)
+    market_status_by_code = {
+        str(row.get("code") or "").lower(): row
+        for row in market_status_rows
+    }
     broker_account = fetch_broker_account_summary(connection)
     live_quotes = fetch_live_prices(
         portfolio_symbols[:10],
@@ -213,6 +217,14 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
                 "allocation_pct": row["allocation_pct"],
                 "current_price_local": quote.get("current_price", row["current_price_local"]),
                 "daily_change_pct": quote.get("change_pct"),
+                "market_tradable_now": bool(
+                    market_status_by_code.get(str(row["symbol"]).split(":", 1)[1].lower(), {}).get("is_tradable")
+                ) if ":" in str(row["symbol"]) else None,
+                "market_status_reason": (
+                    market_status_by_code.get(str(row["symbol"]).split(":", 1)[1].lower(), {}).get("status_reason")
+                    if ":" in str(row["symbol"])
+                    else None
+                ),
             }
         )
 
@@ -245,6 +257,7 @@ Core goal for every decision:
 
 Hard rules:
 - Never trade or recommend trading these excluded symbols: {excluded_symbols_text}.
+- Never recommend a BUY or SELL for a symbol whose market is not currently tradable in the supplied market status context. Use HOLD or NO_ACTION instead.
 - Never short. Long-only portfolio.
 - No single position may exceed 15%% of portfolio value after the proposed trade.
 - Treat all pnl, commission, and taxation impacts in DKK.

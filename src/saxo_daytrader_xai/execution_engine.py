@@ -534,6 +534,20 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         symbol = suggestion["symbol"]
         if action not in {"BUY", "SELL"}:
             continue
+        market_row = _market_status_for_symbol(symbol, config)
+        if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
+            append_audit_log(
+                connection,
+                "execution_order_skipped_market_closed",
+                {
+                    "report_id": report["id"],
+                    "symbol": symbol,
+                    "action": action,
+                    "status_reason": market_row.get("status_reason"),
+                    "next_open": market_row.get("next_open"),
+                },
+            )
+            continue
         requested_weight_pct = float(suggestion["target_weight_pct"])
         if requested_weight_pct > 1.0:
             requested_weight_pct = requested_weight_pct / 100.0
