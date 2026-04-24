@@ -700,8 +700,9 @@ def fetch_portfolio_integrity_status(
                     "broker_quantity": broker_value,
                 }
             )
+    mismatch_symbols = {row["symbol"] for row in mismatches}
 
-    unreconciled_rows = connection.execute(
+    candidate_rows = connection.execute(
         """
         SELECT id, symbol, status, error_text, broker_order_id
         FROM execution_orders
@@ -714,7 +715,25 @@ def fetch_portfolio_integrity_status(
         LIMIT 20
         """
     ).fetchall()
-    unreconciled_orders = [dict(row) for row in unreconciled_rows]
+    unreconciled_orders: list[dict[str, Any]] = []
+    for row in candidate_rows:
+        item = dict(row)
+        symbol = str(item.get("symbol") or "")
+        if item["status"] == "execution_failed" and symbol not in mismatch_symbols:
+            later_executed = connection.execute(
+                """
+                SELECT 1
+                FROM execution_orders
+                WHERE symbol = ?
+                  AND id > ?
+                  AND status = 'executed'
+                LIMIT 1
+                """,
+                (symbol, int(item["id"])),
+            ).fetchone()
+            if later_executed:
+                continue
+        unreconciled_orders.append(item)
 
     warnings: list[str] = []
     if mismatches:

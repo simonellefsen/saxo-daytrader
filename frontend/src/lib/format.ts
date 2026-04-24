@@ -53,6 +53,20 @@ export function formatTimestamp(value: unknown): string {
   }).format(parsed);
 }
 
+export function formatTimestampPrecise(value: unknown): string {
+  if (!value || typeof value !== "string") {
+    return "n/a";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return String(value);
+  }
+  return new Intl.DateTimeFormat("da-DK", {
+    dateStyle: "short",
+    timeStyle: "medium",
+  }).format(parsed);
+}
+
 export function toYahooFinanceUrl(symbol: string): string {
   const [ticker, market] = symbol.split(":");
   const upperTicker = ticker.toUpperCase();

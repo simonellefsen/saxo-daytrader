@@ -281,6 +281,14 @@ select {
   border: 1px solid var(--border);
 }
 
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover {
+  background: rgba(15, 92, 115, 0.04);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -318,6 +326,26 @@ th {
 
 .history-row.active {
   background: rgba(15, 92, 115, 0.1);
+}
+
+.status-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.22rem 0.55rem;
+  font-size: 0.78rem;
+  border: 1px solid var(--border);
+}
+
+.status-chip.good {
+  color: var(--good);
+  background: var(--good-soft);
+  border-color: rgba(15, 138, 75, 0.18);
+}
+
+.status-chip.neutral {
+  color: var(--muted);
+  background: #f8fafc;
 }
 
 .muted {
@@ -406,6 +434,123 @@ th {
   gap: 0.4rem;
 }
 
+.sparkline {
+  width: 120px;
+  height: 32px;
+  display: block;
+}
+
+.json-details {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+  background: rgba(255,255,255,0.75);
+}
+
+.json-details summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+}
+
+.overlay-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(10, 17, 28, 0.45);
+  backdrop-filter: blur(6px);
+}
+
+.drawer {
+  position: relative;
+  width: min(1400px, calc(100vw - 2rem));
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  border-radius: 24px;
+  background: var(--panel-strong);
+  box-shadow: 0 32px 80px rgba(16, 25, 35, 0.3);
+  padding: 1rem;
+}
+
+.drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.drawer-header h2 {
+  margin: 0;
+}
+
+.drawer-header p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+}
+
+.ladder-controls {
+  justify-content: space-between;
+}
+
+.toggle {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  color: var(--muted);
+}
+
+.ladder-grid {
+  align-items: start;
+}
+
+.chart-panel {
+  min-width: 0;
+}
+
+.ladder-chart svg {
+  height: 360px;
+}
+
+.marker-panel .mini-card {
+  position: sticky;
+  top: 0;
+}
+
+.code-block.compact {
+  max-height: 340px;
+  margin-top: 0.75rem;
+}
+
+.chart-marker {
+  cursor: pointer;
+}
+
+.status-row.status-executed {
+  background: rgba(15, 138, 75, 0.05);
+}
+
+.status-row.status-pending-execution,
+.status-row.status-submitted-to-broker,
+.status-row.status-broker-working {
+  background: rgba(245, 158, 11, 0.06);
+}
+
+.status-row.status-execution-failed,
+.status-row.status-broker-fill-unreconciled {
+  background: rgba(180, 35, 24, 0.06);
+}
+
 .input {
   width: 100%;
   border-radius: 10px;
@@ -424,5 +569,11 @@ th {
 
   .shell {
     padding: 1rem;
+  }
+
+  .drawer {
+    width: calc(100vw - 1rem);
+    max-height: calc(100vh - 1rem);
+    padding: 0.75rem;
   }
 }

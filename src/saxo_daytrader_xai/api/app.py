@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from saxo_daytrader_xai.execution_engine import (
     sync_broker_order_statuses,
 )
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
+from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token, get_chart_samples, lookup_instrument
 from saxo_daytrader_xai.portfolio import (
     fetch_goal_tracking,
     fetch_portfolio_integrity_status,
@@ -83,6 +85,17 @@ def _history_start_at(range_key: str, end_at: datetime) -> str | None:
     if normalized == "YTD":
         return datetime(end_at.year, 1, 1, tzinfo=UTC).isoformat(timespec="seconds")
     return None
+
+
+def _parse_json_text(value: Any) -> Any:
+    if not value:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def create_app(config_path: str | None = None) -> FastAPI:
@@ -148,6 +161,356 @@ def create_app(config_path: str | None = None) -> FastAPI:
             "failed": sum(1 for row in orders if row.get("status") == "execution_failed"),
         }
 
+    active_order_statuses = {
+        "pending_execution",
+        "pending_approval",
+        "waiting_for_market_open",
+        "waiting_for_cash_settlement",
+        "waiting_for_virtual_cash_budget",
+        "submitted_to_broker",
+        "broker_working",
+        "broker_amended",
+        "broker_partially_filled",
+        "broker_replace_requested",
+        "broker_cancel_requested",
+    }
+
+    def ladder_status_by_symbol(connection) -> dict[str, dict[str, Any]]:
+        rows = connection.execute(
+            """
+            SELECT symbol, status, strategy_type, strategy_role
+            FROM execution_orders
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        output: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            record = output.setdefault(
+                str(row["symbol"]),
+                {
+                    "active_orders": 0,
+                    "active_stop_orders": 0,
+                    "active_take_profit_orders": 0,
+                    "filled_entry_rungs": 0,
+                    "latest_strategy_type": None,
+                },
+            )
+            status = str(row["status"] or "")
+            strategy_type = str(row["strategy_type"] or "") or None
+            strategy_role = str(row["strategy_role"] or "") or None
+            if strategy_type:
+                record["latest_strategy_type"] = strategy_type
+            if status in active_order_statuses:
+                record["active_orders"] += 1
+                if strategy_role == "stop_loss":
+                    record["active_stop_orders"] += 1
+                elif strategy_role == "take_profit":
+                    record["active_take_profit_orders"] += 1
+            if status == "executed" and strategy_role == "entry":
+                record["filled_entry_rungs"] += 1
+        for symbol, record in output.items():
+            trailing = bool(record["active_stop_orders"])
+            if record["active_orders"]:
+                status_text = f"{record['active_orders']} active"
+                if trailing:
+                    status_text += " • trailing"
+            elif record["filled_entry_rungs"]:
+                status_text = f"{record['filled_entry_rungs']} filled"
+            else:
+                status_text = "idle"
+            record["text"] = status_text
+            record["trailing"] = trailing
+        return output
+
+    def _chart_series_for_symbol(config: dict[str, Any], symbol: str, *, range_key: str, first_event_at: datetime | None) -> tuple[list[dict[str, Any]], str | None]:
+        execution_cfg = config.get("execution", {})
+        if str(execution_cfg.get("adapter") or "").lower() != "saxo":
+            return [], "Chart unavailable: non-Saxo adapter."
+        try:
+            session = ensure_access_token(config, config["saxo"].get("session_path"))
+            instrument = lookup_instrument(symbol, config, session)
+        except Exception as exc:  # noqa: BLE001
+            return [], str(exc)
+
+        now = datetime.now(UTC)
+        normalized = str(range_key or "SESSION").upper()
+        if normalized == "1H":
+            horizon_minutes = 1
+            count = 60
+        elif normalized == "4H":
+            horizon_minutes = 1
+            count = 240
+        elif normalized == "SESSION":
+            age_minutes = 240
+            if first_event_at is not None:
+                age_minutes = max(int((now - first_event_at).total_seconds() // 60) + 30, 60)
+            if age_minutes <= 360:
+                horizon_minutes = 1
+            elif age_minutes <= 1440:
+                horizon_minutes = 5
+            elif age_minutes <= 10080:
+                horizon_minutes = 30
+            else:
+                horizon_minutes = 60
+            count = min(max(age_minutes // max(horizon_minutes, 1), 60), 1000)
+        else:
+            horizon_minutes = 5
+            count = 288
+
+        try:
+            payload = get_chart_samples(
+                uic=instrument.uic,
+                asset_type=instrument.asset_type,
+                config=config,
+                session=session,
+                horizon_minutes=horizon_minutes,
+                count=count,
+                mode="UpTo",
+            )
+        except SaxoSessionError as exc:
+            return [], str(exc)
+        except Exception as exc:  # noqa: BLE001
+            return [], f"Chart fetch failed: {exc}"
+
+        data = payload.get("Data", []) or []
+        output: list[dict[str, Any]] = []
+        for item in data:
+            output.append(
+                {
+                    "time": item.get("Time"),
+                    "open": float(item.get("Open") or 0.0),
+                    "high": float(item.get("High") or 0.0),
+                    "low": float(item.get("Low") or 0.0),
+                    "close": float(item.get("Close") or 0.0),
+                    "volume": float(item.get("Volume") or 0.0),
+                }
+            )
+        return output, None
+
+    def asset_ladder_history_payload(config: dict[str, Any], connection, symbol: str, *, range_key: str = "SESSION") -> dict[str, Any]:
+        kwargs = portfolio_kwargs(config)
+        positions = fetch_portfolio_positions(connection, **kwargs)
+        position = next((row for row in positions if str(row.get("symbol")) == symbol), None)
+        order_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT *
+                FROM execution_orders
+                WHERE symbol = ?
+                ORDER BY id ASC
+                """,
+                (symbol,),
+            ).fetchall()
+        ]
+        fill_rows = [
+            dict(row)
+            for row in connection.execute(
+                """
+                SELECT *
+                FROM execution_fills
+                WHERE symbol = ?
+                ORDER BY id ASC
+                """,
+                (symbol,),
+            ).fetchall()
+        ]
+        event_rows = [
+            {
+                **dict(row),
+                "request_json": _parse_json_text(row["request_json"]),
+            }
+            for row in connection.execute(
+                """
+                SELECT e.*, o.request_json, o.strategy_role, o.strategy_type
+                FROM execution_order_events e
+                JOIN execution_orders o ON o.id = e.execution_order_id
+                WHERE o.symbol = ?
+                ORDER BY e.id ASC
+                """,
+                (symbol,),
+            ).fetchall()
+        ]
+
+        first_event_at: datetime | None = None
+        for row in fill_rows:
+            if str(row.get("side") or "").upper() == "BUY" and row.get("created_at"):
+                first_event_at = datetime.fromisoformat(str(row["created_at"])).astimezone(UTC)
+                break
+        if first_event_at is None:
+            for row in order_rows:
+                if str(row.get("action") or "").upper() == "BUY" and row.get("created_at"):
+                    first_event_at = datetime.fromisoformat(str(row["created_at"])).astimezone(UTC)
+                    break
+
+        chart_points, chart_error = _chart_series_for_symbol(config, symbol, range_key=range_key, first_event_at=first_event_at)
+
+        markers: list[dict[str, Any]] = []
+        for row in fill_rows:
+            side = str(row.get("side") or "").upper()
+            fill_price = float(row.get("average_price_local") or 0.0)
+            fill_payload = _parse_json_text(row.get("raw_payload_json")) or {}
+            last_activity = fill_payload.get("last_activity") if isinstance(fill_payload, dict) else None
+            commission_dkk = None
+            if isinstance(last_activity, dict):
+                commission_dkk = (last_activity.get("Cost") or {}).get("Commission") or (last_activity.get("CostInAccountCurrency") or {}).get("Commission")
+            markers.append(
+                {
+                    "id": f"fill-{row['id']}",
+                    "time": row.get("created_at"),
+                    "price": fill_price,
+                    "kind": "buy_fill" if side == "BUY" else "sell_fill",
+                    "label": f"{side.title()} fill",
+                    "quantity": float(row.get("delta_quantity") or 0.0),
+                    "commission_dkk": commission_dkk,
+                    "strategy_role": None,
+                    "details": f"{side.title()} fill at {fill_price:.2f}",
+                    "payload": fill_payload,
+                }
+            )
+        for row in order_rows:
+            request_payload = _parse_json_text(row.get("request_json")) or {}
+            if row.get("status") in active_order_statuses or row.get("status") == "executed":
+                price = row.get("limit_price_local") or row.get("stop_price_local") or row.get("price_local")
+                kind = "order"
+                label = f"{str(row.get('action') or '').title()} {str(row.get('order_type') or 'Order')}"
+                if str(row.get("strategy_role") or "") == "flatten_close":
+                    kind = "flatten"
+                    label = "Flatten"
+                markers.append(
+                    {
+                        "id": f"order-{row['id']}",
+                        "time": row.get("created_at"),
+                        "price": float(price or 0.0),
+                        "kind": kind,
+                        "label": label,
+                        "quantity": float(row.get("quantity") or 0.0),
+                        "commission_dkk": None,
+                        "strategy_role": row.get("strategy_role"),
+                        "details": f"{label} · {row.get('status')}",
+                        "payload": {
+                            "request_json": request_payload,
+                            "execution_result_json": _parse_json_text(row.get("execution_result_json")),
+                            "order": row,
+                        },
+                    }
+                )
+        for row in event_rows:
+            if str(row.get("event_type") or "").startswith("broker_") and "amend" not in str(row.get("event_type") or ""):
+                continue
+            payload = _parse_json_text(row.get("raw_payload_json")) or {}
+            markers.append(
+                {
+                    "id": f"event-{row['id']}",
+                    "time": row.get("created_at"),
+                    "price": float(row.get("broker_price_local") or 0.0),
+                    "kind": "amendment",
+                    "label": "Order update",
+                    "quantity": float(row.get("broker_quantity") or 0.0),
+                    "commission_dkk": None,
+                    "strategy_role": row.get("strategy_role"),
+                    "details": f"{row.get('event_type')} · {row.get('broker_status') or ''}",
+                    "payload": payload,
+                }
+            )
+        markers.sort(key=lambda item: str(item.get("time") or ""))
+
+        if not chart_points:
+            fallback_points = []
+            for marker in markers:
+                marker_time = marker.get("time")
+                marker_price = marker.get("price")
+                if not marker_time or marker_price in (None, ""):
+                    continue
+                price_value = float(marker_price)
+                fallback_points.append(
+                    {
+                        "time": marker_time,
+                        "open": price_value,
+                        "high": price_value,
+                        "low": price_value,
+                        "close": price_value,
+                        "volume": 0.0,
+                    }
+                )
+            if position and position.get("current_price_local") not in (None, ""):
+                fallback_points.append(
+                    {
+                        "time": datetime.now(UTC).isoformat(timespec="seconds"),
+                        "open": float(position["current_price_local"]),
+                        "high": float(position["current_price_local"]),
+                        "low": float(position["current_price_local"]),
+                        "close": float(position["current_price_local"]),
+                        "volume": 0.0,
+                    }
+                )
+            if fallback_points:
+                chart_points = sorted(fallback_points, key=lambda item: str(item["time"]))
+                chart_error = chart_error or "Saxo chart samples unavailable; showing execution-price fallback."
+
+        active_lines: list[dict[str, Any]] = []
+        ladder_levels: list[dict[str, Any]] = []
+        for row in order_rows:
+            status = str(row.get("status") or "")
+            if status not in active_order_statuses:
+                continue
+            strategy_role = str(row.get("strategy_role") or "")
+            if row.get("stop_price_local") is not None:
+                active_lines.append(
+                    {
+                        "label": "Stop loss",
+                        "price": float(row["stop_price_local"]),
+                        "color": "#b42318",
+                        "kind": strategy_role or "stop",
+                        "dashed": True,
+                    }
+                )
+            if row.get("limit_price_local") is not None:
+                active_lines.append(
+                    {
+                        "label": "Take profit" if strategy_role == "take_profit" else "Limit",
+                        "price": float(row["limit_price_local"]),
+                        "color": "#0f8a4b" if strategy_role == "take_profit" else "#6b7280",
+                        "kind": strategy_role or "limit",
+                        "dashed": True,
+                    }
+                )
+            if str(row.get("strategy_type") or "") == "ladder":
+                request_payload = _parse_json_text(row.get("request_json")) or {}
+                metadata = request_payload.get("strategy_metadata") if isinstance(request_payload, dict) else None
+                if isinstance(metadata, dict):
+                    for key, label, color in (
+                        ("entry_price_local", "Entry rung", "#9ca3af"),
+                        ("take_profit_price_local", "Take-profit rung", "#0f8a4b"),
+                        ("stop_price_local", "Stop rung", "#b42318"),
+                    ):
+                        value = metadata.get(key)
+                        if value not in (None, ""):
+                            ladder_levels.append(
+                                {
+                                    "label": label,
+                                    "price": float(value),
+                                    "color": color,
+                                    "kind": key,
+                                }
+                            )
+
+        ladder_summary = ladder_status_by_symbol(connection).get(symbol, {"text": "idle", "active_orders": 0, "filled_entry_rungs": 0, "trailing": False})
+        return {
+            "symbol": symbol,
+            "range_key": range_key,
+            "position": position,
+            "ladder_summary": ladder_summary,
+            "chart": {
+                "points": chart_points,
+                "error": chart_error,
+                "first_event_at": first_event_at.isoformat(timespec="seconds") if first_event_at else None,
+            },
+            "markers": markers,
+            "active_lines": active_lines,
+            "ladder_levels": ladder_levels,
+        }
+
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -204,7 +567,21 @@ def create_app(config_path: str | None = None) -> FastAPI:
         with runtime() as (config, connection):
             kwargs = portfolio_kwargs(config)
             positions = fetch_portfolio_positions(connection, **kwargs)
-            return {"items": positions[:limit], "total": len(positions)}
+            ladder_status_map = ladder_status_by_symbol(connection)
+            items = []
+            for row in positions[:limit]:
+                enriched = dict(row)
+                enriched["ladder_status"] = ladder_status_map.get(
+                    str(row.get("symbol") or ""),
+                    {"text": "idle", "active_orders": 0, "filled_entry_rungs": 0, "trailing": False},
+                )
+                items.append(enriched)
+            return {"items": items, "total": len(positions)}
+
+    @app.get("/api/asset-ladder-history/{symbol}")
+    def asset_ladder_history(symbol: str, range_key: str = Query(default="SESSION")) -> dict[str, Any]:
+        with runtime() as (config, connection):
+            return asset_ladder_history_payload(config, connection, symbol, range_key=range_key)
 
     @app.get("/api/portfolio/trades")
     def portfolio_trades(limit: int = Query(default=50, ge=1, le=250)) -> dict[str, Any]:

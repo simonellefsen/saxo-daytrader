@@ -46,6 +46,21 @@ export interface PositionsResponse {
   total: number;
 }
 
+export interface AssetLadderHistoryResponse {
+  symbol: string;
+  range_key: string;
+  position: Record<string, any> | null;
+  ladder_summary: Record<string, any>;
+  chart: {
+    points: Array<Record<string, any>>;
+    error?: string | null;
+    first_event_at?: string | null;
+  };
+  markers: Array<Record<string, any>>;
+  active_lines: Array<Record<string, any>>;
+  ladder_levels: Array<Record<string, any>>;
+}
+
 export interface PerformanceResponse {
   range_key: string;
   history: Array<Record<string, any>>;

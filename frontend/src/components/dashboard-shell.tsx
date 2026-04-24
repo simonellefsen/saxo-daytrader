@@ -5,8 +5,9 @@ import { useEffect, useMemo, useState } from "react";
 import useSWR, { mutate } from "swr";
 
 import { apiFetch, getFetcher, postAction } from "@/lib/api";
-import { formatDkk, formatLocalMoney, formatNumber, formatPercent, formatTimestamp, signedClass, toYahooFinanceUrl } from "@/lib/format";
+import { formatDkk, formatLocalMoney, formatNumber, formatPercent, formatTimestamp, formatTimestampPrecise, signedClass, toYahooFinanceUrl } from "@/lib/format";
 import type {
+  AssetLadderHistoryResponse,
   DecisionHistoryResponse,
   DecisionResponse,
   ExecutionResponse,
@@ -16,7 +17,9 @@ import type {
   PositionsResponse,
   SchedulerResponse,
 } from "@/lib/types";
+import { LadderVisualizer } from "@/components/ladder-visualizer";
 import { LineChart } from "@/components/line-chart";
+import { Sparkline } from "@/components/sparkline";
 
 type TabKey = "portfolio" | "performance" | "market" | "decision" | "execution";
 
@@ -33,6 +36,8 @@ const PERFORMANCE_RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "ALL"] as const
 const PORTFOLIO_COLUMN_HELP: Record<string, string> = {
   Symbol: "Trading symbol. Click to open the instrument on Yahoo Finance.",
   Instrument: "Instrument or company name.",
+  "Ladder Status": "Current ladder strategy state for the symbol.",
+  Trend: "Short intraday sparkline from the recent chart window.",
   Qty: "Current broker-aligned quantity held.",
   Currency: "Trading currency of the instrument.",
   "Paid Price": "Average price paid per unit in the instrument currency.",
@@ -46,6 +51,64 @@ const PORTFOLIO_COLUMN_HELP: Record<string, string> = {
   "Quote Updated": "Timestamp of the latest stored quote used for this row.",
 };
 
+function PortfolioRow({
+  row,
+  onOpen,
+}: {
+  row: Record<string, any>;
+  onOpen: (symbol: string) => void;
+}) {
+  const symbol = String(row.symbol ?? "");
+  const sparkline = useSWR<AssetLadderHistoryResponse>(
+    `/api/asset-ladder-history/${encodeURIComponent(symbol)}?range_key=1H`,
+    getFetcher,
+    { refreshInterval: 120_000 },
+  );
+  const sparkValues = (sparkline.data?.chart?.points ?? []).map((point) => Number(point.close ?? 0)).filter((value) => Number.isFinite(value) && value > 0);
+  const positive = sparkValues.length > 1 ? sparkValues[sparkValues.length - 1] >= sparkValues[0] : Number(row.daily_pnl_dkk ?? 0) >= 0;
+
+  return (
+    <tr className="clickable-row" key={symbol} onClick={() => onOpen(symbol)}>
+      <td>
+        <a
+          href={toYahooFinanceUrl(symbol)}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(event) => event.stopPropagation()}
+        >
+          {symbol}
+        </a>
+      </td>
+      <td>{String(row.instrument_name ?? symbol)}</td>
+      <td>
+        <span className={`status-chip ${row.ladder_status?.trailing ? "good" : "neutral"}`}>
+          {String(row.ladder_status?.text ?? "idle")}
+        </span>
+      </td>
+      <td><Sparkline values={sparkValues} positive={positive} /></td>
+      <td>{formatNumber(row.quantity, 0)}</td>
+      <td>{String(row.currency ?? "")}</td>
+      <td>
+        {row.paid_price_local === null || row.paid_price_local === undefined
+          ? "n/a"
+          : formatLocalMoney(row.paid_price_local, row.currency)}
+      </td>
+      <td>{formatLocalMoney(row.current_price_local, row.currency)}</td>
+      <td>{formatDkk(row.cost_basis_dkk)}</td>
+      <td>{formatDkk(row.market_value_dkk)}</td>
+      <td className={signedClass(row.unrealised_pnl_dkk)}>{formatDkk(row.unrealised_pnl_dkk)}</td>
+      <td className={signedClass(row.fx_unrealised_pnl_dkk)}>
+        {row.fx_unrealised_pnl_dkk === null || row.fx_unrealised_pnl_dkk === undefined
+          ? "n/a"
+          : formatDkk(row.fx_unrealised_pnl_dkk)}
+      </td>
+      <td className={signedClass(row.daily_pnl_dkk)}>{formatDkk(row.daily_pnl_dkk)}</td>
+      <td>{formatPercent(row.allocation_pct)}</td>
+      <td>{formatTimestamp(row.latest_quote_updated_at)}</td>
+    </tr>
+  );
+}
+
 function metricSubvalue(value: unknown, formatter: (value: unknown) => string) {
   if (value === null || value === undefined) {
     return "n/a";
@@ -57,8 +120,11 @@ export function DashboardShell() {
   const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
   const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
   const [selectedDecisionId, setSelectedDecisionId] = useState<number | null>(null);
+  const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [statusTone, setStatusTone] = useState<"info" | "warn" | "good">("info");
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("daytrader-active-tab") as TabKey | null;
@@ -71,9 +137,31 @@ export function DashboardShell() {
     window.localStorage.setItem("daytrader-active-tab", activeTab);
   }, [activeTab]);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tagName = target?.tagName ?? "";
+      if (target?.isContentEditable || tagName === "INPUT" || tagName === "TEXTAREA") {
+        return;
+      }
+      if (event.key.toLowerCase() === "r") {
+        event.preventDefault();
+        void runAction("/api/actions/scheduler-cycle", { mock: false });
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
   const overview = useSWR<OverviewResponse>("/api/overview", getFetcher, {
     refreshInterval: 15_000,
   });
+
+  useEffect(() => {
+    if (overview.data) {
+      setLastUpdatedAt(new Date().toISOString());
+    }
+  }, [overview.data]);
 
   const priceRefreshMs = Math.max(
     15_000,
@@ -117,6 +205,7 @@ export function DashboardShell() {
   );
 
   async function runAction(path: string, body?: unknown) {
+    setPendingAction(path);
     try {
       const result = await postAction<Record<string, unknown>>(path, body);
       setStatusTone("good");
@@ -133,6 +222,8 @@ export function DashboardShell() {
     } catch (error) {
       setStatusTone("warn");
       setStatusMessage(error instanceof Error ? error.message : "Action failed.");
+    } finally {
+      setPendingAction(null);
     }
   }
 
@@ -151,6 +242,8 @@ export function DashboardShell() {
     () => [
       "Symbol",
       "Instrument",
+      "Ladder Status",
+      "Trend",
       "Qty",
       "Currency",
       "Paid Price",
@@ -216,6 +309,29 @@ export function DashboardShell() {
     ].includes(String(row.status ?? "")),
   );
 
+  const ladderSummary = useMemo(() => {
+    const ladderOrders = executionOrders.filter((row) => String(row.strategy_type ?? "") === "ladder");
+    const activeLadders = new Set(
+      ladderOrders
+        .filter((row) =>
+          [
+            "pending_execution",
+            "pending_approval",
+            "waiting_for_market_open",
+            "submitted_to_broker",
+            "broker_working",
+            "broker_amended",
+            "broker_partially_filled",
+            "broker_replace_requested",
+            "broker_cancel_requested",
+          ].includes(String(row.status ?? "")),
+        )
+        .map((row) => String(row.symbol ?? "")),
+    ).size;
+    const filledRungs = ladderOrders.filter((row) => String(row.strategy_role ?? "") === "entry" && String(row.status ?? "") === "executed").length;
+    return { activeLadders, filledRungs };
+  }, [executionOrders]);
+
   return (
     <main className="shell">
       <header className="page-header">
@@ -225,6 +341,7 @@ export function DashboardShell() {
             Modern web frontend over the existing Python trading runtime. Targeted polling keeps the active
             view fresh without re-running the whole page.
           </p>
+          <p className="muted">Last updated {formatTimestampPrecise(lastUpdatedAt)} · Shortcut: R runs one scheduler cycle</p>
         </div>
         <div className="pill-row">
           <span className="pill">Execution: {String(overview.data?.execution?.mode ?? "n/a").toUpperCase()}</span>
@@ -238,6 +355,12 @@ export function DashboardShell() {
           {warning}
         </section>
       ))}
+
+      {Number(cashManagement.cash_buffer_shortfall_dkk ?? 0) > 0 ? (
+        <section className="banner warn">
+          Cash buffer is below target by {formatDkk(cashManagement.cash_buffer_shortfall_dkk)}. Add cash or reduce exposure.
+        </section>
+      ) : null}
 
       {analysisSummary?.analysis_window_active ? (
         <section className="banner good">
@@ -323,38 +446,9 @@ export function DashboardShell() {
                 </tr>
               </thead>
               <tbody>
-                {(positions.data?.items ?? []).map((row) => {
-                  const symbol = String(row.symbol ?? "");
-                  return (
-                    <tr key={symbol}>
-                      <td>
-                        <a href={toYahooFinanceUrl(symbol)} target="_blank" rel="noreferrer">
-                          {symbol}
-                        </a>
-                      </td>
-                      <td>{String(row.instrument_name ?? symbol)}</td>
-                      <td>{formatNumber(row.quantity, 0)}</td>
-                      <td>{String(row.currency ?? "")}</td>
-                      <td>
-                        {row.paid_price_local === null || row.paid_price_local === undefined
-                          ? "n/a"
-                          : formatLocalMoney(row.paid_price_local, row.currency)}
-                      </td>
-                      <td>{formatLocalMoney(row.current_price_local, row.currency)}</td>
-                      <td>{formatDkk(row.cost_basis_dkk)}</td>
-                      <td>{formatDkk(row.market_value_dkk)}</td>
-                      <td className={signedClass(row.unrealised_pnl_dkk)}>{formatDkk(row.unrealised_pnl_dkk)}</td>
-                      <td className={signedClass(row.fx_unrealised_pnl_dkk)}>
-                        {row.fx_unrealised_pnl_dkk === null || row.fx_unrealised_pnl_dkk === undefined
-                          ? "n/a"
-                          : formatDkk(row.fx_unrealised_pnl_dkk)}
-                      </td>
-                      <td className={signedClass(row.daily_pnl_dkk)}>{formatDkk(row.daily_pnl_dkk)}</td>
-                      <td>{formatPercent(row.allocation_pct)}</td>
-                      <td>{formatTimestamp(row.latest_quote_updated_at)}</td>
-                    </tr>
-                  );
-                })}
+                {(positions.data?.items ?? []).map((row) => (
+                  <PortfolioRow key={String(row.symbol ?? "")} row={row} onOpen={setSelectedSymbol} />
+                ))}
               </tbody>
             </table>
           </div>
@@ -498,6 +592,13 @@ export function DashboardShell() {
           <div className="grid-2">
             <div className="stack">
               <div className="mini-card">
+                <div className="label">Strategy Flow</div>
+                <div className="value">
+                  {formatNumber(Array.isArray(displayedDecision?.report_json?.candidate_assets) ? displayedDecision?.report_json?.candidate_assets.length : 0, 0)} → {formatNumber(selectedAssets.length, 0)} → {formatNumber(Array.isArray(strategyPlan.ladder_orders) ? strategyPlan.ladder_orders.length : 0, 0)}
+                </div>
+                <div className="subvalue">xAI candidates → technically selected → ladder orders</div>
+              </div>
+              <div className="mini-card">
                 <div className="label">Strategy Status</div>
                 <div className="value">{String(strategyPlan.status ?? "n/a")}</div>
                 <div className="muted">
@@ -588,7 +689,10 @@ export function DashboardShell() {
                 </table>
               </div>
             </div>
-            <pre className="code-block">{JSON.stringify(displayedDecision?.report_json ?? {}, null, 2)}</pre>
+            <details className="json-details" open>
+              <summary>Report JSON</summary>
+              <pre className="code-block">{JSON.stringify(displayedDecision?.report_json ?? {}, null, 2)}</pre>
+            </details>
           </div>
         </section>
       ) : null}
@@ -607,21 +711,31 @@ export function DashboardShell() {
             </div>
           </div>
           <div className="action-row">
-            <button className="button" type="button" onClick={() => runAction("/api/actions/queue-process")}>
-              Run Queue Processor
+            <button className="button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/queue-process")}>
+              {pendingAction === "/api/actions/queue-process" ? "Running…" : "▶ Run Queue Processor"}
             </button>
-            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/sync-broker")}>
-              Sync Broker Status
+            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/sync-broker")}>
+              {pendingAction === "/api/actions/sync-broker" ? "Syncing…" : "↻ Sync Broker Status"}
             </button>
-            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/retry-failed")}>
-              Retry Failed Orders
+            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/retry-failed")}>
+              {pendingAction === "/api/actions/retry-failed" ? "Retrying…" : "↺ Retry Failed Orders"}
             </button>
-            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/reconcile-broker")}>
-              Reconcile Portfolio To Saxo
+            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/reconcile-broker")}>
+              {pendingAction === "/api/actions/reconcile-broker" ? "Reconciling…" : "≋ Reconcile Portfolio To Saxo"}
             </button>
-            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
-              Run Scheduler Cycle
+            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
+              {pendingAction === "/api/actions/scheduler-cycle" ? "Running…" : "⟳ Run Scheduler Cycle"}
             </button>
+          </div>
+          <div className="mini-grid">
+            <article className="mini-card">
+              <div className="label">Active Ladders</div>
+              <div className="value">{formatNumber(ladderSummary.activeLadders, 0)}</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Total Rungs Filled</div>
+              <div className="value">{formatNumber(ladderSummary.filledRungs, 0)}</div>
+            </article>
           </div>
           <div className="table-wrap">
             <table>
@@ -647,7 +761,7 @@ export function DashboardShell() {
                 {executionOrders.map((row) => {
                   const isManageable = manageableOrders.some((order) => order.id === row.id);
                   return (
-                    <tr key={String(row.id)}>
+                    <tr key={String(row.id)} className={`status-row status-${String(row.status ?? "").replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`}>
                       <td>{String(row.id)}</td>
                       <td>{formatTimestamp(row.created_at)}</td>
                       <td>{String(row.symbol ?? "")}</td>
@@ -698,6 +812,12 @@ export function DashboardShell() {
           </div>
         </section>
       ) : null}
+
+      <LadderVisualizer
+        symbol={selectedSymbol ?? ""}
+        open={selectedSymbol !== null}
+        onClose={() => setSelectedSymbol(null)}
+      />
     </main>
   );
 }
