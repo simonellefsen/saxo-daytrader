@@ -25,7 +25,7 @@ export function formatNumber(value: unknown, digits = 2): string {
 }
 
 export function formatPercent(value: unknown): string {
-  return `${formatNumber(value, 2)}%`;
+  return `${formatNumber(Number(value ?? 0) * 100, 2)}%`;
 }
 
 export function signedClass(value: unknown): string {

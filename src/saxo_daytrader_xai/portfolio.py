@@ -78,7 +78,8 @@ def _trade_rows(connection: sqlite3.Connection) -> list[dict[str, Any]]:
             currency,
             gross_amount_dkk,
             commission_dkk,
-            cost_basis_sold_dkk
+            cost_basis_sold_dkk,
+            cost_basis_sold_local
         FROM trade_ledger
         WHERE status IN ('executed', 'approved', 'recorded')
         ORDER BY created_at, id

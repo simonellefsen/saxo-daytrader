@@ -207,6 +207,12 @@ select {
   font-size: 0.92rem;
 }
 
+.help-header {
+  cursor: help;
+  text-decoration: underline dotted rgba(101, 114, 132, 0.85);
+  text-underline-offset: 0.18rem;
+}
+
 .action-row,
 .segmented {
   display: flex;

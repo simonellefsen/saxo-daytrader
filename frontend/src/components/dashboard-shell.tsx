@@ -29,6 +29,22 @@ const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
 
 const PERFORMANCE_RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "ALL"] as const;
 
+const PORTFOLIO_COLUMN_HELP: Record<string, string> = {
+  Symbol: "Trading symbol. Click to open the instrument on Yahoo Finance.",
+  Instrument: "Instrument or company name.",
+  Qty: "Current broker-aligned quantity held.",
+  Currency: "Trading currency of the instrument.",
+  "Paid Price": "Average price paid per unit in the instrument currency.",
+  "Current Price": "Latest polled market price in the instrument currency.",
+  "Cost Basis DKK": "Current remaining acquisition cost in DKK for the held quantity.",
+  "Market Value DKK": "Current position value in DKK using the latest price and FX rate.",
+  "Unrealised P/L DKK": "Unrealised profit or loss in DKK before tax.",
+  "FX Gain/Loss DKK": "Part of unrealised P/L caused by FX movement since purchase.",
+  "Daily P/L DKK": "Change in DKK since the 06:00 Copenhagen intraday baseline.",
+  Allocation: "Share of total portfolio value currently allocated to this position.",
+  "Quote Updated": "Timestamp of the latest stored quote used for this row.",
+};
+
 function metricSubvalue(value: unknown, formatter: (value: unknown) => string) {
   if (value === null || value === undefined) {
     return "n/a";
@@ -120,6 +136,25 @@ export function DashboardShell() {
   const performanceSeries = useMemo(() => {
     return (performance.data?.history ?? []).map((row) => Number(row.total_market_value_dkk ?? 0));
   }, [performance.data?.history]);
+
+  const portfolioColumns = useMemo(
+    () => [
+      "Symbol",
+      "Instrument",
+      "Qty",
+      "Currency",
+      "Paid Price",
+      "Current Price",
+      "Cost Basis DKK",
+      "Market Value DKK",
+      "Unrealised P/L DKK",
+      "FX Gain/Loss DKK",
+      "Daily P/L DKK",
+      "Allocation",
+      "Quote Updated",
+    ],
+    [],
+  );
 
   const latestDecision = decision.data?.report;
   const decisionSuggestions = Array.isArray(latestDecision?.report_json?.suggested_trades)
@@ -238,19 +273,13 @@ export function DashboardShell() {
             <table>
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th>Instrument</th>
-                  <th>Qty</th>
-                  <th>Currency</th>
-                  <th>Paid Price</th>
-                  <th>Current Price</th>
-                  <th>Cost Basis DKK</th>
-                  <th>Market Value DKK</th>
-                  <th>Unrealised P/L DKK</th>
-                  <th>FX Gain/Loss DKK</th>
-                  <th>Daily P/L DKK</th>
-                  <th>Allocation</th>
-                  <th>Quote Updated</th>
+                  {portfolioColumns.map((column) => (
+                    <th key={column}>
+                      <span className="help-header" title={PORTFOLIO_COLUMN_HELP[column]}>
+                        {column}
+                      </span>
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
