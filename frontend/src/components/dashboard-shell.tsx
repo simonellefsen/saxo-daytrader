@@ -60,7 +60,7 @@ function PortfolioRow({
 }) {
   const symbol = String(row.symbol ?? "");
   const sparkline = useSWR<AssetLadderHistoryResponse>(
-    `/api/asset-ladder-history/${encodeURIComponent(symbol)}?range_key=1H`,
+    `/api/ladder-chart/${encodeURIComponent(symbol)}?range_key=1H`,
     getFetcher,
     { refreshInterval: 120_000 },
   );
@@ -81,11 +81,30 @@ function PortfolioRow({
       </td>
       <td>{String(row.instrument_name ?? symbol)}</td>
       <td>
-        <span className={`status-chip ${row.ladder_status?.trailing ? "good" : "neutral"}`}>
-          {String(row.ladder_status?.text ?? "idle")}
-        </span>
+        <div className="ladder-status-cell">
+          <span className={`status-chip ${row.ladder_status?.trailing ? "good" : "neutral"}`}>
+            {String(row.ladder_status?.text ?? "idle")}
+          </span>
+          {Number(row.ladder_status?.progress_pct ?? 0) > 0 ? (
+            <div className="ladder-progress">
+              <div className="ladder-progress-bar" style={{ width: `${Math.max(6, Math.round(Number(row.ladder_status?.progress_pct ?? 0) * 100))}%` }} />
+            </div>
+          ) : null}
+        </div>
       </td>
-      <td><Sparkline values={sparkValues} positive={positive} /></td>
+      <td>
+        <button
+          className="sparkline-button"
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onOpen(symbol);
+          }}
+          aria-label={`Open ladder visualizer for ${symbol}`}
+        >
+          <Sparkline values={sparkValues} positive={positive} />
+        </button>
+      </td>
       <td>{formatNumber(row.quantity, 0)}</td>
       <td>{String(row.currency ?? "")}</td>
       <td>

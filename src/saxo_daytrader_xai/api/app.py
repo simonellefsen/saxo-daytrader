@@ -192,6 +192,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     "active_stop_orders": 0,
                     "active_take_profit_orders": 0,
                     "filled_entry_rungs": 0,
+                    "total_entry_rungs": 0,
                     "latest_strategy_type": None,
                 },
             )
@@ -206,21 +207,56 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     record["active_stop_orders"] += 1
                 elif strategy_role == "take_profit":
                     record["active_take_profit_orders"] += 1
+            if strategy_role == "entry":
+                record["total_entry_rungs"] += 1
             if status == "executed" and strategy_role == "entry":
                 record["filled_entry_rungs"] += 1
         for symbol, record in output.items():
             trailing = bool(record["active_stop_orders"])
+            filled = int(record["filled_entry_rungs"])
+            total = max(int(record["total_entry_rungs"]), filled, 0)
             if record["active_orders"]:
-                status_text = f"{record['active_orders']} active"
+                if total:
+                    status_text = f"{filled}/{total} filled"
+                else:
+                    status_text = f"{record['active_orders']} active"
                 if trailing:
                     status_text += " • trailing"
-            elif record["filled_entry_rungs"]:
-                status_text = f"{record['filled_entry_rungs']} filled"
+            elif filled:
+                status_text = f"{filled}/{total or filled} filled"
             else:
                 status_text = "idle"
             record["text"] = status_text
             record["trailing"] = trailing
+            record["progress_pct"] = (filled / total) if total else 0.0
         return output
+
+    def _ladder_parameters(order_rows: list[dict[str, Any]], position: dict[str, Any] | None) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        for row in order_rows:
+            request_payload = _parse_json_text(row.get("request_json")) or {}
+            strategy_metadata = request_payload.get("strategy_metadata") if isinstance(request_payload, dict) else None
+            if isinstance(strategy_metadata, dict):
+                metadata = strategy_metadata
+                break
+        if not metadata:
+            return {}
+        current_price = float(position.get("current_price_local") or 0.0) if isinstance(position, dict) else 0.0
+        ceiling = metadata.get("take_profit_price_local")
+        stop = metadata.get("stop_price_local")
+        entry = metadata.get("entry_price_local")
+        return {
+            "atr_1m": metadata.get("atr_1m"),
+            "rung_spacing_local": metadata.get("rung_spacing_local"),
+            "ladder_rung_id": metadata.get("ladder_rung_id"),
+            "max_position_weight_pct": float(metadata.get("max_position_weight_pct") or 0.0),
+            "entry_price_local": entry,
+            "take_profit_price_local": ceiling,
+            "stop_price_local": stop,
+            "current_price_local": current_price if current_price else None,
+            "ceiling_gap_local": (float(ceiling) - current_price) if ceiling not in (None, "") and current_price else None,
+            "stop_gap_local": (current_price - float(stop)) if stop not in (None, "") and current_price else None,
+        }
 
     def _chart_series_for_symbol(config: dict[str, Any], symbol: str, *, range_key: str, first_event_at: datetime | None) -> tuple[list[dict[str, Any]], str | None]:
         execution_cfg = config.get("execution", {})
@@ -344,6 +380,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     break
 
         chart_points, chart_error = _chart_series_for_symbol(config, symbol, range_key=range_key, first_event_at=first_event_at)
+        chart_source = "saxo" if chart_points else "fallback"
 
         markers: list[dict[str, Any]] = []
         for row in fill_rows:
@@ -364,12 +401,17 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     "quantity": float(row.get("delta_quantity") or 0.0),
                     "commission_dkk": commission_dkk,
                     "strategy_role": None,
+                    "ladder_rung_id": None,
+                    "amendment_reason": None,
+                    "strategy_reason": None,
+                    "confidence": None,
                     "details": f"{side.title()} fill at {fill_price:.2f}",
                     "payload": fill_payload,
                 }
             )
         for row in order_rows:
             request_payload = _parse_json_text(row.get("request_json")) or {}
+            strategy_metadata = request_payload.get("strategy_metadata") if isinstance(request_payload, dict) else None
             if row.get("status") in active_order_statuses or row.get("status") == "executed":
                 price = row.get("limit_price_local") or row.get("stop_price_local") or row.get("price_local")
                 kind = "order"
@@ -387,6 +429,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
                         "quantity": float(row.get("quantity") or 0.0),
                         "commission_dkk": None,
                         "strategy_role": row.get("strategy_role"),
+                        "ladder_rung_id": strategy_metadata.get("ladder_rung_id") if isinstance(strategy_metadata, dict) else None,
+                        "amendment_reason": strategy_metadata.get("amendment_reason") if isinstance(strategy_metadata, dict) else None,
+                        "strategy_reason": request_payload.get("rationale") if isinstance(request_payload, dict) else None,
+                        "confidence": request_payload.get("confidence") if isinstance(request_payload, dict) else None,
                         "details": f"{label} · {row.get('status')}",
                         "payload": {
                             "request_json": request_payload,
@@ -409,6 +455,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     "quantity": float(row.get("broker_quantity") or 0.0),
                     "commission_dkk": None,
                     "strategy_role": row.get("strategy_role"),
+                    "ladder_rung_id": payload.get("strategy_metadata", {}).get("ladder_rung_id") if isinstance(payload.get("strategy_metadata"), dict) else None,
+                    "amendment_reason": payload.get("amendment_reason") if isinstance(payload, dict) else None,
+                    "strategy_reason": None,
+                    "confidence": None,
                     "details": f"{row.get('event_type')} · {row.get('broker_status') or ''}",
                     "payload": payload,
                 }
@@ -447,6 +497,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             if fallback_points:
                 chart_points = sorted(fallback_points, key=lambda item: str(item["time"]))
                 chart_error = chart_error or "Saxo chart samples unavailable; showing execution-price fallback."
+                chart_source = "fallback"
 
         active_lines: list[dict[str, Any]] = []
         ladder_levels: list[dict[str, Any]] = []
@@ -495,7 +546,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
                                 }
                             )
 
-        ladder_summary = ladder_status_by_symbol(connection).get(symbol, {"text": "idle", "active_orders": 0, "filled_entry_rungs": 0, "trailing": False})
+        ladder_summary = ladder_status_by_symbol(connection).get(symbol, {"text": "idle", "active_orders": 0, "filled_entry_rungs": 0, "trailing": False, "progress_pct": 0.0})
+        ladder_parameters = _ladder_parameters(order_rows, position)
         return {
             "symbol": symbol,
             "range_key": range_key,
@@ -504,11 +556,23 @@ def create_app(config_path: str | None = None) -> FastAPI:
             "chart": {
                 "points": chart_points,
                 "error": chart_error,
+                "source": chart_source,
+                "has_real_data": chart_source == "saxo" and bool(chart_points),
                 "first_event_at": first_event_at.isoformat(timespec="seconds") if first_event_at else None,
             },
             "markers": markers,
             "active_lines": active_lines,
             "ladder_levels": ladder_levels,
+            "ladder_parameters": ladder_parameters,
+            "legend": [
+                {"key": "buy_fill", "label": "Buy fill", "color": "#0f8a4b"},
+                {"key": "sell_fill", "label": "Sell fill", "color": "#b42318"},
+                {"key": "order", "label": "Order / rung", "color": "#2563eb"},
+                {"key": "amendment", "label": "Amendment", "color": "#38bdf8"},
+                {"key": "stop_loss", "label": "Stop line", "color": "#b42318"},
+                {"key": "take_profit", "label": "Ceiling / take-profit", "color": "#0f8a4b"},
+                {"key": "current_price", "label": "Current price", "color": "#2563eb"},
+            ],
         }
 
     @app.get("/api/health")
@@ -580,6 +644,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.get("/api/asset-ladder-history/{symbol}")
     def asset_ladder_history(symbol: str, range_key: str = Query(default="SESSION")) -> dict[str, Any]:
+        with runtime() as (config, connection):
+            return asset_ladder_history_payload(config, connection, symbol, range_key=range_key)
+
+    @app.get("/api/ladder-chart/{symbol}")
+    def ladder_chart(symbol: str, range_key: str = Query(default="SESSION")) -> dict[str, Any]:
         with runtime() as (config, connection):
             return asset_ladder_history_payload(config, connection, symbol, range_key=range_key)
 

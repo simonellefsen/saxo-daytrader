@@ -547,13 +547,11 @@ def get_chart_samples(
         "Uic": int(uic),
         "Horizon": int(horizon_minutes),
         "Count": int(count),
-        "Mode": mode,
-        "FieldGroups": "ChartInfo,DisplayAndFormat",
+        "FieldGroups": "ChartInfo,Data,DisplayAndFormat",
     }
     if time:
         params["Time"] = time
-    elif str(mode).lower() == "upto":
-        params["Time"] = _to_iso(_now_utc()).replace("+00:00", "Z")
+        params["Mode"] = mode
     response = requests.get(
         f"{base_url}/chart/v3/charts",
         params=params,

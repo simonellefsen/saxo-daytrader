@@ -51,9 +51,13 @@ export interface AssetLadderHistoryResponse {
   range_key: string;
   position: Record<string, any> | null;
   ladder_summary: Record<string, any>;
+  ladder_parameters?: Record<string, any>;
+  legend?: Array<Record<string, any>>;
   chart: {
     points: Array<Record<string, any>>;
     error?: string | null;
+    source?: string | null;
+    has_real_data?: boolean;
     first_event_at?: string | null;
   };
   markers: Array<Record<string, any>>;

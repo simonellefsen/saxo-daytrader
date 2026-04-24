@@ -1,11 +1,21 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import useSWR from "swr";
+import {
+  CandlestickSeries,
+  ColorType,
+  createChart,
+  createSeriesMarkers,
+  LineSeries,
+  LineStyle,
+  type SeriesMarker,
+  type UTCTimestamp,
+} from "lightweight-charts";
 
 import { getFetcher } from "@/lib/api";
-import { formatDkk, formatLocalMoney, formatNumber, formatTimestamp } from "@/lib/format";
+import { formatDkk, formatLocalMoney, formatNumber, formatPercent, formatTimestamp } from "@/lib/format";
 import type { AssetLadderHistoryResponse } from "@/lib/types";
 
 const RANGE_OPTIONS = ["1H", "4H", "SESSION"] as const;
@@ -14,6 +24,38 @@ interface LadderVisualizerProps {
   symbol: string;
   open: boolean;
   onClose: () => void;
+}
+
+function toChartTime(isoTime: string | null | undefined): UTCTimestamp | null {
+  if (!isoTime) {
+    return null;
+  }
+  const parsed = Date.parse(isoTime);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return Math.floor(parsed / 1000) as UTCTimestamp;
+}
+
+function markerColor(kind: string): string {
+  if (kind === "buy_fill") return "#0f8a4b";
+  if (kind === "sell_fill") return "#b42318";
+  if (kind === "amendment") return "#38bdf8";
+  if (kind === "flatten") return "#7c3aed";
+  return "#2563eb";
+}
+
+function markerShape(kind: string): "circle" | "square" | "arrowUp" | "arrowDown" {
+  if (kind === "buy_fill") return "arrowUp";
+  if (kind === "sell_fill") return "arrowDown";
+  if (kind === "amendment") return "square";
+  return "circle";
+}
+
+function markerPosition(kind: string): "aboveBar" | "belowBar" | "inBar" {
+  if (kind === "buy_fill") return "belowBar";
+  if (kind === "sell_fill") return "aboveBar";
+  return "inBar";
 }
 
 function withinRange(isoTime: string | null | undefined, startAtMs: number) {
@@ -29,19 +71,26 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
   const [showAmendments, setShowAmendments] = useState(true);
   const [selectedMarkerId, setSelectedMarkerId] = useState<string | null>(null);
 
+  const chartContainerRef = useRef<HTMLDivElement | null>(null);
+  const chartInstanceRef = useRef<any>(null);
+
   const history = useSWR<AssetLadderHistoryResponse>(
-    open ? `/api/asset-ladder-history/${encodeURIComponent(symbol)}?range_key=${rangeKey}` : null,
+    open ? `/api/ladder-chart/${encodeURIComponent(symbol)}?range_key=${rangeKey}` : null,
     getFetcher,
     { refreshInterval: 30_000 },
   );
 
   const chartPoints = history.data?.chart?.points ?? [];
   const chartError = history.data?.chart?.error;
+  const chartHasRealData = Boolean(history.data?.chart?.has_real_data);
+  const chartSource = String(history.data?.chart?.source ?? "fallback");
   const markers = history.data?.markers ?? [];
   const activeLines = history.data?.active_lines ?? [];
   const ladderLevels = history.data?.ladder_levels ?? [];
+  const ladderParameters = history.data?.ladder_parameters ?? {};
   const position = history.data?.position ?? null;
   const ladderSummary = history.data?.ladder_summary ?? {};
+  const legend = history.data?.legend ?? [];
 
   const filteredMarkers = useMemo(() => {
     return markers.filter((marker) => {
@@ -54,67 +103,192 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
 
   const selectedMarker = filteredMarkers.find((marker) => String(marker.id) === selectedMarkerId) ?? filteredMarkers[0] ?? null;
 
-  const chartModel = useMemo(() => {
-    if (!chartPoints.length) {
-      return null;
-    }
-    const width = 920;
-    const height = 360;
-    const top = 20;
-    const bottom = 24;
-    const left = 18;
-    const right = 18;
-    const times = chartPoints.map((point) => new Date(String(point.time)).getTime()).filter(Number.isFinite);
-    if (!times.length) {
-      return null;
-    }
-    const lows = chartPoints.map((point) => Number(point.low ?? point.close ?? 0));
-    const highs = chartPoints.map((point) => Number(point.high ?? point.close ?? 0));
-    const overlayPrices = [
-      ...activeLines.map((row) => Number(row.price ?? 0)),
-      ...ladderLevels.map((row) => Number(row.price ?? 0)),
-      ...filteredMarkers.map((row) => Number(row.price ?? 0)),
-    ].filter((value) => Number.isFinite(value) && value > 0);
-    const minPrice = Math.min(...lows, ...(overlayPrices.length ? overlayPrices : [Math.min(...lows)]));
-    const maxPrice = Math.max(...highs, ...(overlayPrices.length ? overlayPrices : [Math.max(...highs)]));
-    const priceSpread = Math.max(maxPrice - minPrice, 0.01);
-    const xRange = Math.max(times[times.length - 1] - times[0], 1);
-    const plotWidth = width - left - right;
-    const plotHeight = height - top - bottom;
-    const candleWidth = Math.max(3, Math.min(10, plotWidth / Math.max(chartPoints.length, 1) * 0.7));
+  const visibleMarkers = useMemo(() => {
+    const firstTime = toChartTime(String(chartPoints[0]?.time ?? "")) ?? null;
+    const firstMs = firstTime ? Number(firstTime) * 1000 : 0;
+    return filteredMarkers.filter((marker) => withinRange(String(marker.time ?? ""), firstMs));
+  }, [chartPoints, filteredMarkers]);
 
-    const xFor = (timeValue: number) => left + ((timeValue - times[0]) / xRange) * plotWidth;
-    const yFor = (priceValue: number) => top + (1 - (priceValue - minPrice) / priceSpread) * plotHeight;
+  useEffect(() => {
+    if (!open || !chartContainerRef.current) {
+      return undefined;
+    }
 
-    return {
-      width,
-      height,
-      top,
-      bottom,
-      left,
-      right,
-      candleWidth,
-      xFor,
-      yFor,
-      minPrice,
-      maxPrice,
-      points: chartPoints.map((point) => {
-        const timeValue = new Date(String(point.time)).getTime();
+    const container = chartContainerRef.current;
+    container.innerHTML = "";
+
+    const chart = createChart(container, {
+      autoSize: true,
+      height: 420,
+      layout: {
+        background: { type: ColorType.Solid, color: "#ffffff" },
+        textColor: "#657284",
+        fontFamily: "\"Avenir Next\", \"Segoe UI\", \"Helvetica Neue\", sans-serif",
+      },
+      grid: {
+        vertLines: { color: "rgba(215, 222, 232, 0.35)" },
+        horzLines: { color: "rgba(215, 222, 232, 0.35)" },
+      },
+      rightPriceScale: {
+        borderColor: "rgba(215, 222, 232, 0.8)",
+      },
+      timeScale: {
+        borderColor: "rgba(215, 222, 232, 0.8)",
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      crosshair: {
+        mode: 0,
+      },
+      handleScroll: true,
+      handleScale: true,
+    });
+    chartInstanceRef.current = chart;
+
+    const sortedPoints = [...chartPoints]
+      .map((point) => {
+        const time = toChartTime(String(point.time ?? ""));
+        if (!time) {
+          return null;
+        }
         return {
-          ...point,
+          time,
           open: Number(point.open ?? point.close ?? 0),
+          high: Number(point.high ?? point.close ?? 0),
+          low: Number(point.low ?? point.close ?? 0),
           close: Number(point.close ?? point.open ?? 0),
-          time: String(point.time ?? ""),
-          timeValue,
-          x: xFor(timeValue),
-          yOpen: yFor(Number(point.open ?? point.close ?? 0)),
-          yClose: yFor(Number(point.close ?? point.open ?? 0)),
-          yHigh: yFor(Number(point.high ?? point.close ?? 0)),
-          yLow: yFor(Number(point.low ?? point.close ?? 0)),
         };
-      }),
+      })
+      .filter(Boolean) as Array<{ time: UTCTimestamp; open: number; high: number; low: number; close: number }>;
+
+    const isFallbackOnly = !chartHasRealData || chartSource !== "saxo";
+
+    const baseSeries: any = isFallbackOnly
+      ? chart.addSeries(LineSeries, {
+          color: "#0f5c73",
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+        })
+      : chart.addSeries(CandlestickSeries, {
+          upColor: "#0f8a4b",
+          downColor: "#b42318",
+          borderVisible: false,
+          wickUpColor: "#0f8a4b",
+          wickDownColor: "#b42318",
+          priceLineVisible: false,
+          lastValueVisible: false,
+        });
+
+    if (isFallbackOnly) {
+      baseSeries.setData(
+        sortedPoints.map((point) => ({ time: point.time, value: point.close })),
+      );
+    } else {
+      baseSeries.setData(sortedPoints);
+    }
+
+    const overlaySeries: any[] = [];
+    const xStart = sortedPoints[0]?.time ?? null;
+    const xEnd = sortedPoints[sortedPoints.length - 1]?.time ?? null;
+    const canDrawHorizontal = xStart !== null && xEnd !== null && xStart !== xEnd;
+
+    if (canDrawHorizontal) {
+      const lineRows: Array<Record<string, unknown> & { emphasized: boolean }> = [
+        ...activeLines.map((row) => ({ ...row, emphasized: true })),
+        ...(showRungs ? ladderLevels.map((row) => ({ ...row, emphasized: false })) : []),
+      ];
+      for (const line of lineRows) {
+        const price = Number(line.price ?? 0);
+        if (!Number.isFinite(price) || price <= 0) {
+          continue;
+        }
+        const series = chart.addSeries(LineSeries, {
+          color: String(line.color ?? "#9ca3af"),
+          lineWidth: line.emphasized ? 2 : 1,
+          lineStyle: line.emphasized ? LineStyle.LargeDashed : LineStyle.Dashed,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        });
+        series.setData([
+          { time: xStart, value: price },
+          { time: xEnd, value: price },
+        ]);
+        overlaySeries.push(series);
+      }
+
+      if (position?.current_price_local) {
+        const currentPrice = Number(position.current_price_local);
+        if (Number.isFinite(currentPrice) && currentPrice > 0) {
+          const currentSeries = chart.addSeries(LineSeries, {
+            color: "#2563eb",
+            lineWidth: 2,
+            lineStyle: LineStyle.Solid,
+            priceLineVisible: false,
+            lastValueVisible: false,
+            crosshairMarkerVisible: false,
+          });
+          currentSeries.setData([
+            { time: xStart, value: currentPrice },
+            { time: xEnd, value: currentPrice },
+          ]);
+          overlaySeries.push(currentSeries);
+        }
+      }
+    }
+
+    const seriesMarkers: SeriesMarker<UTCTimestamp>[] = visibleMarkers
+      .map((marker) => {
+        const time = toChartTime(String(marker.time ?? ""));
+        if (!time) {
+          return null;
+        }
+        const kind = String(marker.kind ?? "");
+        return {
+          id: String(marker.id),
+          time,
+          position: markerPosition(kind),
+          shape: markerShape(kind),
+          color: markerColor(kind),
+          text: kind === "amendment" ? "A" : kind === "buy_fill" ? "B" : kind === "sell_fill" ? "S" : undefined,
+          size: kind.includes("fill") ? 1.5 : 1,
+        } satisfies SeriesMarker<UTCTimestamp>;
+      })
+      .filter(Boolean) as SeriesMarker<UTCTimestamp>[];
+    createSeriesMarkers(baseSeries as any, seriesMarkers as any);
+
+    chart.timeScale().fitContent();
+
+    chart.subscribeClick((param) => {
+      if (!param.time || typeof param.time !== "number" || !visibleMarkers.length) {
+        return;
+      }
+      const clickedAt = Number(param.time);
+      const nearest = [...visibleMarkers].sort((left, right) => {
+        const leftTime = Number(toChartTime(String(left.time ?? "")) ?? 0);
+        const rightTime = Number(toChartTime(String(right.time ?? "")) ?? 0);
+        return Math.abs(leftTime - clickedAt) - Math.abs(rightTime - clickedAt);
+      })[0];
+      if (nearest?.id) {
+        setSelectedMarkerId(String(nearest.id));
+      }
+    });
+
+    const resizeObserver = new ResizeObserver(() => {
+      chart.resize(container.clientWidth, 420);
+    });
+    resizeObserver.observe(container);
+
+    return () => {
+      resizeObserver.disconnect();
+      for (const series of overlaySeries) {
+        chart.removeSeries(series);
+      }
+      chart.remove();
+      chartInstanceRef.current = null;
     };
-  }, [activeLines, chartPoints, filteredMarkers, ladderLevels]);
+  }, [activeLines, chartHasRealData, chartPoints, chartSource, ladderLevels, open, position?.current_price_local, showRungs, visibleMarkers]);
 
   if (!open) {
     return null;
@@ -128,7 +302,8 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
           <div>
             <h2>Ladder Visualizer · {symbol}</h2>
             <p>
-              {position ? `${String(position.instrument_name ?? symbol)} · ${String(ladderSummary.text ?? "idle")}` : "Waiting for first fill"}
+              {position ? String(position.instrument_name ?? symbol) : symbol} ·{" "}
+              <span className={`status-chip ${ladderSummary.trailing ? "good" : "neutral"}`}>{String(ladderSummary.text ?? "idle")}</span>
             </p>
           </div>
           <button className="ghost-button" type="button" onClick={onClose}>
@@ -139,15 +314,11 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
         <div className="mini-grid">
           <article className="mini-card">
             <div className="label">Paid Price</div>
-            <div className="value">
-              {position ? formatLocalMoney(position.paid_price_local, position.currency) : "n/a"}
-            </div>
+            <div className="value">{position ? formatLocalMoney(position.paid_price_local, position.currency) : "n/a"}</div>
           </article>
           <article className="mini-card">
             <div className="label">Current Price</div>
-            <div className="value">
-              {position ? formatLocalMoney(position.current_price_local, position.currency) : "n/a"}
-            </div>
+            <div className="value">{position ? formatLocalMoney(position.current_price_local, position.currency) : "n/a"}</div>
           </article>
           <article className="mini-card">
             <div className="label">Unrealised P/L</div>
@@ -158,7 +329,18 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
           <article className="mini-card">
             <div className="label">Cash Impact</div>
             <div className="value">{position ? formatDkk(position.market_value_dkk) : "n/a"}</div>
-            <div className="subvalue">Allocation {position ? formatNumber(Number(position.allocation_pct ?? 0) * 100, 2) : "0"}%</div>
+            <div className="subvalue">Allocation {position ? formatPercent(position.allocation_pct) : "0%"}</div>
+          </article>
+          <article className="mini-card">
+            <div className="label">Ladder Parameters</div>
+            <div className="value">
+              {ladderParameters.rung_spacing_local !== null && ladderParameters.rung_spacing_local !== undefined
+                ? formatLocalMoney(ladderParameters.rung_spacing_local, position?.currency)
+                : "n/a"}
+            </div>
+            <div className="subvalue">
+              ATR {ladderParameters.atr_1m ? formatNumber(ladderParameters.atr_1m, 3) : "n/a"} · Max {ladderParameters.max_position_weight_pct ? `${formatNumber(Number(ladderParameters.max_position_weight_pct), 1)}%` : "n/a"}
+            </div>
           </article>
         </div>
 
@@ -174,101 +356,30 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
                 {option}
               </button>
             ))}
+            <button className="ghost-button" type="button" onClick={() => void history.mutate()}>
+              Refresh Chart
+            </button>
           </div>
           <label className="toggle"><input checked={showFills} onChange={(e) => setShowFills(e.target.checked)} type="checkbox" /> Show only fills</label>
           <label className="toggle"><input checked={showRungs} onChange={(e) => setShowRungs(e.target.checked)} type="checkbox" /> Show ladder rungs</label>
           <label className="toggle"><input checked={showAmendments} onChange={(e) => setShowAmendments(e.target.checked)} type="checkbox" /> Show amendments</label>
         </div>
 
+        <div className="legend-row">
+          {legend.map((item) => (
+            <span className="legend-item" key={String(item.key)}>
+              <span className="legend-dot" style={{ backgroundColor: String(item.color ?? "#9ca3af") }} />
+              {String(item.label ?? item.key)}
+            </span>
+          ))}
+        </div>
+
         <div className="grid-2 ladder-grid">
           <div className="chart-panel">
-            {chartError ? <div className="banner warn">{chartError}</div> : null}
-            {!chartModel ? (
-              <div className="chart muted">Waiting for first fill or chart data.</div>
-            ) : (
-              <div className="chart ladder-chart">
-                <svg viewBox={`0 0 ${chartModel.width} ${chartModel.height}`} role="img" aria-label={`${symbol} ladder chart`}>
-                  {showRungs
-                    ? ladderLevels.map((line, index) => (
-                        <g key={`${String(line.kind)}-${index}`}>
-                          <line
-                            x1={chartModel.left}
-                            x2={chartModel.width - chartModel.right}
-                            y1={chartModel.yFor(Number(line.price))}
-                            y2={chartModel.yFor(Number(line.price))}
-                            stroke={String(line.color ?? "#9ca3af")}
-                            strokeDasharray="3 4"
-                            strokeOpacity="0.5"
-                          />
-                        </g>
-                      ))
-                    : null}
-                  {activeLines.map((line, index) => (
-                    <g key={`active-${index}`}>
-                      <line
-                        x1={chartModel.left}
-                        x2={chartModel.width - chartModel.right}
-                        y1={chartModel.yFor(Number(line.price))}
-                        y2={chartModel.yFor(Number(line.price))}
-                        stroke={String(line.color ?? "#111827")}
-                        strokeDasharray={line.dashed ? "6 4" : undefined}
-                        strokeWidth="2"
-                      />
-                    </g>
-                  ))}
-                  {chartModel.points.map((point, index) => {
-                    const isUp = Number(point.close) >= Number(point.open);
-                    const fill = isUp ? "#0f8a4b" : "#b42318";
-                    const candleTop = Math.min(point.yOpen, point.yClose);
-                    const candleHeight = Math.max(Math.abs(point.yClose - point.yOpen), 1.5);
-                    return (
-                      <g key={`${String(point.time)}-${index}`}>
-                        <line x1={point.x} x2={point.x} y1={point.yHigh} y2={point.yLow} stroke={fill} strokeOpacity="0.75" />
-                        <rect
-                          x={point.x - chartModel.candleWidth / 2}
-                          y={candleTop}
-                          width={chartModel.candleWidth}
-                          height={candleHeight}
-                          fill={fill}
-                          fillOpacity="0.3"
-                          stroke={fill}
-                        />
-                      </g>
-                    );
-                  })}
-                  {filteredMarkers
-                    .filter((marker) => withinRange(String(marker.time ?? ""), chartModel.points[0]?.timeValue ?? 0))
-                    .map((marker) => {
-                      const timeValue = new Date(String(marker.time)).getTime();
-                      const x = chartModel.xFor(timeValue);
-                      const y = chartModel.yFor(Number(marker.price ?? chartModel.minPrice));
-                      const kind = String(marker.kind ?? "");
-                      const color =
-                        kind === "buy_fill"
-                          ? "#0f8a4b"
-                          : kind === "sell_fill"
-                            ? "#b42318"
-                            : kind === "amendment"
-                              ? "#f59e0b"
-                              : kind === "flatten"
-                                ? "#7c3aed"
-                                : "#2563eb";
-                      return (
-                        <g
-                          key={String(marker.id)}
-                          className="chart-marker"
-                          onClick={() => setSelectedMarkerId(String(marker.id))}
-                        >
-                          <title>
-                            {`${String(marker.label)} · ${formatTimestamp(marker.time)} · ${formatLocalMoney(marker.price, position?.currency)} · Qty ${formatNumber(marker.quantity, 0)}`}
-                          </title>
-                          <circle cx={x} cy={y} r={selectedMarkerId === String(marker.id) ? 6 : 4.5} fill={color} />
-                        </g>
-                      );
-                    })}
-                </svg>
-              </div>
-            )}
+            {!chartHasRealData && chartError ? <div className="banner warn">{chartError}</div> : null}
+            <div className="chart ladder-chart">
+              <div className="chart-host" ref={chartContainerRef} />
+            </div>
           </div>
           <aside className="marker-panel">
             <div className="mini-card">
@@ -280,6 +391,9 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
                     {formatTimestamp(selectedMarker.time)} · {formatLocalMoney(selectedMarker.price, position?.currency)} · Qty {formatNumber(selectedMarker.quantity, 0)}
                   </div>
                   <div className="muted">{String(selectedMarker.details ?? "")}</div>
+                  <div className="muted">
+                    {selectedMarker.strategy_reason ? `Reason: ${String(selectedMarker.strategy_reason)}` : "Click a marker in the chart to inspect the event payload."}
+                  </div>
                   <pre className="code-block compact">{JSON.stringify(selectedMarker.payload ?? {}, null, 2)}</pre>
                 </>
               ) : (
