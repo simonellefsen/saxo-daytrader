@@ -149,22 +149,31 @@ def init_db(connection: sqlite3.Connection) -> None:
             report_id INTEGER,
             symbol TEXT NOT NULL,
             action TEXT NOT NULL,
+            order_type TEXT NOT NULL DEFAULT 'Market',
             mode TEXT NOT NULL,
             status TEXT NOT NULL,
             adapter TEXT NOT NULL,
             requested_weight_pct REAL,
             quantity REAL,
             price_local REAL,
+            limit_price_local REAL,
+            stop_price_local REAL,
             currency TEXT,
             estimated_value_dkk REAL,
             approval_required INTEGER NOT NULL DEFAULT 0,
             approved_at TEXT,
             ledger_id INTEGER,
+            parent_execution_order_id INTEGER,
+            strategy_type TEXT,
+            strategy_session TEXT,
+            strategy_key TEXT,
+            strategy_role TEXT,
             request_json TEXT NOT NULL,
             execution_result_json TEXT,
             error_text TEXT,
             FOREIGN KEY(report_id) REFERENCES decision_reports(id),
-            FOREIGN KEY(ledger_id) REFERENCES trade_ledger(id)
+            FOREIGN KEY(ledger_id) REFERENCES trade_ledger(id),
+            FOREIGN KEY(parent_execution_order_id) REFERENCES execution_orders(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_execution_orders_report
@@ -422,6 +431,20 @@ def init_db(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "trade_ledger", "batch_id", "TEXT")
     _ensure_column(connection, "position_lots", "figi", "TEXT")
     _ensure_column(connection, "execution_orders", "broker_order_id", "TEXT")
+    _ensure_column(connection, "execution_orders", "order_type", "TEXT NOT NULL DEFAULT 'Market'")
+    _ensure_column(connection, "execution_orders", "limit_price_local", "REAL")
+    _ensure_column(connection, "execution_orders", "stop_price_local", "REAL")
+    _ensure_column(connection, "execution_orders", "parent_execution_order_id", "INTEGER")
+    _ensure_column(connection, "execution_orders", "strategy_type", "TEXT")
+    _ensure_column(connection, "execution_orders", "strategy_session", "TEXT")
+    _ensure_column(connection, "execution_orders", "strategy_key", "TEXT")
+    _ensure_column(connection, "execution_orders", "strategy_role", "TEXT")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_execution_orders_strategy
+        ON execution_orders(strategy_key, status)
+        """
+    )
     _ensure_column(connection, "notification_deliveries", "summary_kind", "TEXT NOT NULL DEFAULT 'daily'")
     connection.commit()
 

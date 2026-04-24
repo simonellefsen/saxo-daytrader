@@ -60,6 +60,27 @@ scheduler:
   history_max_rows: 250
   history_retention_days: 30
 
+strategy:
+  enabled: true
+  selection_interval_minutes: 15
+  max_candidates: 20
+  min_selected_assets: 3
+  max_selected_assets: 8
+  max_assets_per_sector: 2
+  estimated_slippage_bps: 8
+  cost_guard_multiple: 1.5
+  ladder:
+    rung_count: 5
+    atr_spacing_min: 0.15
+    atr_spacing_factor: 0.25
+    atr_spacing_max: 0.4
+    stop_loss_atr_multiple: 2.0
+    take_profit_rung_multiple: 2.0
+    min_position_weight: 0.02
+    max_position_weight: 0.04
+    flatten_minutes_before_tradable_close: 15
+    trail_stop_atr_multiple: 1.25
+
 execution:
   #mode: simulation
   mode: live

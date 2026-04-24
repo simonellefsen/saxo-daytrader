@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +18,18 @@ from saxo_daytrader_xai.market_schedule import get_market_status
 from saxo_daytrader_xai.saxo_openapi import (
     SaxoOrderNotFoundError,
     SaxoSessionError,
-    build_market_order_payload,
+    build_order_payload,
     cancel_order,
     change_order,
     ensure_access_token,
     get_balance_snapshot,
     get_accounts_snapshot,
+    get_chart_samples,
     get_instrument_exposures,
     get_open_order,
     get_order_activity_last,
     get_positions_snapshot,
+    lookup_instrument,
     place_order,
     precheck_order,
 )
@@ -39,6 +41,7 @@ from saxo_daytrader_xai.portfolio import (
     fetch_portfolio_positions,
     fetch_portfolio_summary,
 )
+from saxo_daytrader_xai.strategy_engine import TERMINAL_ORDER_STATUSES, strategy_enabled
 from saxo_daytrader_xai.tax_engine import calculate_sell_outcome, update_ledger
 from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report
 
@@ -93,6 +96,50 @@ def _market_status_for_symbol(symbol: str, config: dict[str, Any]) -> dict[str, 
         return None
     rows = get_market_status(config)
     return next((row for row in rows if str(row.get("code")) == exchange_code), None)
+
+
+def _request_payload(order: dict[str, Any]) -> dict[str, Any]:
+    payload = order.get("request_json")
+    if isinstance(payload, str) and payload:
+        try:
+            return json.loads(payload)
+        except ValueError:
+            return {}
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _strategy_plan(report: dict[str, Any] | None) -> dict[str, Any]:
+    if not report:
+        return {}
+    report_json = report.get("report_json") or {}
+    if isinstance(report_json, str):
+        try:
+            report_json = json.loads(report_json)
+        except ValueError:
+            return {}
+    return dict(report_json.get("strategy_plan") or {})
+
+
+def _terminal_status(status: str | None) -> bool:
+    return str(status or "") in TERMINAL_ORDER_STATUSES
+
+
+def _strategy_row_signature(order: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+    return (
+        str(order.get("strategy_key") or "") or None,
+        str(order.get("symbol") or "") or None,
+        str(order.get("strategy_role") or "") or None,
+    )
+
+
+def _order_working_price(order: dict[str, Any]) -> float | None:
+    for key in ("limit_price_local", "stop_price_local", "price_local"):
+        value = _coerce_float(order.get(key))
+        if value is not None:
+            return value
+    return None
 
 
 def _should_auto_submit_live_orders(config: dict[str, Any]) -> bool:
@@ -363,6 +410,104 @@ def _mark_execution_failed(
     return {"status": "execution_failed", "order_id": order_id, "error": error_text}
 
 
+def _record_related_orders_after_submission(
+    connection,
+    *,
+    parent_order: dict[str, Any],
+    broker_payload: dict[str, Any],
+    broker_result: dict[str, Any],
+) -> list[int]:
+    request_payload = _request_payload(parent_order)
+    related_orders = list(request_payload.get("related_orders") or [])
+    if not related_orders:
+        return []
+    created_at = datetime.now(UTC).isoformat(timespec="seconds")
+    child_results = list(broker_result.get("Orders") or [])
+    inserted_ids: list[int] = []
+    for index, child in enumerate(related_orders):
+        strategy_role = str(child.get("strategy_role") or f"child_{index}")
+        strategy_key = None
+        if parent_order.get("strategy_key"):
+            strategy_key = f"{parent_order['strategy_key']}:{strategy_role}"
+        existing = None
+        if strategy_key:
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM execution_orders
+                WHERE strategy_key = ?
+                  AND parent_execution_order_id = ?
+                LIMIT 1
+                """,
+                (strategy_key, parent_order["id"]),
+            ).fetchone()
+        if existing:
+            inserted_ids.append(int(existing["id"]))
+            continue
+        child_broker_result = child_results[index] if index < len(child_results) else {}
+        order_type = str(child.get("order_type") or "Limit")
+        limit_price = _coerce_float(child.get("limit_price"))
+        stop_price = _coerce_float(child.get("stop_price"))
+        price_local = limit_price if order_type == "Limit" else stop_price
+        execution_result_json = {
+            "payload": {
+                "AccountKey": broker_payload.get("AccountKey"),
+                "Amount": child_quantity if (child_quantity := float(child.get("quantity") or parent_order["quantity"])) else float(parent_order["quantity"]),
+                "AssetType": broker_payload.get("AssetType", "Stock"),
+                "BuySell": "Buy" if str(child.get("action", "SELL")).upper() == "BUY" else "Sell",
+                "OrderDuration": {"DurationType": str(child.get("duration_type") or "GoodTillCancel")},
+                "OrderType": order_type,
+                "OrderPrice": limit_price if order_type == "Limit" else stop_price,
+                "Uic": broker_payload.get("Uic"),
+            },
+            "broker_result": child_broker_result,
+            "parent_broker_order_id": parent_order.get("broker_order_id"),
+            "parent_payload": broker_payload,
+        }
+        cursor = connection.execute(
+            """
+            INSERT INTO execution_orders (
+                created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                approval_required, approved_at, broker_order_id, parent_execution_order_id,
+                strategy_type, strategy_session, strategy_key, strategy_role,
+                request_json, execution_result_json, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                parent_order.get("report_id"),
+                parent_order["symbol"],
+                child.get("action", "SELL"),
+                order_type,
+                parent_order["mode"],
+                "submitted_to_broker",
+                parent_order["adapter"],
+                parent_order.get("requested_weight_pct"),
+                float(child.get("quantity") or parent_order["quantity"]),
+                price_local,
+                limit_price,
+                stop_price,
+                parent_order.get("currency"),
+                parent_order.get("estimated_value_dkk"),
+                0,
+                datetime.now(UTC).isoformat(timespec="seconds"),
+                str(child_broker_result.get("OrderId", "")) or None,
+                parent_order["id"],
+                parent_order.get("strategy_type"),
+                parent_order.get("strategy_session"),
+                strategy_key,
+                strategy_role,
+                json.dumps(child, ensure_ascii=False, sort_keys=True),
+                json.dumps(execution_result_json, ensure_ascii=False, sort_keys=True),
+                None,
+            ),
+        )
+        inserted_ids.append(int(cursor.lastrowid))
+    connection.commit()
+    return inserted_ids
+
+
 def _is_retryable_execution_failure(error_text: str | None) -> bool:
     text = str(error_text or "").casefold()
     if not text:
@@ -496,6 +641,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         return [dict(row) for row in existing]
 
     report_json = report["report_json"] or {}
+    strategy_plan = _strategy_plan(report)
     suggestions = report_json.get("suggested_trades", [])
     batch_id = fetch_latest_batch_id(connection)
     initial_cash_dkk = _initial_cash_dkk(config)
@@ -520,12 +666,119 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     live_price_map = _get_live_price_map([symbol for symbol in live_symbols if symbol], config)
     fx_snapshot = fetch_ecb_fx_rates()
     created_at = datetime.now(UTC).isoformat(timespec="seconds")
-    orders = []
+    new_orders: list[dict[str, Any]] = []
+    result_orders: list[dict[str, Any]] = []
     max_position_weight = float(config["risk"]["max_position_weight"])
     min_trade_value_dkk = float(config["execution"]["min_trade_value_dkk"])
     remaining_capacity = _remaining_daily_order_capacity(connection, config)
     remaining_cash_dkk = float(portfolio_summary["cash_balance_dkk"] or 0.0)
     approval_required = _approval_required_for_order(config)
+    desired_strategy_orders = list(strategy_plan.get("ladder_orders") or []) if strategy_enabled(config) else []
+    active_strategy_by_key: dict[str, dict[str, Any]] = {}
+    if desired_strategy_orders:
+        desired_keys = [str(item.get("strategy_key") or "") for item in desired_strategy_orders if item.get("strategy_key")]
+        if desired_keys:
+            placeholders = ",".join("?" for _ in desired_keys)
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM execution_orders
+                WHERE strategy_key IN ({placeholders})
+                  AND status NOT IN ({",".join("?" for _ in TERMINAL_ORDER_STATUSES)})
+                ORDER BY id ASC
+                """,
+                (*desired_keys, *tuple(TERMINAL_ORDER_STATUSES)),
+            ).fetchall()
+            active_strategy_by_key = {
+                str(row["strategy_key"]): dict(row)
+                for row in rows
+                if row["strategy_key"]
+            }
+
+    for desired in desired_strategy_orders:
+        if remaining_capacity <= 0:
+            break
+        strategy_key = str(desired.get("strategy_key") or "")
+        symbol = str(desired["symbol"])
+        active_existing = active_strategy_by_key.get(strategy_key) if strategy_key else None
+        requested_weight_pct = float(desired.get("requested_weight_pct") or 0.0)
+        quantity = float(desired.get("quantity") or 0.0)
+        limit_price = _coerce_float(desired.get("limit_price_local"))
+        stop_price = _coerce_float(desired.get("stop_price_local"))
+        price_local = limit_price or stop_price or _coerce_float(desired.get("price_local"))
+        if active_existing:
+            if active_existing["status"] in {
+                "pending_execution",
+                "pending_approval",
+                "waiting_for_market_open",
+                "waiting_for_cash_settlement",
+                "waiting_for_virtual_cash_budget",
+            }:
+                connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET report_id = ?, quantity = ?, price_local = ?, limit_price_local = ?, stop_price_local = ?,
+                        requested_weight_pct = ?, request_json = ?, error_text = NULL
+                    WHERE id = ?
+                    """,
+                    (
+                        report["id"],
+                        quantity,
+                        price_local,
+                        limit_price,
+                        stop_price,
+                        requested_weight_pct,
+                        json.dumps(desired, ensure_ascii=False, sort_keys=True),
+                        active_existing["id"],
+                    ),
+                )
+                connection.commit()
+                result_orders.append(dict(connection.execute("SELECT * FROM execution_orders WHERE id = ?", (active_existing["id"],)).fetchone()))
+            else:
+                result_orders.append(active_existing)
+            continue
+        market_row = _market_status_for_symbol(symbol, config)
+        if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
+            append_audit_log(
+                connection,
+                "execution_order_skipped_market_closed",
+                {
+                    "report_id": report["id"],
+                    "symbol": symbol,
+                    "action": desired["action"],
+                    "status_reason": market_row.get("status_reason"),
+                    "next_open": market_row.get("next_open"),
+                    "strategy_key": strategy_key,
+                },
+            )
+            continue
+        new_orders.append(
+            {
+                "symbol": symbol,
+                "action": desired["action"],
+                "order_type": str(desired.get("order_type") or "Market"),
+                "mode": config["execution"]["mode"],
+                "status": "pending_approval" if approval_required else "pending_execution",
+                "adapter": config["execution"]["adapter"],
+                "requested_weight_pct": requested_weight_pct,
+                "quantity": quantity,
+                "price_local": price_local,
+                "limit_price_local": limit_price,
+                "stop_price_local": stop_price,
+                "currency": desired.get("currency"),
+                "estimated_value_dkk": float(desired.get("estimated_value_dkk") or 0.0),
+                "approval_required": 1 if approval_required else 0,
+                "parent_execution_order_id": None,
+                "strategy_type": str(desired.get("strategy_type") or "ladder"),
+                "strategy_session": desired.get("session_tag"),
+                "strategy_key": strategy_key,
+                "strategy_role": desired.get("strategy_role"),
+                "request_json": json.dumps(desired, ensure_ascii=False, sort_keys=True),
+                "execution_result_json": None,
+                "error_text": None,
+            }
+        )
+        remaining_capacity -= 1
 
     for suggestion in suggestions:
         if remaining_capacity <= 0:
@@ -533,6 +786,8 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         action = suggestion["action"]
         symbol = suggestion["symbol"]
         if action not in {"BUY", "SELL"}:
+            continue
+        if desired_strategy_orders and action == "BUY":
             continue
         market_row = _market_status_for_symbol(symbol, config)
         if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
@@ -555,19 +810,27 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         try:
             price_local, currency, fx_rate = _estimate_price_and_fx(symbol, position_map, live_price_map, fx_snapshot)
         except Exception as exc:  # noqa: BLE001
-            orders.append(
+            new_orders.append(
                 {
                     "symbol": symbol,
                     "action": action,
+                    "order_type": "Market",
                     "mode": config["execution"]["mode"],
                     "status": "error",
                     "adapter": config["execution"]["adapter"],
                     "requested_weight_pct": requested_weight_pct,
                     "quantity": 0.0,
                     "price_local": None,
+                    "limit_price_local": None,
+                    "stop_price_local": None,
                     "currency": None,
                     "estimated_value_dkk": 0.0,
                     "approval_required": 1 if approval_required else 0,
+                    "parent_execution_order_id": None,
+                    "strategy_type": None,
+                    "strategy_session": None,
+                    "strategy_key": None,
+                    "strategy_role": None,
                     "request_json": json.dumps(suggestion, ensure_ascii=False, sort_keys=True),
                     "execution_result_json": None,
                     "error_text": str(exc),
@@ -630,19 +893,27 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
             except ValueError:
                 pass
 
-        orders.append(
+        new_orders.append(
             {
                 "symbol": symbol,
                 "action": action,
+                "order_type": "Market",
                 "mode": config["execution"]["mode"],
                 "status": "pending_approval" if approval_required else "pending_execution",
                 "adapter": config["execution"]["adapter"],
                 "requested_weight_pct": requested_weight_pct,
                 "quantity": float(whole_quantity),
                 "price_local": price_local,
+                "limit_price_local": None,
+                "stop_price_local": None,
                 "currency": currency,
                 "estimated_value_dkk": estimated_value_dkk,
                 "approval_required": 1 if approval_required else 0,
+                "parent_execution_order_id": None,
+                "strategy_type": None,
+                "strategy_session": None,
+                "strategy_key": None,
+                "strategy_role": None,
                 "request_json": json.dumps(suggestion, ensure_ascii=False, sort_keys=True),
                 "execution_result_json": None,
                 "error_text": None,
@@ -653,10 +924,11 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     connection.executemany(
         """
         INSERT INTO execution_orders (
-            created_at, report_id, symbol, action, mode, status, adapter,
-            requested_weight_pct, quantity, price_local, currency, estimated_value_dkk,
-            approval_required, request_json, execution_result_json, error_text
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, report_id, symbol, action, order_type, mode, status, adapter,
+            requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+            approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+            request_json, execution_result_json, error_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -664,20 +936,28 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
                 report["id"],
                 order["symbol"],
                 order["action"],
+                order.get("order_type", "Market"),
                 order["mode"],
                 order["status"],
                 order["adapter"],
                 order["requested_weight_pct"],
                 order["quantity"],
                 order["price_local"],
+                order.get("limit_price_local"),
+                order.get("stop_price_local"),
                 order["currency"],
                 order["estimated_value_dkk"],
                 order["approval_required"],
+                order.get("parent_execution_order_id"),
+                order.get("strategy_type"),
+                order.get("strategy_session"),
+                order.get("strategy_key"),
+                order.get("strategy_role"),
                 order["request_json"],
                 order["execution_result_json"],
                 order["error_text"],
             )
-            for order in orders
+            for order in new_orders
         ],
     )
     connection.commit()
@@ -685,7 +965,169 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         "SELECT * FROM execution_orders WHERE report_id = ? ORDER BY id",
         (report["id"],),
     ).fetchall()
-    return [dict(row) for row in created]
+    created_orders = [dict(row) for row in created]
+    created_orders.extend(result_orders)
+    if desired_strategy_orders:
+        created_orders.extend(
+            [
+                row
+                for key, row in active_strategy_by_key.items()
+                if key in {str(item.get("strategy_key") or "") for item in desired_strategy_orders}
+                and row["id"] not in {created_row["id"] for created_row in created_orders}
+            ]
+        )
+    deduped: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for row in created_orders:
+        row_id = int(row["id"])
+        if row_id in seen_ids:
+            continue
+        seen_ids.add(row_id)
+        deduped.append(row)
+    return deduped
+
+
+def _flatten_due_for_symbol(symbol: str, config: dict[str, Any]) -> bool:
+    if not strategy_enabled(config):
+        return False
+    market_row = _market_status_for_symbol(symbol, config)
+    if not market_row or not bool(market_row.get("is_tradable")):
+        return False
+    tradable_close_at = market_row.get("tradable_close_at_utc")
+    if not tradable_close_at:
+        return False
+    try:
+        close_dt = datetime.fromisoformat(str(tradable_close_at))
+    except ValueError:
+        return False
+    flatten_minutes = int(config.get("strategy", {}).get("ladder", {}).get("flatten_minutes_before_tradable_close", 15) or 15)
+    now = datetime.now(UTC)
+    return close_dt - timedelta(minutes=flatten_minutes) <= now < close_dt
+
+
+def enqueue_session_flatten_orders(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        if str(resolved_config.get("execution", {}).get("mode")) != "live":
+            return {"status": "skipped", "created_order_ids": []}
+        if str(resolved_config.get("execution", {}).get("adapter")) != "saxo":
+            return {"status": "skipped", "created_order_ids": []}
+        batch_id = fetch_latest_batch_id(resolved_connection)
+        initial_cash_dkk = _initial_cash_dkk(resolved_config)
+        prefer_broker_cash = _prefer_broker_state(resolved_config)
+        positions = fetch_portfolio_positions(
+            resolved_connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        )
+        created: list[int] = []
+        for position in positions:
+            symbol = str(position["symbol"])
+            quantity = _whole_share_quantity(float(position["quantity"] or 0.0))
+            if quantity <= 0 or not _flatten_due_for_symbol(symbol, resolved_config):
+                continue
+            existing_flatten = resolved_connection.execute(
+                """
+                SELECT id
+                FROM execution_orders
+                WHERE symbol = ?
+                  AND strategy_type = 'flatten'
+                  AND status NOT IN ({})
+                LIMIT 1
+                """.format(",".join("?" for _ in TERMINAL_ORDER_STATUSES)),
+                (symbol, *tuple(TERMINAL_ORDER_STATUSES)),
+            ).fetchone()
+            if existing_flatten:
+                continue
+            pending_rows = resolved_connection.execute(
+                """
+                SELECT *
+                FROM execution_orders
+                WHERE symbol = ?
+                  AND mode = 'live'
+                  AND status NOT IN ({})
+                  AND (strategy_type IS NULL OR strategy_type != 'flatten')
+                ORDER BY id ASC
+                """.format(",".join("?" for _ in TERMINAL_ORDER_STATUSES)),
+                (symbol, *tuple(TERMINAL_ORDER_STATUSES)),
+            ).fetchall()
+            for row in pending_rows:
+                pending_order = dict(row)
+                if pending_order["status"] in MANAGEABLE_LIVE_STATUSES:
+                    try:
+                        manage_live_order(
+                            int(pending_order["id"]),
+                            management_action="cancel",
+                            config=resolved_config,
+                            connection=resolved_connection,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif pending_order["status"] in {
+                    "pending_execution",
+                    "pending_approval",
+                    "waiting_for_market_open",
+                    "waiting_for_cash_settlement",
+                    "waiting_for_virtual_cash_budget",
+                }:
+                    resolved_connection.execute(
+                        "UPDATE execution_orders SET status = ?, error_text = ? WHERE id = ?",
+                        ("cancelled", "Cancelled due to session-close flatten window", int(pending_order["id"])),
+                    )
+            cursor = resolved_connection.execute(
+                """
+                INSERT INTO execution_orders (
+                    created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                    requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                    approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+                    request_json, execution_result_json, error_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now(UTC).isoformat(timespec="seconds"),
+                    None,
+                    symbol,
+                    "SELL",
+                    "Market",
+                    "live",
+                    "pending_execution",
+                    resolved_config["execution"]["adapter"],
+                    0.0,
+                    float(quantity),
+                    _coerce_float(position.get("current_price_local")),
+                    None,
+                    None,
+                    position.get("currency"),
+                    _coerce_float(position.get("market_value_dkk")) or 0.0,
+                    0,
+                    None,
+                    "flatten",
+                    parse_exchange_code(symbol),
+                    f"flatten:{symbol}:{datetime.now(UTC).date().isoformat()}",
+                    "flatten_close",
+                    json.dumps(
+                        {
+                            "symbol": symbol,
+                            "action": "SELL",
+                            "order_type": "Market",
+                            "strategy_type": "flatten",
+                            "strategy_role": "flatten_close",
+                            "reason": "Session close flatten window",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    None,
+                    None,
+                ),
+            )
+            created.append(int(cursor.lastrowid))
+        resolved_connection.commit()
+        return {"status": "ok", "created_order_ids": created}
+    finally:
+        if should_close:
+            resolved_connection.close()
 
 
 def _record_buy_trade(connection, config: dict[str, Any], order: dict[str, Any], batch_id: str) -> dict[str, Any]:
@@ -2006,13 +2448,19 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                             "error": error_text,
                             "cash_gate": cash_gate,
                         }
-                payload = build_market_order_payload(
+                order_request = _request_payload(order)
+                payload = build_order_payload(
                     symbol=order["symbol"],
                     action=order["action"],
                     quantity=float(_whole_share_quantity(float(order["quantity"]))),
                     external_reference=f"saxo-daytrader:{order_id}",
                     config=resolved_config,
                     session=session,
+                    order_type=str(order.get("order_type") or order_request.get("order_type") or "Market"),
+                    limit_price=_coerce_float(order.get("limit_price_local")) or _coerce_float(order_request.get("limit_price_local")),
+                    stop_price=_coerce_float(order.get("stop_price_local")) or _coerce_float(order_request.get("stop_price_local")),
+                    duration_type=str(order_request.get("duration_type") or "DayOrder"),
+                    related_orders=list(order_request.get("related_orders") or []),
                 )
                 precheck = precheck_order(payload, resolved_config, session)
                 broker_result = place_order(payload, resolved_config, session)
@@ -2035,16 +2483,29 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                     ),
                 )
                 resolved_connection.commit()
+                child_order_ids = _record_related_orders_after_submission(
+                    resolved_connection,
+                    parent_order={**order, "broker_order_id": str(broker_result.get("OrderId", "")) or None},
+                    broker_payload=payload,
+                    broker_result=broker_result,
+                )
                 append_audit_log(
                     resolved_connection,
                     "execution_order_submitted",
-                    {"order_id": order_id, "mode": order["mode"], "adapter": order["adapter"], "payload": payload},
+                    {
+                        "order_id": order_id,
+                        "mode": order["mode"],
+                        "adapter": order["adapter"],
+                        "payload": payload,
+                        "child_order_ids": child_order_ids,
+                    },
                 )
                 return {
                     "status": "submitted_to_broker",
                     "order_id": order_id,
                     "broker_result": broker_result,
                     "precheck": precheck,
+                    "child_order_ids": child_order_ids,
                 }
             except (SaxoSessionError, requests.RequestException, ValueError) as exc:  # type: ignore[name-defined]
                 error_text = str(exc)
@@ -2311,6 +2772,107 @@ def manage_live_order(
             resolved_connection.close()
 
 
+def maintain_ladder_orders(*, config: dict[str, Any] | None = None, connection=None, limit: int = 50) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        if not strategy_enabled(resolved_config):
+            return {"status": "disabled", "updated": 0, "orders": []}
+        rows = resolved_connection.execute(
+            """
+            SELECT *
+            FROM execution_orders
+            WHERE mode = 'live'
+              AND strategy_type = 'ladder'
+              AND strategy_role = 'stop_loss'
+              AND status IN ('submitted_to_broker', 'broker_working', 'broker_amended', 'broker_replace_requested')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return {"status": "ok", "updated": 0, "orders": []}
+        session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+        updates: list[dict[str, Any]] = []
+        for row in rows:
+            order = dict(row)
+            parent_order = None
+            if order.get("parent_execution_order_id"):
+                parent_row = resolved_connection.execute(
+                    "SELECT * FROM execution_orders WHERE id = ?",
+                    (int(order["parent_execution_order_id"]),),
+                ).fetchone()
+                parent_order = dict(parent_row) if parent_row else None
+            if parent_order and parent_order.get("status") not in {"executed", "broker_partially_filled", "submitted_to_broker", "broker_working"}:
+                continue
+            parent_request = _request_payload(parent_order or {})
+            metadata = dict(parent_request.get("strategy_metadata") or {})
+            if not metadata:
+                continue
+            try:
+                instrument = lookup_instrument(order["symbol"], resolved_config, session)
+                payload = get_chart_samples(
+                    uic=instrument.uic,
+                    asset_type=instrument.asset_type,
+                    config=resolved_config,
+                    session=session,
+                    horizon_minutes=1,
+                    count=20,
+                )
+            except Exception as exc:  # noqa: BLE001
+                updates.append({"order_id": order["id"], "status": "chart_error", "error": str(exc)})
+                continue
+            bars = payload.get("Data", []) or []
+            if not bars:
+                continue
+            latest_bar = bars[-1]
+            current_price = _coerce_float(latest_bar.get("Close"))
+            if current_price is None:
+                continue
+            current_stop = _coerce_float(order.get("stop_price_local")) or _coerce_float(order.get("price_local"))
+            if current_stop is None:
+                continue
+            atr = float(metadata.get("atr_1m") or 0.0)
+            trail_multiple = float(metadata.get("trail_stop_atr_multiple") or 1.25)
+            decimals = int(metadata.get("decimals") or 2)
+            activation_price = _coerce_float(metadata.get("trail_activation_price_local"))
+            if activation_price is None or current_price < activation_price:
+                continue
+            proposed_stop = round(max(current_stop, current_price - (atr * trail_multiple)), max(decimals, 0))
+            if proposed_stop <= current_stop:
+                continue
+            result = manage_live_order(
+                int(order["id"]),
+                management_action="replace",
+                config=resolved_config,
+                connection=resolved_connection,
+                new_quantity=float(order["quantity"]),
+                new_price=proposed_stop,
+            )
+            if result["status"] in {"broker_replace_requested", "broker_amended"}:
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET stop_price_local = ?, price_local = ?
+                    WHERE id = ?
+                    """,
+                    (proposed_stop, proposed_stop, int(order["id"])),
+                )
+                resolved_connection.commit()
+            updates.append(
+                {
+                    "order_id": order["id"],
+                    "status": result["status"],
+                    "current_price": current_price,
+                    "new_stop_price": proposed_stop,
+                }
+            )
+        return {"status": "ok", "updated": len(updates), "orders": updates}
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
 def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
@@ -2318,6 +2880,7 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
         orders = []
         if report and report["status"] == "completed":
             orders = _create_or_fetch_orders(resolved_connection, resolved_config, report)
+        flatten_result = enqueue_session_flatten_orders(config=resolved_config, connection=resolved_connection)
         executed = []
         executable_statuses = {
             "pending_execution",
@@ -2359,6 +2922,7 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
         return {
             "status": "ok" if report and report["status"] == "completed" else "processed_existing_queue",
             "orders": orders,
+            "flatten": flatten_result,
             "executed": executed,
             "broker_sync": broker_sync,
             "alerts": alert_result,

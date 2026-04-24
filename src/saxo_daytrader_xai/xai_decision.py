@@ -20,6 +20,7 @@ from saxo_daytrader_xai.portfolio import (
     fetch_portfolio_summary,
     fetch_portfolio_symbols,
 )
+from saxo_daytrader_xai.strategy_engine import build_strategy_plan, strategy_selection_interval_minutes
 from saxo_daytrader_xai.watchlists import build_watchlists
 
 
@@ -74,6 +75,23 @@ DECISION_REPORT_SCHEMA: dict[str, Any] = {
                     "risks": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["symbol", "thesis", "catalysts", "risks"],
+                "additionalProperties": False,
+            },
+        },
+        "candidate_assets": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["BUY", "SELL", "WATCH"]},
+                    "xai_score": {"type": "number"},
+                    "sector": {"type": ["string", "null"]},
+                    "thesis": {"type": "string"},
+                    "catalysts": {"type": "array", "items": {"type": "string"}},
+                    "risks": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["symbol", "direction", "xai_score", "sector", "thesis", "catalysts", "risks"],
                 "additionalProperties": False,
             },
         },
@@ -296,9 +314,11 @@ Task:
 1. Assess the current market regime for a day-trading horizon.
 2. Evaluate the existing portfolio, including concentration and downside risks.
 3. Evaluate whether the portfolio is currently on track versus the DKK 500/day and DKK 3,500/week goals using the provided day/week/month/year/all-time performance data.
-4. Identify the highest-priority trade adjustments for today, if any.
+4. Return a candidate asset pool of 5-20 symbols in candidate_assets, driven primarily by news and sentiment. candidate_assets is the upstream idea list, not the final execution list.
+5. Identify the highest-priority trade adjustments for today, if any.
 5. Respect Danish tax drag, commission drag, and the long-only / exclusion constraints.
-6. Produce a concise but concrete decision report for the operator.
+6. If a market is not currently tradable, use WATCH or HOLD rather than a live trade recommendation.
+7. Produce a concise but concrete decision report for the operator.
 """.strip()
 
     return {
@@ -336,6 +356,17 @@ def _mock_decision_report(context: dict[str, Any], config: dict[str, Any]) -> di
                 "thesis": "Highest-ranked watchlist symbol from current inputs.",
                 "catalysts": ["Watchlist ranking and live quote inputs"],
                 "risks": ["Mock report only; requires live xAI confirmation"],
+            }
+        ],
+        "candidate_assets": [
+            {
+                "symbol": top_watch,
+                "direction": "WATCH",
+                "xai_score": 50.0,
+                "sector": None,
+                "thesis": "Mock candidate because no live xAI response was requested.",
+                "catalysts": ["Mock mode candidate pool"],
+                "risks": ["Requires live xAI confirmation before deployment"],
             }
         ],
         "suggested_trades": [
@@ -431,14 +462,15 @@ def fetch_latest_decision_report(connection) -> dict[str, Any] | None:
 def should_auto_run_decision_report(connection, config: dict[str, Any], analysis_window_active: bool) -> bool:
     if not analysis_window_active:
         return False
+    rerun_minutes = strategy_selection_interval_minutes(config)
     latest = _latest_report_row(connection)
     if not latest or latest["status"] != "completed":
         if not latest:
             return True
         latest_time = datetime.fromisoformat(latest["created_at"])
-        return datetime.now(UTC) - latest_time > timedelta(minutes=int(config["xai"]["auto_run_interval_minutes"]))
+        return datetime.now(UTC) - latest_time > timedelta(minutes=rerun_minutes)
     latest_time = datetime.fromisoformat(latest["created_at"])
-    return datetime.now(UTC) - latest_time > timedelta(minutes=int(config["xai"]["auto_run_interval_minutes"]))
+    return datetime.now(UTC) - latest_time > timedelta(minutes=rerun_minutes)
 
 
 def generate_decision_report(
@@ -474,6 +506,21 @@ def generate_decision_report(
             status = "failed"
             error_text = str(exc)
             report_json = _mock_decision_report(context, resolved_config)
+
+        try:
+            strategy_plan = build_strategy_plan(
+                report_json=report_json,
+                context=context,
+                config=resolved_config,
+            )
+            report_json["strategy_plan"] = strategy_plan
+        except Exception as exc:  # noqa: BLE001
+            report_json["strategy_plan"] = {
+                "status": "failed",
+                "selected_assets": [],
+                "ladder_orders": [],
+                "notes": [f"Strategy plan generation failed: {exc}"],
+            }
 
         cursor = resolved_connection.execute(
             """

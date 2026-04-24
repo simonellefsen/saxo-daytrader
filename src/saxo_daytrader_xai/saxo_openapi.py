@@ -347,21 +347,87 @@ def build_market_order_payload(
     config: dict[str, Any],
     session: dict[str, Any],
 ) -> dict[str, Any]:
+    return build_order_payload(
+        symbol=symbol,
+        action=action,
+        quantity=quantity,
+        external_reference=external_reference,
+        config=config,
+        session=session,
+        order_type="Market",
+    )
+
+
+def build_order_payload(
+    *,
+    symbol: str,
+    action: str,
+    quantity: float,
+    external_reference: str,
+    config: dict[str, Any],
+    session: dict[str, Any],
+    order_type: str = "Market",
+    limit_price: float | None = None,
+    stop_price: float | None = None,
+    duration_type: str = "DayOrder",
+    related_orders: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     instrument = lookup_instrument(symbol, config, session)
     whole_quantity = int(quantity)
     if whole_quantity <= 0:
         raise SaxoSessionError("Order quantity must be at least 1 whole share")
-    return {
+    payload = {
         "AccountKey": _account_key(config, session),
         "Amount": whole_quantity,
         "AssetType": instrument.asset_type,
         "BuySell": "Buy" if action == "BUY" else "Sell",
         "ExternalReference": external_reference[:50],
         "ManualOrder": True,
-        "OrderDuration": {"DurationType": "DayOrder"},
-        "OrderType": "Market",
+        "OrderDuration": {"DurationType": duration_type},
+        "OrderType": order_type,
         "Uic": instrument.uic,
     }
+    if order_type in {"Limit", "Stop", "StopLimit"}:
+        order_price = limit_price if order_type == "Limit" else stop_price
+        if order_price is None:
+            raise SaxoSessionError(f"{order_type} orders require a price")
+        payload["OrderPrice"] = float(order_price)
+    if order_type == "StopLimit":
+        if limit_price is None or stop_price is None:
+            raise SaxoSessionError("StopLimit orders require both stop_price and limit_price")
+        payload["OrderPrice"] = float(stop_price)
+        payload["StopLimitPrice"] = float(limit_price)
+    if related_orders:
+        payload["Orders"] = []
+        for item in related_orders:
+            child_quantity = int(item.get("quantity") or whole_quantity)
+            if child_quantity <= 0:
+                continue
+            child_type = str(item.get("order_type") or "Limit")
+            child_duration = str(item.get("duration_type") or "GoodTillCancel")
+            child_payload: dict[str, Any] = {
+                "Amount": child_quantity,
+                "AssetType": instrument.asset_type,
+                "BuySell": "Buy" if str(item.get("action")).upper() == "BUY" else "Sell",
+                "ManualOrder": True,
+                "OrderDuration": {"DurationType": child_duration},
+                "OrderType": child_type,
+                "Uic": instrument.uic,
+            }
+            child_price = item.get("limit_price")
+            child_stop = item.get("stop_price")
+            if child_type in {"Limit", "Stop", "StopLimit"}:
+                order_price = child_price if child_type == "Limit" else child_stop
+                if order_price is None:
+                    raise SaxoSessionError(f"Related {child_type} orders require a price")
+                child_payload["OrderPrice"] = float(order_price)
+            if child_type == "StopLimit":
+                if child_price is None or child_stop is None:
+                    raise SaxoSessionError("Related StopLimit orders require both stop and limit prices")
+                child_payload["OrderPrice"] = float(child_stop)
+                child_payload["StopLimitPrice"] = float(child_price)
+            payload["Orders"].append(child_payload)
+    return payload
 
 
 def precheck_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
@@ -388,6 +454,38 @@ def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[s
         timeout=30,
     )
     return _raise_for_saxo_response(response, action="Order placement")
+
+
+def get_chart_samples(
+    *,
+    uic: int,
+    asset_type: str,
+    config: dict[str, Any],
+    session: dict[str, Any],
+    horizon_minutes: int = 1,
+    count: int = 240,
+    mode: str = "UpTo",
+    time: str | None = None,
+) -> dict[str, Any]:
+    base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
+    params: dict[str, Any] = {
+        "AccountKey": _account_key(config, session),
+        "AssetType": asset_type,
+        "Uic": int(uic),
+        "Horizon": int(horizon_minutes),
+        "Count": int(count),
+        "Mode": mode,
+        "FieldGroups": "ChartInfo,DisplayAndFormat",
+    }
+    if time:
+        params["Time"] = time
+    response = requests.get(
+        f"{base_url}/chart/v3/charts",
+        params=params,
+        headers=_auth_headers(session["access_token"]),
+        timeout=30,
+    )
+    return _raise_for_saxo_response(response, action="Chart data")
 
 
 def get_balance_snapshot(config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:

@@ -913,6 +913,16 @@ if active_tab == "Decision Report":
         else:
             st.caption("No suggested trades in the latest report.")
 
+        strategy_plan = report.get("strategy_plan", {}) or {}
+        st.markdown("**Strategy Selection**")
+        if strategy_plan.get("selected_assets"):
+            st.dataframe(strategy_plan["selected_assets"], width="stretch", hide_index=True)
+        else:
+            st.caption("No strategy-selected assets in the latest report.")
+        if strategy_plan.get("notes"):
+            for note in strategy_plan.get("notes", []):
+                st.caption(note)
+
         st.markdown("**Watchlist Focus**")
         watchlist_focus = report.get("watchlist_focus", [])
         if watchlist_focus:
@@ -1074,7 +1084,11 @@ if active_tab == "Execution":
         st.markdown("**Manage Live Broker Orders**")
         for order in manageable_orders[:20]:
             cols = st.columns([3, 2, 2, 2, 2, 2])
-            cols[0].write(f"{order['id']} {order['action']} {order['symbol']}")
+            cols[0].write(
+                f"{order['id']} {order['action']} {order['symbol']} "
+                f"({order.get('order_type') or 'Market'}"
+                f"{' / ' + str(order.get('strategy_role')) if order.get('strategy_role') else ''})"
+            )
             cols[1].write(f"Status {order['status']}")
             replace_qty = cols[2].number_input(
                 "Qty",
@@ -1086,7 +1100,7 @@ if active_tab == "Execution":
             replace_price = cols[3].number_input(
                 "Price",
                 min_value=0.0,
-                value=float(order["price_local"] or 0.0),
+                value=float(order.get("limit_price_local") or order.get("stop_price_local") or order["price_local"] or 0.0),
                 step=0.01,
                 key=f"replace-price-{order['id']}",
             )
@@ -1119,12 +1133,18 @@ if active_tab == "Execution":
                     "Created": row["created_at"],
                     "Symbol": row["symbol"],
                     "Action": row["action"],
+                    "Order Type": row.get("order_type") or "Market",
+                    "Strategy": row.get("strategy_type") or "",
+                    "Role": row.get("strategy_role") or "",
+                    "Session": row.get("strategy_session") or "",
                     "Mode": row["mode"],
                     "Status": row["status"],
                     "Adapter": row["adapter"],
                     "Target Weight": _format_pct(row["requested_weight_pct"]),
                     "Quantity": _format_qty(row["quantity"]),
                     "Price": _format_money(row["price_local"], row["currency"]),
+                    "Limit": _format_money(row.get("limit_price_local"), row["currency"]),
+                    "Stop": _format_money(row.get("stop_price_local"), row["currency"]),
                     "Estimated Value DKK": _format_dkk(row["estimated_value_dkk"]),
                     "Broker Order ID": row["broker_order_id"],
                     "Ledger ID": row["ledger_id"],

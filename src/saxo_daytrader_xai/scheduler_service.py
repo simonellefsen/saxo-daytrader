@@ -10,7 +10,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db, prune_scheduler_cycles, record_scheduler_cycle, update_scheduler_status
-from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report, sync_broker_order_statuses
+from saxo_daytrader_xai.execution_engine import enqueue_session_flatten_orders, maintain_ladder_orders, queue_and_maybe_execute_latest_report, sync_broker_order_statuses
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
 from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
@@ -293,10 +293,22 @@ def run_price_monitor_cycle(
         except SaxoSessionError as exc:
             broker_sync = {"status": "error", "error": str(exc)}
     price_result = refresh_portfolio_price_state(config_path=config_path)
+    flatten_result = enqueue_session_flatten_orders(config=resolved_config)
+    ladder_maintenance = None
+    if (
+        str(resolved_config["execution"].get("mode")) == "live"
+        and str(resolved_config["execution"].get("adapter")) == "saxo"
+    ):
+        try:
+            ladder_maintenance = maintain_ladder_orders(config=resolved_config)
+        except SaxoSessionError as exc:
+            ladder_maintenance = {"status": "error", "error": str(exc)}
     return {
         "status": "ok",
         "price_monitor": price_result,
         "broker_sync": broker_sync,
+        "flatten": flatten_result,
+        "ladder_maintenance": ladder_maintenance,
     }
 
 
