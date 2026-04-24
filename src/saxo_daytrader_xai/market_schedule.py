@@ -331,9 +331,8 @@ def get_market_status(config: dict[str, Any], reference_time: datetime | None = 
     now_utc = (reference_time or datetime.now(UTC)).astimezone(UTC)
     analysis_cfg = config["analysis_windows"]
     offset_minutes = int(analysis_cfg["offset_minutes_after_open"])
-    duration_minutes = int(analysis_cfg["duration_minutes"])
     pre_sync_minutes = int(analysis_cfg.get("pre_sync_minutes_before_analysis", 5))
-    close_offset_minutes = int(analysis_cfg.get("close_offset_minutes_before_close", 60))
+    end_buffer_minutes = int(analysis_cfg.get("end_buffer_minutes_before_close", 15))
     refresh_market_calendars(config, reference_time=now_utc)
     rows: list[dict[str, Any]] = []
 
@@ -361,22 +360,15 @@ def get_market_status(config: dict[str, Any], reference_time: datetime | None = 
             is_open = open_utc <= now_utc <= close_utc
             is_tradable = open_utc <= now_utc < tradable_close_utc
             open_analysis_start = open_dt + timedelta(minutes=offset_minutes)
-            open_analysis_end = open_analysis_start + timedelta(minutes=duration_minutes)
+            open_analysis_end = max(open_analysis_start, tradable_close_dt - timedelta(minutes=end_buffer_minutes))
             pre_sync_start = max(open_dt, open_analysis_start - timedelta(minutes=pre_sync_minutes))
-            close_analysis_start = max(open_dt, close_dt - timedelta(minutes=close_offset_minutes))
-            close_analysis_end = tradable_close_dt
+            close_analysis_start = None
+            close_analysis_end = None
             open_analysis_window_active = open_analysis_start <= local_now <= open_analysis_end
-            close_analysis_window_active = close_analysis_start <= local_now <= close_analysis_end
+            close_analysis_window_active = False
             pre_analysis_sync_active = pre_sync_start <= local_now < open_analysis_start
-            analysis_window_active = open_analysis_window_active or close_analysis_window_active
-            if open_analysis_window_active and close_analysis_window_active:
-                analysis_window_kind = "open_and_close"
-            elif open_analysis_window_active:
-                analysis_window_kind = "open"
-            elif close_analysis_window_active:
-                analysis_window_kind = "close"
-            else:
-                analysis_window_kind = None
+            analysis_window_active = open_analysis_window_active
+            analysis_window_kind = "open" if open_analysis_window_active else None
         else:
             open_dt = None
             close_dt = None
@@ -434,10 +426,15 @@ def get_market_status(config: dict[str, Any], reference_time: datetime | None = 
                 "analysis_window_active": analysis_window_active,
                 "analysis_window_kind": analysis_window_kind,
                 "pre_analysis_sync_start": pre_sync_start.strftime("%Y-%m-%d %H:%M") if pre_sync_start is not None else "n/a",
+                "pre_analysis_sync_start_at_utc": pre_sync_start.astimezone(UTC).isoformat(timespec="seconds") if pre_sync_start is not None else None,
                 "open_analysis_window_start": open_analysis_start.strftime("%Y-%m-%d %H:%M") if open_analysis_start is not None else "n/a",
                 "open_analysis_window_end": open_analysis_end.strftime("%Y-%m-%d %H:%M") if open_analysis_end is not None else "n/a",
+                "open_analysis_window_start_at_utc": open_analysis_start.astimezone(UTC).isoformat(timespec="seconds") if open_analysis_start is not None else None,
+                "open_analysis_window_end_at_utc": open_analysis_end.astimezone(UTC).isoformat(timespec="seconds") if open_analysis_end is not None else None,
                 "close_analysis_window_start": close_analysis_start.strftime("%Y-%m-%d %H:%M") if close_analysis_start is not None else "n/a",
                 "close_analysis_window_end": close_analysis_end.strftime("%Y-%m-%d %H:%M") if close_analysis_end is not None else "n/a",
+                "close_analysis_window_start_at_utc": close_analysis_start.astimezone(UTC).isoformat(timespec="seconds") if close_analysis_start is not None else None,
+                "close_analysis_window_end_at_utc": close_analysis_end.astimezone(UTC).isoformat(timespec="seconds") if close_analysis_end is not None else None,
                 "analysis_window_start": open_analysis_start.strftime("%Y-%m-%d %H:%M") if open_analysis_start is not None else "n/a",
                 "analysis_window_end": open_analysis_end.strftime("%Y-%m-%d %H:%M") if open_analysis_end is not None else "n/a",
                 "next_open": next_open.strftime("%Y-%m-%d %H:%M"),

@@ -7,6 +7,7 @@ import useSWR, { mutate } from "swr";
 import { apiFetch, getFetcher, postAction } from "@/lib/api";
 import { formatDkk, formatLocalMoney, formatNumber, formatPercent, formatTimestamp, signedClass, toYahooFinanceUrl } from "@/lib/format";
 import type {
+  DecisionHistoryResponse,
   DecisionResponse,
   ExecutionResponse,
   MarketResponse,
@@ -55,6 +56,7 @@ function metricSubvalue(value: unknown, formatter: (value: unknown) => string) {
 export function DashboardShell() {
   const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
   const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
+  const [selectedDecisionId, setSelectedDecisionId] = useState<number | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [statusTone, setStatusTone] = useState<"info" | "warn" | "good">("info");
 
@@ -98,6 +100,11 @@ export function DashboardShell() {
     getFetcher,
     { refreshInterval: 60_000 },
   );
+  const decisionHistory = useSWR<DecisionHistoryResponse>(
+    activeTab === "decision" ? "/api/decision/reports?limit=20" : null,
+    getFetcher,
+    { refreshInterval: 60_000 },
+  );
   const execution = useSWR<ExecutionResponse>(
     activeTab === "execution" ? "/api/execution?limit=150" : null,
     getFetcher,
@@ -120,6 +127,7 @@ export function DashboardShell() {
         mutate(`/api/performance?range_key=${performanceRange}`),
         mutate("/api/execution?limit=150"),
         mutate("/api/decision/latest"),
+        mutate("/api/decision/reports?limit=20"),
         mutate("/api/scheduler?limit=10"),
       ]);
     } catch (error) {
@@ -136,6 +144,8 @@ export function DashboardShell() {
   const performanceSeries = useMemo(() => {
     return (performance.data?.history ?? []).map((row) => Number(row.total_market_value_dkk ?? 0));
   }, [performance.data?.history]);
+
+  const browserTimeZone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "local time", []);
 
   const portfolioColumns = useMemo(
     () => [
@@ -157,12 +167,42 @@ export function DashboardShell() {
   );
 
   const latestDecision = decision.data?.report;
-  const decisionSuggestions = Array.isArray(latestDecision?.report_json?.suggested_trades)
-    ? (latestDecision?.report_json?.suggested_trades as Array<Record<string, unknown>>)
+  const nextDecision = decision.data?.next_report ?? null;
+  const decisionHistoryItems = decisionHistory.data?.items ?? [];
+  const displayedDecision = useMemo(() => {
+    if (selectedDecisionId !== null) {
+      const selected = decisionHistoryItems.find((row) => Number(row.id) === selectedDecisionId);
+      if (selected) {
+        return selected;
+      }
+    }
+    return latestDecision ?? decisionHistoryItems[0] ?? null;
+  }, [decisionHistoryItems, latestDecision, selectedDecisionId]);
+  const decisionSuggestions = Array.isArray(displayedDecision?.report_json?.suggested_trades)
+    ? (displayedDecision?.report_json?.suggested_trades as Array<Record<string, unknown>>)
     : [];
-  const selectedAssets = Array.isArray(latestDecision?.report_json?.strategy_plan?.selected_assets)
-    ? (latestDecision?.report_json?.strategy_plan?.selected_assets as Array<Record<string, unknown>>)
+  const selectedAssets = Array.isArray(displayedDecision?.report_json?.strategy_plan?.selected_assets)
+    ? (displayedDecision?.report_json?.strategy_plan?.selected_assets as Array<Record<string, unknown>>)
     : [];
+  const strategyPlan = (displayedDecision?.report_json?.strategy_plan ?? {}) as Record<string, unknown>;
+  const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
+
+  useEffect(() => {
+    if (!decisionHistoryItems.length && !latestDecision) {
+      setSelectedDecisionId(null);
+      return;
+    }
+    if (selectedDecisionId === null) {
+      const fallbackId = Number(latestDecision?.id ?? decisionHistoryItems[0]?.id ?? 0);
+      setSelectedDecisionId(fallbackId || null);
+      return;
+    }
+    const existsInHistory = decisionHistoryItems.some((row) => Number(row.id) === selectedDecisionId);
+    if (!existsInHistory && Number(latestDecision?.id) !== selectedDecisionId) {
+      const fallbackId = Number(latestDecision?.id ?? decisionHistoryItems[0]?.id ?? 0);
+      setSelectedDecisionId(fallbackId || null);
+    }
+  }, [decisionHistoryItems, latestDecision, selectedDecisionId]);
 
   const executionOrders = execution.data?.orders ?? [];
   const manageableOrders = executionOrders.filter((row) =>
@@ -367,7 +407,7 @@ export function DashboardShell() {
           <div className="panel-header">
             <div>
               <h2>Market Status</h2>
-              <p>Tradability, analysis windows, and calendar timing for tracked exchanges.</p>
+              <p>Tradability, analysis windows, and calendar timing for tracked exchanges. Times below are shown in {browserTimeZone}.</p>
             </div>
           </div>
           <div className="table-wrap">
@@ -377,12 +417,12 @@ export function DashboardShell() {
                   <th>Exchange</th>
                   <th>Status</th>
                   <th>Tradable</th>
-                  <th>Session Open</th>
-                  <th>Tradable Close</th>
+                  <th>Session Open ({browserTimeZone})</th>
+                  <th>Tradable Close ({browserTimeZone})</th>
                   <th>Pre-Sync</th>
                   <th>Open Window</th>
                   <th>Close Window</th>
-                  <th>Next Open</th>
+                  <th>Next Open ({browserTimeZone})</th>
                 </tr>
               </thead>
               <tbody>
@@ -391,12 +431,12 @@ export function DashboardShell() {
                     <td>{String(row.market ?? row.code)}</td>
                     <td>{String(row.status_reason ?? "")}</td>
                     <td>{row.is_tradable ? "Yes" : "No"}</td>
-                    <td>{String(row.session_open_local ?? "n/a")}</td>
-                    <td>{String(row.tradable_close_local ?? "n/a")}</td>
+                    <td>{row.session_open_at_utc ? formatTimestamp(row.session_open_at_utc) : "n/a"}</td>
+                    <td>{row.tradable_close_at_utc ? formatTimestamp(row.tradable_close_at_utc) : "n/a"}</td>
                     <td>{row.pre_analysis_sync_active ? "Active" : "No"}</td>
                     <td>{row.open_analysis_window_active ? "Active" : "No"}</td>
                     <td>{row.close_analysis_window_active ? "Active" : "No"}</td>
-                    <td>{String(row.next_open ?? "n/a")}</td>
+                    <td>{row.next_open_at_utc ? formatTimestamp(row.next_open_at_utc) : "n/a"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -421,11 +461,11 @@ export function DashboardShell() {
           <div className="mini-grid">
             <article className="mini-card">
               <div className="label">Created</div>
-              <div className="value">{formatTimestamp(latestDecision?.created_at)}</div>
+              <div className="value">{formatTimestamp(displayedDecision?.created_at)}</div>
             </article>
             <article className="mini-card">
               <div className="label">Status</div>
-              <div className="value">{String(latestDecision?.status ?? "n/a")}</div>
+              <div className="value">{String(displayedDecision?.status ?? "n/a")}</div>
             </article>
             <article className="mini-card">
               <div className="label">Selected Assets</div>
@@ -435,9 +475,35 @@ export function DashboardShell() {
               <div className="label">Suggested Trades</div>
               <div className="value">{formatNumber(decisionSuggestions.length, 0)}</div>
             </article>
+            <article className="mini-card">
+              <div className="label">Report Cadence</div>
+              <div className="value">Every {formatNumber(overview.data?.refresh?.decision_interval_minutes ?? 15, 0)} min</div>
+              <div className="subvalue">While an analysis window is active</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Cash Buffer</div>
+              <div className={`value ${cashManagement.requires_cash_raise ? "negative" : "positive"}`}>
+                {cashManagement.requires_cash_raise ? "Below target" : "Healthy"}
+              </div>
+              <div className="subvalue">
+                Cash {formatDkk(cashManagement.cash_balance_dkk)} · Shortfall {formatDkk(cashManagement.cash_buffer_shortfall_dkk)}
+              </div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Next Planned Report</div>
+              <div className="value">{formatTimestamp(nextDecision?.next_report_at)}</div>
+              <div className="subvalue">{String(nextDecision?.reason ?? "n/a")}</div>
+            </article>
           </div>
           <div className="grid-2">
             <div className="stack">
+              <div className="mini-card">
+                <div className="label">Strategy Status</div>
+                <div className="value">{String(strategyPlan.status ?? "n/a")}</div>
+                <div className="muted">
+                  {Array.isArray(strategyPlan.notes) ? (strategyPlan.notes as string[]).join(" ") : "n/a"}
+                </div>
+              </div>
               <div className="table-wrap">
                 <table>
                   <thead>
@@ -482,8 +548,47 @@ export function DashboardShell() {
                   </tbody>
                 </table>
               </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Created</th>
+                      <th>Status</th>
+                      <th>Strategy</th>
+                      <th>Selected</th>
+                      <th>Trades</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {decisionHistoryItems.map((row) => {
+                      const reportJson = (row.report_json ?? {}) as Record<string, unknown>;
+                      const historyStrategy = (reportJson.strategy_plan ?? {}) as Record<string, unknown>;
+                      const historySelected = Array.isArray(historyStrategy.selected_assets)
+                        ? historyStrategy.selected_assets.length
+                        : 0;
+                      const historyTrades = Array.isArray(reportJson.suggested_trades)
+                        ? reportJson.suggested_trades.length
+                        : 0;
+                      const isActive = Number(row.id) === selectedDecisionId;
+                      return (
+                        <tr
+                          key={String(row.id)}
+                          className={`history-row ${isActive ? "active" : ""}`}
+                          onClick={() => setSelectedDecisionId(Number(row.id))}
+                        >
+                          <td>{formatTimestamp(row.created_at)}</td>
+                          <td>{String(row.status ?? "")}</td>
+                          <td>{String(historyStrategy.status ?? "n/a")}</td>
+                          <td>{formatNumber(historySelected, 0)}</td>
+                          <td>{formatNumber(historyTrades, 0)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
-            <pre className="code-block">{JSON.stringify(latestDecision?.report_json ?? {}, null, 2)}</pre>
+            <pre className="code-block">{JSON.stringify(displayedDecision?.report_json ?? {}, null, 2)}</pre>
           </div>
         </section>
       ) : null}

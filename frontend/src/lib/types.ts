@@ -37,6 +37,7 @@ export interface OverviewResponse {
   refresh: {
     price_poll_interval_minutes: number;
     scheduler_poll_interval_minutes: number;
+    decision_interval_minutes: number;
   };
 }
 
@@ -58,6 +59,11 @@ export interface MarketResponse {
 
 export interface DecisionResponse {
   report: Record<string, any> | null;
+  next_report?: Record<string, any> | null;
+}
+
+export interface DecisionHistoryResponse {
+  items: Array<Record<string, any>>;
 }
 
 export interface ExecutionResponse {

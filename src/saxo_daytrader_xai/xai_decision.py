@@ -20,7 +20,11 @@ from saxo_daytrader_xai.portfolio import (
     fetch_portfolio_summary,
     fetch_portfolio_symbols,
 )
-from saxo_daytrader_xai.strategy_engine import build_strategy_plan, strategy_selection_interval_minutes
+from saxo_daytrader_xai.strategy_engine import (
+    build_strategy_plan,
+    strategy_capital_limits,
+    strategy_selection_interval_minutes,
+)
 from saxo_daytrader_xai.watchlists import build_watchlists
 
 
@@ -247,6 +251,47 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
         )
 
     market_regime = _summarize_market_regime(watchlists, live_quotes, market_news, market_status_rows)
+    capital_limits = strategy_capital_limits(
+        config=config,
+        total_market_value_dkk=float(portfolio_summary.get("total_market_value_dkk") or 0.0),
+        invested_market_value_dkk=float(portfolio_summary.get("invested_market_value_dkk") or 0.0),
+        cash_balance_dkk=float(portfolio_summary.get("cash_balance_dkk") or 0.0),
+    )
+    cash_shortfall_dkk = max(
+        float(capital_limits["min_cash_buffer_dkk"]) - float(portfolio_summary.get("cash_balance_dkk") or 0.0),
+        0.0,
+    )
+    tradable_positions = [
+        row
+        for row in enriched_positions
+        if bool(row.get("market_tradable_now")) and float(row.get("quantity") or 0.0) > 0.0
+    ]
+    tradable_positions.sort(
+        key=lambda row: (
+            float(row.get("allocation_pct") or 0.0),
+            float(row.get("unrealised_pnl_dkk") or 0.0),
+        ),
+        reverse=True,
+    )
+    cash_management = {
+        "cash_balance_dkk": float(portfolio_summary.get("cash_balance_dkk") or 0.0),
+        "invested_market_value_dkk": float(portfolio_summary.get("invested_market_value_dkk") or 0.0),
+        "portfolio_value_dkk": float(portfolio_summary.get("total_market_value_dkk") or 0.0),
+        "capital_limits": capital_limits,
+        "cash_buffer_shortfall_dkk": cash_shortfall_dkk,
+        "requires_cash_raise": cash_shortfall_dkk > 1.0,
+        "tradable_trim_candidates": [
+            {
+                "symbol": row["symbol"],
+                "allocation_pct": row["allocation_pct"],
+                "market_value_dkk": row["market_value_dkk"],
+                "unrealised_pnl_dkk": row["unrealised_pnl_dkk"],
+                "daily_pnl_dkk": row["daily_change_pct"],
+                "market_status_reason": row.get("market_status_reason"),
+            }
+            for row in tradable_positions[:6]
+        ],
+    }
     return {
         "batch_id": batch_id,
         "portfolio_summary": portfolio_summary,
@@ -261,6 +306,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
         "market_status": market_status_rows,
         "analysis_summary": analysis_summary,
         "market_regime": market_regime,
+        "cash_management": cash_management,
     }
 
 
@@ -278,6 +324,7 @@ Hard rules:
 - Never recommend a BUY or SELL for a symbol whose market is not currently tradable in the supplied market status context. Use HOLD or NO_ACTION instead.
 - Never short. Long-only portfolio.
 - No single position may exceed 15%% of portfolio value after the proposed trade.
+- Respect the configured intraday cash buffer and deployment cap. If cash is below the required buffer, prefer SELL / trim recommendations in currently tradable positions over new BUY recommendations.
 - Treat all pnl, commission, and taxation impacts in DKK.
 - Prefer liquid, high-conviction trades with limited execution complexity.
 - If the best action is to do nothing, say so clearly.
@@ -310,15 +357,19 @@ Goal tracking JSON:
 Broker account JSON:
 {json.dumps(context['broker_account'], ensure_ascii=False, indent=2)}
 
+Cash management JSON:
+{json.dumps(context['cash_management'], ensure_ascii=False, indent=2)}
+
 Task:
 1. Assess the current market regime for a day-trading horizon.
 2. Evaluate the existing portfolio, including concentration and downside risks.
 3. Evaluate whether the portfolio is currently on track versus the DKK 500/day and DKK 3,500/week goals using the provided day/week/month/year/all-time performance data.
-4. Return a candidate asset pool of 5-20 symbols in candidate_assets, driven primarily by news and sentiment. candidate_assets is the upstream idea list, not the final execution list.
-5. Identify the highest-priority trade adjustments for today, if any.
-5. Respect Danish tax drag, commission drag, and the long-only / exclusion constraints.
-6. If a market is not currently tradable, use WATCH or HOLD rather than a live trade recommendation.
-7. Produce a concise but concrete decision report for the operator.
+4. Explicitly assess whether current cash is below the required next-session buffer. If it is, prefer actionable SELL/trim recommendations in currently tradable positions and explain the required cash raise clearly.
+5. Return a candidate asset pool of 5-20 symbols in candidate_assets, driven primarily by news and sentiment. candidate_assets is the upstream idea list, not the final execution list.
+6. Identify the highest-priority trade adjustments for today, if any.
+7. Respect Danish tax drag, commission drag, the cash-buffer constraints, and the long-only / exclusion constraints.
+8. If a market is not currently tradable, use WATCH or HOLD rather than a live trade recommendation and explain that the action must wait until the next tradable window.
+9. Produce a concise but concrete decision report for the operator.
 """.strip()
 
     return {
@@ -449,6 +500,30 @@ def _latest_report_row(connection) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _slot_interval(config: dict[str, Any]) -> timedelta:
+    return timedelta(minutes=max(strategy_selection_interval_minutes(config), 1))
+
+
+def _floor_to_slot(moment: datetime, interval: timedelta) -> datetime:
+    minute_span = int(interval.total_seconds() // 60)
+    floored_minute = (moment.minute // minute_span) * minute_span
+    return moment.replace(minute=floored_minute, second=0, microsecond=0)
+
+
+def _ceil_to_slot(moment: datetime, interval: timedelta) -> datetime:
+    floored = _floor_to_slot(moment, interval)
+    if floored == moment.replace(second=0, microsecond=0):
+        return floored
+    return floored + interval
+
+
+def _latest_report_time(connection) -> datetime | None:
+    latest = _latest_report_row(connection)
+    if not latest or not latest.get("created_at"):
+        return None
+    return datetime.fromisoformat(str(latest["created_at"])).astimezone(UTC)
+
+
 def fetch_latest_decision_report(connection) -> dict[str, Any] | None:
     row = _latest_report_row(connection)
     if not row:
@@ -459,18 +534,88 @@ def fetch_latest_decision_report(connection) -> dict[str, Any] | None:
     return row
 
 
+def fetch_recent_decision_reports(connection, limit: int = 20) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM decision_reports
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["request_json"] = json.loads(item["request_json"]) if item.get("request_json") else None
+        item["response_json"] = json.loads(item["response_json"]) if item.get("response_json") else None
+        item["report_json"] = json.loads(item["report_json"]) if item.get("report_json") else None
+        output.append(item)
+    return output
+
+
+def estimate_next_decision_report(connection, config: dict[str, Any], reference_time: datetime | None = None) -> dict[str, Any]:
+    now = (reference_time or datetime.now(UTC)).astimezone(UTC)
+    status_rows = get_market_status(config, reference_time=now)
+    analysis_summary = summarize_analysis_window(status_rows)
+    interval = _slot_interval(config)
+    latest_time = _latest_report_time(connection)
+
+    active_window_ends: list[datetime] = []
+    future_window_starts: list[tuple[datetime, str]] = []
+    for row in status_rows:
+        open_end = row.get("open_analysis_window_end_at_utc")
+        open_start = row.get("open_analysis_window_start_at_utc")
+        market_name = str(row.get("market") or row.get("code") or "market")
+        if row.get("open_analysis_window_active") and open_end:
+            active_window_ends.append(datetime.fromisoformat(str(open_end)))
+        if open_start:
+            parsed = datetime.fromisoformat(str(open_start))
+            slot_start = _ceil_to_slot(parsed, interval)
+            if slot_start > now:
+                future_window_starts.append((slot_start, f"{market_name} analysis slot"))
+
+    if analysis_summary["analysis_window_active"]:
+        active_until = max(active_window_ends) if active_window_ends else None
+        current_slot = _floor_to_slot(now, interval)
+        latest_slot = _floor_to_slot(latest_time, interval) if latest_time is not None else None
+        if active_until is None or current_slot <= active_until:
+            if latest_slot is None or latest_slot < current_slot:
+                return {
+                    "next_report_at": current_slot.isoformat(timespec="seconds"),
+                    "reason": "Current cadence slot is due inside active analysis window",
+                }
+        next_slot = _ceil_to_slot(now, interval)
+        if active_until is None or next_slot <= active_until:
+            return {
+                "next_report_at": next_slot.isoformat(timespec="seconds"),
+                "reason": "Next fixed cadence slot inside active analysis window",
+            }
+
+    if future_window_starts:
+        next_start_at, label = min(future_window_starts, key=lambda item: item[0])
+        return {
+            "next_report_at": next_start_at.isoformat(timespec="seconds"),
+            "reason": f"Next {label}",
+        }
+
+    return {
+        "next_report_at": None,
+        "reason": "No upcoming analysis window found in the current calendar horizon",
+    }
+
+
 def should_auto_run_decision_report(connection, config: dict[str, Any], analysis_window_active: bool) -> bool:
     if not analysis_window_active:
         return False
-    rerun_minutes = strategy_selection_interval_minutes(config)
-    latest = _latest_report_row(connection)
-    if not latest or latest["status"] != "completed":
-        if not latest:
-            return True
-        latest_time = datetime.fromisoformat(latest["created_at"])
-        return datetime.now(UTC) - latest_time > timedelta(minutes=rerun_minutes)
-    latest_time = datetime.fromisoformat(latest["created_at"])
-    return datetime.now(UTC) - latest_time > timedelta(minutes=rerun_minutes)
+    interval = _slot_interval(config)
+    now = datetime.now(UTC)
+    current_slot = _floor_to_slot(now, interval)
+    latest_time = _latest_report_time(connection)
+    if latest_time is None:
+        return True
+    latest_slot = _floor_to_slot(latest_time, interval)
+    return latest_slot < current_slot
 
 
 def generate_decision_report(
@@ -521,6 +666,8 @@ def generate_decision_report(
                 "ladder_orders": [],
                 "notes": [f"Strategy plan generation failed: {exc}"],
             }
+        report_json["analysis_summary"] = context["analysis_summary"]
+        report_json["cash_management"] = context["cash_management"]
 
         cursor = resolved_connection.execute(
             """

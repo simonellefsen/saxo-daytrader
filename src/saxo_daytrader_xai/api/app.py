@@ -33,7 +33,12 @@ from saxo_daytrader_xai.portfolio import (
     fetch_unrealised_after_tax_summary,
 )
 from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
-from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report, generate_decision_report
+from saxo_daytrader_xai.xai_decision import (
+    estimate_next_decision_report,
+    fetch_latest_decision_report,
+    fetch_recent_decision_reports,
+    generate_decision_report,
+)
 
 
 class SchedulerCycleRequest(BaseModel):
@@ -190,6 +195,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 "refresh": {
                     "price_poll_interval_minutes": int(config.get("price_monitor", {}).get("poll_interval_minutes", 1)),
                     "scheduler_poll_interval_minutes": int(config.get("scheduler", {}).get("poll_interval_minutes", 10)),
+                    "decision_interval_minutes": int(config.get("strategy", {}).get("selection_interval_minutes", 15)),
                 },
             }
 
@@ -237,9 +243,15 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.get("/api/decision/latest")
     def decision_latest() -> dict[str, Any]:
-        with runtime() as (_, connection):
+        with runtime() as (config, connection):
             report = fetch_latest_decision_report(connection)
-            return {"report": report}
+            next_report = estimate_next_decision_report(connection, config)
+            return {"report": report, "next_report": next_report}
+
+    @app.get("/api/decision/reports")
+    def decision_reports(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+        with runtime() as (_, connection):
+            return {"items": fetch_recent_decision_reports(connection, limit=limit)}
 
     @app.get("/api/execution")
     def execution(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:

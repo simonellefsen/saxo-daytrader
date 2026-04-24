@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -55,6 +58,11 @@ EXCHANGE_ALIASES = {
     "xbru": {"XBRU", "BRU"},
     "xlse": {"XLIS", "LIS"},
 }
+
+ORDER_REQUEST_MIN_INTERVAL_SECONDS = 1.05
+ORDER_RATE_LIMIT_MAX_RETRIES = 3
+_ORDER_RATE_LIMIT_LOCK = threading.Lock()
+_NEXT_ORDER_REQUEST_AT = 0.0
 
 
 class SaxoSessionError(RuntimeError):
@@ -134,6 +142,71 @@ def _raise_for_saxo_response(response: requests.Response, *, action: str) -> dic
     if isinstance(payload, dict):
         return payload
     return {}
+
+
+def _rate_limit_reset_seconds(response: requests.Response) -> float:
+    for header_name in (
+        "X-RateLimit-SessionOrders-Reset",
+        "X-RateLimit-Session-Reset",
+        "Retry-After",
+    ):
+        raw_value = response.headers.get(header_name)
+        if raw_value in (None, ""):
+            continue
+        try:
+            return max(float(raw_value), 0.0)
+        except (TypeError, ValueError):
+            continue
+    return 1.0
+
+
+def _wait_for_order_slot(min_interval_seconds: float = ORDER_REQUEST_MIN_INTERVAL_SECONDS) -> None:
+    global _NEXT_ORDER_REQUEST_AT
+    with _ORDER_RATE_LIMIT_LOCK:
+        now = time.monotonic()
+        wait_seconds = max(_NEXT_ORDER_REQUEST_AT - now, 0.0)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+            now = time.monotonic()
+        _NEXT_ORDER_REQUEST_AT = now + float(min_interval_seconds)
+
+
+def _push_back_order_slot(delay_seconds: float) -> None:
+    global _NEXT_ORDER_REQUEST_AT
+    with _ORDER_RATE_LIMIT_LOCK:
+        _NEXT_ORDER_REQUEST_AT = max(_NEXT_ORDER_REQUEST_AT, time.monotonic() + max(delay_seconds, 0.0))
+
+
+def _send_order_request(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: int = 30,
+    **kwargs: Any,
+) -> requests.Response:
+    request_headers = dict(headers)
+    if method.upper() in {"POST", "PATCH"}:
+        request_headers.setdefault("x-request-id", str(uuid.uuid4()))
+    last_response: requests.Response | None = None
+    for attempt in range(ORDER_RATE_LIMIT_MAX_RETRIES + 1):
+        _wait_for_order_slot()
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            headers=request_headers,
+            timeout=timeout,
+            **kwargs,
+        )
+        last_response = response
+        if int(response.status_code) != 429:
+            return response
+        reset_seconds = _rate_limit_reset_seconds(response)
+        _push_back_order_slot(reset_seconds + 0.25)
+        if attempt >= ORDER_RATE_LIMIT_MAX_RETRIES:
+            return response
+        time.sleep(reset_seconds + 0.25)
+    return last_response if last_response is not None else requests.Response()
 
 
 def default_session_path(config: dict[str, Any]) -> Path:
@@ -436,22 +509,22 @@ def precheck_order(payload: dict[str, Any], config: dict[str, Any], session: dic
         **payload,
         "FieldGroups": ["Costs", "MarginImpactBuySell"],
     }
-    response = requests.post(
+    response = _send_order_request(
+        "POST",
         f"{base_url}/trade/v2/orders/precheck",
         headers=_auth_headers(session["access_token"]),
         json=request_payload,
-        timeout=30,
     )
     return _raise_for_saxo_response(response, action="Order precheck")
 
 
 def place_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
-    response = requests.post(
+    response = _send_order_request(
+        "POST",
         f"{base_url}/trade/v2/orders",
         headers=_auth_headers(session["access_token"]),
         json=payload,
-        timeout=30,
     )
     return _raise_for_saxo_response(response, action="Order placement")
 
@@ -479,6 +552,8 @@ def get_chart_samples(
     }
     if time:
         params["Time"] = time
+    elif str(mode).lower() == "upto":
+        params["Time"] = _to_iso(_now_utc()).replace("+00:00", "Z")
     response = requests.get(
         f"{base_url}/chart/v3/charts",
         params=params,
@@ -559,22 +634,22 @@ def get_instrument_exposures(
 
 def change_order(payload: dict[str, Any], config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
-    response = requests.patch(
+    response = _send_order_request(
+        "PATCH",
         f"{base_url}/trade/v2/orders",
         headers=_auth_headers(session["access_token"]),
         json=payload,
-        timeout=30,
     )
     return _raise_for_saxo_response(response, action="Order replace")
 
 
 def cancel_order(order_id: str, config: dict[str, Any], session: dict[str, Any]) -> dict[str, Any]:
     base_url = _openapi_base_url(str(session.get("environment") or config["saxo"]["environment"]))
-    response = requests.delete(
+    response = _send_order_request(
+        "DELETE",
         f"{base_url}/trade/v2/orders/{order_id}",
         params={"AccountKey": _account_key(config, session)},
         headers=_auth_headers(session["access_token"]),
-        timeout=30,
     )
     return _raise_for_saxo_response(response, action="Order cancel")
 

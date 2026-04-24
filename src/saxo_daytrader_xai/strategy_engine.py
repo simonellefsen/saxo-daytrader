@@ -29,6 +29,18 @@ TERMINAL_ORDER_STATUSES = {
     "invalid_quantity",
 }
 
+SESSION_ERROR_MARKERS = (
+    "refresh token",
+    "access token",
+    "oauth",
+    "authorization",
+    "unauthorized",
+    "forbidden",
+    "session file",
+    "client key",
+    "account key",
+)
+
 
 @dataclass(frozen=True)
 class CandidateMetrics:
@@ -114,6 +126,13 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_session_error(exc: Exception) -> bool:
+    if not isinstance(exc, SaxoSessionError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in SESSION_ERROR_MARKERS)
 
 
 def _market_status_by_code(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -554,8 +573,15 @@ def build_strategy_plan(
                 market_status_by_code=market_status_by_code,
             )
         except SaxoSessionError as exc:
+            if _is_session_error(exc):
+                return {
+                    "status": "saxo_session_error",
+                    "selected_assets": [],
+                    "ladder_orders": [],
+                    "notes": [str(exc)],
+                }
             return {
-                "status": "saxo_session_error",
+                "status": "strategy_data_error",
                 "selected_assets": [],
                 "ladder_orders": [],
                 "notes": [str(exc)],

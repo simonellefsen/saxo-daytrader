@@ -302,6 +302,21 @@ def run_price_monitor_cycle(
     config_path: str | Path = "config.yaml",
 ) -> dict[str, Any]:
     resolved_config = load_config(config_path)
+    decision_result = None
+    queue_result = None
+    with connect(resolved_config["portfolio"]["database_path"]) as connection:
+        init_db(connection)
+        analysis_summary = summarize_analysis_window(get_market_status(resolved_config))
+        if should_auto_run_decision_report(connection, resolved_config, analysis_summary["analysis_window_active"]):
+            decision_result = generate_decision_report(
+                config=resolved_config,
+                connection=connection,
+                force_mock=False,
+            )
+            queue_result = queue_and_maybe_execute_latest_report(
+                config=resolved_config,
+                connection=connection,
+            )
     broker_sync = None
     if (
         str(resolved_config["execution"].get("mode")) == "live"
@@ -324,6 +339,10 @@ def run_price_monitor_cycle(
             ladder_maintenance = {"status": "error", "error": str(exc)}
     return {
         "status": "ok",
+        "analysis_window_active": analysis_summary["analysis_window_active"] if "analysis_summary" in locals() else False,
+        "generated_decision": decision_result is not None,
+        "decision": decision_result,
+        "queue": queue_result,
         "price_monitor": price_result,
         "broker_sync": broker_sync,
         "flatten": flatten_result,

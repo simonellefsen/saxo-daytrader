@@ -540,6 +540,41 @@ def _is_retryable_execution_failure(error_text: str | None) -> bool:
     return any(marker in text for marker in retryable_markers)
 
 
+def _current_holdings_map_for_retry(connection, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    batch_id = fetch_latest_batch_id(connection)
+    initial_cash_dkk = _initial_cash_dkk(config)
+    prefer_broker_cash = _prefer_broker_state(config)
+    return {
+        row["symbol"]: dict(row)
+        for row in fetch_portfolio_positions(
+            connection,
+            batch_id=batch_id,
+            initial_cash_dkk=initial_cash_dkk,
+            prefer_broker_cash=prefer_broker_cash,
+        )
+    }
+
+
+def _retry_block_reason(
+    order: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    connection,
+) -> str | None:
+    if str(order.get("action") or "").upper() != "SELL":
+        return None
+    holdings = _current_holdings_map_for_retry(connection, config)
+    symbol = str(order.get("symbol") or "")
+    held_qty = float((holdings.get(symbol) or {}).get("quantity") or 0.0)
+    requested_qty = float(order.get("quantity") or 0.0)
+    if held_qty + 1e-9 >= requested_qty:
+        return None
+    return (
+        f"Retry blocked: current broker-aligned holdings for {symbol} are {held_qty:g}, "
+        f"below requested sell quantity {requested_qty:g}."
+    )
+
+
 def retry_execution_order(
     order_id: int,
     *,
@@ -557,6 +592,34 @@ def retry_execution_order(
             return {"status": "not_failed", "order_id": order_id, "current_status": order["status"]}
         if not force and not _is_retryable_execution_failure(order.get("error_text")):
             return {"status": "not_retryable", "order_id": order_id, "error": order.get("error_text")}
+
+        blocked_reason = _retry_block_reason(
+            order,
+            config=resolved_config,
+            connection=resolved_connection,
+        )
+        if blocked_reason:
+            previous_error = str(order.get("error_text") or "")
+            updated_error = blocked_reason if not previous_error else f"{previous_error} | {blocked_reason}"
+            resolved_connection.execute(
+                "UPDATE execution_orders SET error_text = ? WHERE id = ?",
+                (updated_error, order_id),
+            )
+            resolved_connection.commit()
+            append_audit_log(
+                resolved_connection,
+                "execution_order_retry_blocked",
+                {
+                    "order_id": order_id,
+                    "reason": blocked_reason,
+                    "forced": bool(force),
+                },
+            )
+            return {
+                "status": "not_retryable_current_state",
+                "order_id": order_id,
+                "error": updated_error,
+            }
 
         approval_required = bool(order.get("approval_required")) and bool(
             resolved_config.get("execution", {}).get("require_approval_live", True)

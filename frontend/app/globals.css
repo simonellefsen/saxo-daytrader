@@ -308,6 +308,18 @@ th {
   z-index: 1;
 }
 
+.history-row {
+  cursor: pointer;
+}
+
+.history-row:hover {
+  background: rgba(15, 92, 115, 0.06);
+}
+
+.history-row.active {
+  background: rgba(15, 92, 115, 0.1);
+}
+
 .muted {
   color: var(--muted);
 }

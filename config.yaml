@@ -45,10 +45,10 @@ price_monitor:
   history_retention_days: 0
 
 analysis_windows:
-  offset_minutes_after_open: 60
-  duration_minutes: 45
+  offset_minutes_after_open: 30
+  duration_minutes: 0
   pre_sync_minutes_before_analysis: 5
-  close_offset_minutes_before_close: 60
+  end_buffer_minutes_before_close: 15
   calendar_refresh_interval_minutes: 360
   calendar_lookback_days: 7
   calendar_lookahead_days: 45
