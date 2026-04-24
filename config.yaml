@@ -92,7 +92,7 @@ execution:
   #require_approval_live: true
   require_approval_live: false
   min_trade_value_dkk: 500
-  max_daily_orders: 6
+  max_daily_orders: 25
 
 risk:
   excluded_symbols: []

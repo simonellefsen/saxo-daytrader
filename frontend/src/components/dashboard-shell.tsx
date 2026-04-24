@@ -135,12 +135,58 @@ function metricSubvalue(value: unknown, formatter: (value: unknown) => string) {
   return formatter(value);
 }
 
+function actionLabel(path: string): string {
+  if (path.includes("/queue-process")) return "Queue processor";
+  if (path.includes("/sync-broker")) return "Broker sync";
+  if (path.includes("/retry-failed")) return "Retry failed orders";
+  if (path.includes("/reconcile-broker")) return "Portfolio reconciliation";
+  if (path.includes("/scheduler-cycle")) return "Scheduler cycle";
+  if (path.includes("/decision-report")) return "Decision report";
+  if (path.includes("/manage")) return "Order action";
+  return "Action";
+}
+
+function summarizeActionResult(path: string, result: Record<string, unknown>): string {
+  const label = actionLabel(path);
+  if (path.includes("/retry-failed")) {
+    const retried = Array.isArray(result.retried) ? result.retried.length : 0;
+    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    return `${label} completed. Requeued ${retried} order${retried === 1 ? "" : "s"}${skipped ? `, skipped ${skipped}` : ""}.`;
+  }
+  if (path.includes("/reconcile-broker")) {
+    const adjustments = Array.isArray(result.adjustments) ? result.adjustments.length : 0;
+    return `${label} completed. Applied ${adjustments} adjustment${adjustments === 1 ? "" : "s"}.`;
+  }
+  if (path.includes("/sync-broker")) {
+    const updated = Number(result.updated ?? 0);
+    return `${label} completed. Updated ${formatNumber(updated, 0)} order${updated === 1 ? "" : "s"}.`;
+  }
+  if (path.includes("/queue-process")) {
+    const queued = Number(result.orders_processed ?? result.processed ?? 0);
+    return `${label} completed. Processed ${formatNumber(queued, 0)} order${queued === 1 ? "" : "s"}.`;
+  }
+  if (path.includes("/scheduler-cycle")) {
+    const generated = Boolean(result.generated_decision);
+    return `${label} completed${generated ? " and generated a decision report" : ""}.`;
+  }
+  if (path.includes("/decision-report")) {
+    const status = String((result.report as Record<string, unknown> | undefined)?.status ?? result.status ?? "ok");
+    return `${label} completed with status ${status}.`;
+  }
+  if (path.includes("/manage")) {
+    const status = String(result.status ?? "ok");
+    return `${label} completed with status ${status}.`;
+  }
+  return `${label} completed.`;
+}
+
 export function DashboardShell() {
   const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
   const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
   const [selectedDecisionId, setSelectedDecisionId] = useState<number | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
+  const [statusDetails, setStatusDetails] = useState<string>("");
   const [statusTone, setStatusTone] = useState<"info" | "warn" | "good">("info");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
@@ -228,7 +274,8 @@ export function DashboardShell() {
     try {
       const result = await postAction<Record<string, unknown>>(path, body);
       setStatusTone("good");
-      setStatusMessage(`Action completed: ${JSON.stringify(result)}`);
+      setStatusMessage(summarizeActionResult(path, result));
+      setStatusDetails(JSON.stringify(result, null, 2));
       await Promise.all([
         mutate("/api/overview"),
         mutate("/api/portfolio/positions?limit=25"),
@@ -241,6 +288,7 @@ export function DashboardShell() {
     } catch (error) {
       setStatusTone("warn");
       setStatusMessage(error instanceof Error ? error.message : "Action failed.");
+      setStatusDetails("");
     } finally {
       setPendingAction(null);
     }
@@ -281,6 +329,7 @@ export function DashboardShell() {
   const latestDecision = decision.data?.report;
   const nextDecision = decision.data?.next_report ?? null;
   const decisionHistoryItems = decisionHistory.data?.items ?? [];
+  const dailyOrderCapacity = overview.data?.execution?.daily_order_capacity;
   const displayedDecision = useMemo(() => {
     if (selectedDecisionId !== null) {
       const selected = decisionHistoryItems.find((row) => Number(row.id) === selectedDecisionId);
@@ -439,7 +488,13 @@ export function DashboardShell() {
 
       {statusMessage ? (
         <section className={`banner ${statusTone}`}>
-          {statusMessage}
+          <div>{statusMessage}</div>
+          {statusDetails ? (
+            <details className="banner-details">
+              <summary>Show action details</summary>
+              <pre className="code-block compact">{statusDetails}</pre>
+            </details>
+          ) : null}
         </section>
       ) : null}
 
@@ -722,6 +777,13 @@ export function DashboardShell() {
             <div>
               <h2>Execution</h2>
               <p>Queue control, broker sync, and live order management without page-wide reruns.</p>
+              {dailyOrderCapacity ? (
+                <p className="muted">
+                  Daily order cap: {formatNumber(dailyOrderCapacity.used, 0)} / {formatNumber(dailyOrderCapacity.max, 0)} used
+                  {" · "}
+                  {formatNumber(dailyOrderCapacity.remaining, 0)} remaining
+                </p>
+              ) : null}
             </div>
             <div className="pill-row">
               <span className="pill">Queued {formatNumber(overview.data?.execution?.counts?.queued ?? 0, 0)}</span>
@@ -754,6 +816,11 @@ export function DashboardShell() {
             <article className="mini-card">
               <div className="label">Total Rungs Filled</div>
               <div className="value">{formatNumber(ladderSummary.filledRungs, 0)}</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Daily Orders Left</div>
+              <div className="value">{formatNumber(dailyOrderCapacity?.remaining ?? 0, 0)}</div>
+              <div className="muted">Cap {formatNumber(dailyOrderCapacity?.max ?? 0, 0)}</div>
             </article>
           </div>
           <div className="table-wrap">

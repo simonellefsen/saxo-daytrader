@@ -19,6 +19,7 @@ import { formatDkk, formatLocalMoney, formatNumber, formatPercent, formatTimesta
 import type { AssetLadderHistoryResponse } from "@/lib/types";
 
 const RANGE_OPTIONS = ["1H", "4H", "SESSION"] as const;
+const CHART_HEIGHT = 420;
 
 interface LadderVisualizerProps {
   symbol: string;
@@ -58,6 +59,13 @@ function markerPosition(kind: string): "aboveBar" | "belowBar" | "inBar" {
   return "inBar";
 }
 
+function markerYOffset(kind: string): number {
+  if (kind === "buy_fill") return 18;
+  if (kind === "sell_fill") return -18;
+  if (kind === "amendment") return -10;
+  return 0;
+}
+
 function withinRange(isoTime: string | null | undefined, startAtMs: number) {
   if (!isoTime) return false;
   const parsed = new Date(isoTime).getTime();
@@ -70,6 +78,8 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
   const [showRungs, setShowRungs] = useState(true);
   const [showAmendments, setShowAmendments] = useState(true);
   const [selectedMarkerId, setSelectedMarkerId] = useState<string | null>(null);
+  const [hoverMarker, setHoverMarker] = useState<{ marker: Record<string, any>; x: number; y: number } | null>(null);
+  const [markerAnchors, setMarkerAnchors] = useState<Array<{ marker: Record<string, any>; x: number; y: number }>>([]);
 
   const chartContainerRef = useRef<HTMLDivElement | null>(null);
   const chartInstanceRef = useRef<any>(null);
@@ -118,8 +128,8 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
     container.innerHTML = "";
 
     const chart = createChart(container, {
-      autoSize: true,
-      height: 420,
+      width: container.clientWidth || 960,
+      height: CHART_HEIGHT,
       layout: {
         background: { type: ColorType.Solid, color: "#ffffff" },
         textColor: "#657284",
@@ -136,6 +146,7 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
         borderColor: "rgba(215, 222, 232, 0.8)",
         timeVisible: true,
         secondsVisible: false,
+        rightOffset: 8,
       },
       crosshair: {
         mode: 0,
@@ -258,7 +269,27 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
       .filter(Boolean) as SeriesMarker<UTCTimestamp>[];
     createSeriesMarkers(baseSeries as any, seriesMarkers as any);
 
+    const updateMarkerAnchors = () => {
+      const anchors: Array<{ marker: Record<string, any>; x: number; y: number }> = [];
+      for (const marker of visibleMarkers) {
+        const markerTime = toChartTime(String(marker.time ?? ""));
+        if (!markerTime) {
+          continue;
+        }
+        const kind = String(marker.kind ?? "");
+        const x = Number(chart.timeScale().timeToCoordinate(markerTime) ?? NaN);
+        const baseY = Number(baseSeries.priceToCoordinate(Number(marker.price ?? 0)) ?? NaN);
+        const y = baseY + markerYOffset(kind);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          continue;
+        }
+        anchors.push({ marker, x, y });
+      }
+      setMarkerAnchors(anchors);
+    };
+
     chart.timeScale().fitContent();
+    updateMarkerAnchors();
 
     chart.subscribeClick((param) => {
       if (!param.time || typeof param.time !== "number" || !visibleMarkers.length) {
@@ -276,12 +307,14 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
     });
 
     const resizeObserver = new ResizeObserver(() => {
-      chart.resize(container.clientWidth, 420);
+      chart.resize(container.clientWidth || 960, CHART_HEIGHT);
+      updateMarkerAnchors();
     });
     resizeObserver.observe(container);
 
     return () => {
       resizeObserver.disconnect();
+      setMarkerAnchors([]);
       for (const series of overlaySeries) {
         chart.removeSeries(series);
       }
@@ -379,6 +412,34 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
             {!chartHasRealData && chartError ? <div className="banner warn">{chartError}</div> : null}
             <div className="chart ladder-chart">
               <div className="chart-host" ref={chartContainerRef} />
+              {markerAnchors.map(({ marker, x, y }) => (
+                <button
+                  key={`hitbox-${String(marker.id)}`}
+                  type="button"
+                  className="chart-marker-hitbox"
+                  style={{ left: `${x}px`, top: `${y}px` }}
+                  onMouseEnter={() => setHoverMarker({ marker, x, y })}
+                  onMouseLeave={() => setHoverMarker((current) => (current?.marker?.id === marker.id ? null : current))}
+                  onClick={() => setSelectedMarkerId(String(marker.id))}
+                  aria-label={`Inspect ${String(marker.label ?? "event")}`}
+                />
+              ))}
+              {hoverMarker ? (
+                <div
+                  className="chart-tooltip"
+                  style={{
+                    left: `${Math.min(hoverMarker.x + 14, (chartContainerRef.current?.clientWidth ?? 900) - 260)}px`,
+                    top: `${Math.max(hoverMarker.y - 12, 12)}px`,
+                  }}
+                >
+                  <div className="chart-tooltip-title">{String(hoverMarker.marker.label ?? "Event")}</div>
+                  <div>{formatTimestamp(hoverMarker.marker.time)}</div>
+                  <div>
+                    {formatLocalMoney(hoverMarker.marker.price, position?.currency)} · Qty {formatNumber(hoverMarker.marker.quantity, 0)}
+                  </div>
+                  {hoverMarker.marker.strategy_reason ? <div>{String(hoverMarker.marker.strategy_reason)}</div> : null}
+                </div>
+              ) : null}
             </div>
           </div>
           <aside className="marker-panel">

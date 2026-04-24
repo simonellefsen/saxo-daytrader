@@ -114,6 +114,16 @@ select {
   border-color: rgba(15, 138, 75, 0.18);
 }
 
+.banner-details {
+  margin-top: 0.75rem;
+}
+
+.banner-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -550,6 +560,7 @@ th {
 
 .chart-panel {
   min-width: 0;
+  position: relative;
 }
 
 .ladder-chart svg {
@@ -558,7 +569,42 @@ th {
 
 .chart-host {
   width: 100%;
-  min-height: 420px;
+  height: 420px;
+  max-height: 420px;
+  overflow: hidden;
+}
+
+.chart-marker-hitbox {
+  position: absolute;
+  z-index: 2;
+  width: 28px;
+  height: 28px;
+  transform: translate(-50%, -50%);
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.chart-tooltip {
+  position: absolute;
+  z-index: 3;
+  min-width: 180px;
+  max-width: 320px;
+  transform: translateY(-100%);
+  padding: 0.65rem 0.75rem;
+  border-radius: 12px;
+  background: rgba(16, 25, 35, 0.94);
+  color: #e7edf3;
+  box-shadow: 0 14px 30px rgba(16, 25, 35, 0.22);
+  pointer-events: none;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.chart-tooltip-title {
+  font-weight: 700;
+  margin-bottom: 0.25rem;
 }
 
 .legend-row {

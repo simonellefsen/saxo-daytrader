@@ -11,6 +11,11 @@ export interface OverviewResponse {
     adapter?: string;
     require_approval_live: boolean;
     max_daily_orders: number;
+    daily_order_capacity?: {
+      max: number;
+      used: number;
+      remaining: number;
+    };
     counts: Record<string, number>;
   };
   portfolio_summary: JsonObject;

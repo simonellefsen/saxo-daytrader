@@ -70,6 +70,24 @@ def _prefer_broker_state(config: dict[str, Any]) -> bool:
     )
 
 
+def _daily_order_capacity(connection, config: dict[str, Any]) -> dict[str, int]:
+    limit = int(config.get("execution", {}).get("max_daily_orders", 0) or 0)
+    today = datetime.now(UTC).date().isoformat()
+    used = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) AS count_orders
+            FROM execution_orders
+            WHERE substr(created_at, 1, 10) = ?
+              AND status NOT IN ('error', 'cancelled')
+            """,
+            (today,),
+        ).fetchone()["count_orders"]
+    )
+    remaining = max(limit - used, 0)
+    return {"max": limit, "used": used, "remaining": remaining}
+
+
 def _history_start_at(range_key: str, end_at: datetime) -> str | None:
     normalized = range_key.upper()
     if normalized == "1D":
@@ -606,6 +624,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                     "adapter": config.get("execution", {}).get("adapter"),
                     "require_approval_live": bool(config.get("execution", {}).get("require_approval_live", True)),
                     "max_daily_orders": int(config.get("execution", {}).get("max_daily_orders", 0)),
+                    "daily_order_capacity": _daily_order_capacity(connection, config),
                     "counts": execution_counts(orders),
                 },
                 "portfolio_summary": summary,
