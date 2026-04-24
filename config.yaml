@@ -3,7 +3,7 @@ app:
   environment: local
   dry_run: false
   simulation_mode: true
-  launch_scheduler_with_dashboard: true
+  launch_scheduler_with_ui: true
   scheduler_restart_on_failure: true
   scheduler_max_restarts: 3
   scheduler_restart_delay_seconds: 2.0
@@ -69,6 +69,9 @@ strategy:
   max_assets_per_sector: 2
   estimated_slippage_bps: 8
   cost_guard_multiple: 1.5
+  capital:
+    max_deployment_pct: 0.75
+    min_cash_buffer_pct: 0.25
   ladder:
     rung_count: 5
     atr_spacing_min: 0.15

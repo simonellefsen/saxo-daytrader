@@ -1,8 +1,8 @@
 # saxo-daytrader-xai
 
-Phase 36 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 41 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 23 includes
+## What Phase 41 includes
 
 - Python 3.11+ project scaffold
 - Local SQLite database at `ledger.db`
@@ -41,17 +41,17 @@ Phase 36 foundation for a local Python day-trading assistant focused on a Danish
 - Severity-based broker alert suppression so repeated low-signal events can be throttled without disabling higher-value alerts
 - Named route profiles so several digest or alert kinds can share one delivery destination without repeated config
 - Grouped broker alerts so several broker updates for the same order can be collapsed into one delivery
-- Autonomous app launcher mode that starts the dashboard and background scheduler together for hands-off simulation trading
-- Scheduler heartbeat and last-cycle status persisted to SQLite and shown in the dashboard
-- One-click scheduler cycle controls in the dashboard for live or mock manual runs
+- Autonomous app launcher mode that starts the web UI and background scheduler together for hands-off simulation trading
+- Scheduler heartbeat and last-cycle status persisted to SQLite and shown in the web UI
+- One-click scheduler cycle controls in the web UI for live or mock manual runs
 - Route-profile formatting so subject prefixes, message preambles, and summary style can be shared across notification kinds
-- Immutable scheduler cycle history with recent-cycle visibility in the dashboard
+- Immutable scheduler cycle history with recent-cycle visibility in the web UI
 - Scheduler stale-worker detection with bounded auto-restart for launcher-managed autonomous mode
 - Configurable scheduler cycle-history retention by age and row count
 - Detection and repair of invalid legacy simulation trades that exceed available holdings
 - Whole-share execution enforcement so queued and submitted equity orders use integer quantities only
 - Audit bundle CSV export for ledger, decisions, executions, and tax records
-- Streamlit dashboard with:
+- FastAPI backend plus Next.js web UI with:
   - portfolio summary in DKK
   - holdings allocation table with live quote refresh support
   - daily refreshed Nordic and global watchlists
@@ -72,31 +72,60 @@ Phase 36 foundation for a local Python day-trading assistant focused on a Danish
 ## Run
 
 ```bash
-.venv/bin/python main.py
+.venv/bin/python main.py --with-scheduler
 ```
 
 Useful options:
 
 ```bash
-.venv/bin/python main.py --with-scheduler
 .venv/bin/python main.py --no-scheduler
 .venv/bin/python main.py --sync-only
-.venv/bin/python main.py --headless --port 8501 --no-browser
+.venv/bin/python main.py --api-port 8000 --frontend-port 3000 --no-scheduler
 ```
 
-`main.py` imports the CSV into `ledger.db` before launching Streamlit.
+`main.py` imports the configured portfolio baseline into `ledger.db`, then launches the FastAPI backend and the Next.js frontend.
 
 By default, this project is now set up for autonomous simulation mode:
 
-- `make run` starts both the Streamlit dashboard and the background scheduler
+- `make run` starts the FastAPI backend, the Next.js frontend, and the background scheduler
 - the scheduler generates decisions during active analysis windows
 - in simulation mode with `execution.auto_execute_simulation: true`, queued trades are executed automatically
 
-If you only want the UI without autonomous execution, use:
+If you only want the UI/API without autonomous execution, use:
 
 ```bash
-make run-ui-only
+make api
+make frontend
 ```
+
+## Web UI
+
+- FastAPI backend at `http://127.0.0.1:8000`
+- Next.js frontend at `http://127.0.0.1:3000`
+- APScheduler worker launched by the same Python runtime
+
+Install the frontend dependencies once:
+
+```bash
+make frontend-install
+```
+
+Run the full web stack:
+
+```bash
+make run
+```
+
+Useful web targets:
+
+```bash
+make api
+make frontend
+make restart
+make stop
+```
+
+The web frontend is API-driven and only polls the active data surfaces. That removes the full-page rerun behavior that made the old Streamlit UI sluggish.
 
 ## Config Reference
 
@@ -108,7 +137,7 @@ The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml
 - `environment`: free-form environment label such as `local`.
 - `dry_run`: when `true`, live broker submission and live broker management are blocked even if `execution.mode` is `live`.
 - `simulation_mode`: legacy convenience flag; execution behavior is primarily controlled by `execution.mode`.
-- `launch_scheduler_with_dashboard`: when `true`, `main.py` starts the background scheduler together with Streamlit.
+- `launch_scheduler_with_ui`: when `true`, `main.py` starts the background scheduler together with the FastAPI + Next.js UI stack.
 - `scheduler_restart_on_failure`: if the launcher-managed scheduler dies or becomes stale, `main.py` may restart it.
 - `scheduler_max_restarts`: maximum restart attempts per app run.
 - `scheduler_restart_delay_seconds`: wait time before each restart attempt.
@@ -158,6 +187,18 @@ Example: with `offset_minutes_after_open: 60` and `duration_minutes: 45`, a mark
 - `startup_run`: when `true`, a cycle runs immediately when the scheduler starts instead of waiting for the first interval boundary.
 - `history_max_rows`: maximum scheduler-cycle history rows to retain.
 - `history_retention_days`: maximum age of scheduler-cycle history rows.
+
+### `strategy`
+
+- `enabled`: enables the ladder-strategy overlay on top of xAI candidates.
+- `selection_interval_minutes`: minimum spacing between strategy-driven re-selection passes.
+- `max_candidates`, `min_selected_assets`, `max_selected_assets`: selection funnel sizing.
+- `max_assets_per_sector`: optional diversification cap when sector labels are available.
+- `estimated_slippage_bps`: assumed slippage used when screening ladder profitability.
+- `cost_guard_multiple`: required expected edge relative to estimated round-trip cost.
+- `capital.max_deployment_pct`: hard ceiling on deployed capital during the session. Default `0.75`.
+- `capital.min_cash_buffer_pct`: cash reserve kept out of new ladders for the next trading day. Default `0.25`.
+- `ladder.*`: rung count, ATR spacing, stop/take-profit multiples, per-position weights, flatten timing, and trailing-stop behavior.
 
 ### `execution`
 
@@ -283,17 +324,17 @@ The scheduler:
 - supports route-profile formatting for subject prefixes, message preambles, and compact vs structured summary rendering
 - can group several broker updates for one execution order into a single notification payload
 - records scheduler activity in `audit_log`
-- exposes dead/stale worker detection in the dashboard using heartbeat age plus stored scheduler PID
+- exposes dead/stale worker detection in the web UI using heartbeat age plus stored scheduler PID
 - can be auto-restarted by `main.py` when launched in autonomous mode, using the configured restart budget in `app.scheduler_*`
 - prunes old scheduler cycle-history rows automatically according to `scheduler.history_max_rows` and `scheduler.history_retention_days`
 - flags impossible simulation trades in the Execution tab and can quarantine them from the effective portfolio state
 - normalizes order quantities to whole shares before queueing, simulation execution, and Saxo order submission
 - resolves Saxo instruments by Saxo's own symbol and exchange aliases, so `SBUX:xnas` and `MU:xnas` map correctly during broker submission
 - pushes notification alerts when live execution fails, including session, lookup, and broker submission errors
-- handles broker-side cancel/replace failures cleanly in the UI and pushes notifications for management failures without crashing Streamlit
+- handles broker-side cancel/replace failures cleanly in the UI and pushes notifications for management failures without crashing the web runtime
 - supports configurable starting cash in DKK, shows live cash balance in the portfolio summary, and adjusts cash automatically as trades execute
 - persists latest portfolio quotes, resets the intraday baseline at `06:00` Europe/Copenhagen, and recalculates daily P/L from that baseline
-- records historical portfolio-value samples so the dashboard can graph daily, weekly, monthly, yearly, YTD, custom-range, and all-time performance
+- records historical portfolio-value samples so the web UI can graph daily, weekly, monthly, yearly, YTD, custom-range, and all-time performance
 
 ### What One Scheduler Cycle Does
 
@@ -399,13 +440,15 @@ Rendered files:
 - `deploy/rendered/launchd/com.saxo-daytrader.scheduler.plist`
 - `deploy/rendered/launchd/com.saxo-daytrader.dashboard.plist`
 
+The `dashboard` service names are retained for compatibility, but they now launch the FastAPI + Next.js web UI via `main.py --no-scheduler`.
+
 Typical install flow:
 
 1. Render the templates.
 2. Review the generated paths, user, and port.
 3. Copy the chosen service file into your OS service directory.
 4. Enable the scheduler service first.
-5. Optionally enable the dashboard service if you want the Streamlit UI always running.
+5. Optionally enable the dashboard service if you want the web UI always running.
 
 Example `systemd` commands:
 
@@ -625,8 +668,13 @@ Earlier validation scripts remain available:
 │   └── validate_phase27.py
 │   └── validate_phase28.py
 │   └── validate_phase29.py
+│   └── validate_phase40.py
+│   └── validate_phase41.py
+│   └── validate_phase42.py
 └── src/
     └── saxo_daytrader_xai/
+        ├── api/
+        │   └── app.py
         ├── config.py
         ├── db.py
         ├── execution_engine.py
@@ -640,14 +688,13 @@ Earlier validation scripts remain available:
         ├── portfolio.py
         ├── saxo_openapi.py
         ├── scheduler_service.py
+        ├── strategy_engine.py
         ├── tax_engine.py
         ├── watchlists.py
         ├── xai_decision.py
-        └── ui/
-            └── app.py
 ```
 
 ## Next-phase todo
 
-1. Add a launcher-visible incident counter and cooldown so repeated scheduler crashes can be surfaced more clearly in the dashboard.
-2. Add a one-click dashboard action to prune scheduler history immediately using the current retention policy.
+1. Add a launcher-visible incident counter and cooldown so repeated scheduler crashes can be surfaced more clearly in the web UI.
+2. Add a one-click web UI action to prune scheduler history immediately using the current retention policy.

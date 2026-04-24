@@ -1,22 +1,28 @@
 PYTHON := .venv/bin/python
 PIP := .venv/bin/pip
-PORT ?= 8501
+PNPM := pnpm
+API_PORT ?= 8000
+WEB_PORT ?= 3000
 
-.PHONY: help install run run-headless run-ui-only stop restart scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 validate-phase25 validate-phase26 validate-phase27 validate-phase28 validate-phase29 validate-phase30 validate-phase31 validate-phase32 validate-phase33 validate-phase34 validate-phase35 validate-phase36 validate-phase37 validate-phase38 validate-phase39 validate-phase40 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
+.PHONY: help install frontend-install install-web run run-web restart-web api frontend stop restart scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 validate-phase25 validate-phase26 validate-phase27 validate-phase28 validate-phase29 validate-phase30 validate-phase31 validate-phase32 validate-phase33 validate-phase34 validate-phase35 validate-phase36 validate-phase37 validate-phase38 validate-phase39 validate-phase40 validate-phase41 validate-phase42 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
 
 help:
 	@printf "%s\n" \
 		"Targets:" \
 		"  make install            Install Python dependencies into .venv" \
-		"  make run                Run the dashboard and autonomous scheduler" \
-		"  make run-ui-only        Run only the Streamlit dashboard" \
-		"  make run-headless       Run dashboard+scheduler headless on PORT=$(PORT)" \
-		"  make stop               Stop tracked dashboard and scheduler processes" \
-		"  make restart            Stop tracked processes, then run dashboard+scheduler" \
+		"  make frontend-install   Install Next.js frontend dependencies" \
+		"  make install-web        Install Python + frontend dependencies" \
+		"  make run                Run the FastAPI backend, Next.js frontend, and scheduler" \
+		"  make run-web            Alias for make run" \
+		"  make api                Run only the FastAPI backend on API_PORT=$(API_PORT)" \
+		"  make frontend           Run only the Next.js frontend on WEB_PORT=$(WEB_PORT)" \
+		"  make stop               Stop tracked API, frontend, scheduler, and legacy runtime processes" \
+		"  make restart            Stop tracked processes, then run the FastAPI+Next.js stack" \
+		"  make restart-web        Alias for make restart" \
 		"  make scheduler          Run the APScheduler worker continuously" \
 		"  make scheduler-once     Run one scheduler cycle in mock-decision mode" \
-		"  make sync               Import the CSV into ledger.db without starting Streamlit" \
-		"  make validate           Run the latest phase validation (Phase 40)" \
+		"  make sync               Import the CSV into ledger.db without starting the web stack" \
+		"  make validate           Run the latest phase validation (Phase 42)" \
 		"  make validate-phase1    Run Phase 1 validation" \
 		"  make validate-phase2    Run Phase 2 validation" \
 		"  make validate-phase3    Run Phase 3 validation" \
@@ -58,6 +64,8 @@ help:
 		"  make validate-phase38   Run Phase 38 goal tracking validation" \
 		"  make validate-phase39   Run Phase 39 price-monitor trading-hours gating validation" \
 		"  make validate-phase40   Run Phase 40 ladder-order strategy validation" \
+		"  make validate-phase41   Run Phase 41 FastAPI web-backend validation" \
+		"  make validate-phase42   Run Phase 42 ladder guardrail validation" \
 		"  make render-services    Render systemd and launchd service examples into deploy/rendered" \
 		"  make saxo-sim           Run Saxo OAuth helper against SIM using PKCE" \
 		"  make saxo-live          Run Saxo OAuth helper against LIVE using app secret" \
@@ -67,21 +75,32 @@ help:
 install:
 	$(PIP) install -r requirements.txt
 
+frontend-install:
+	cd frontend && $(PNPM) install
+
+install-web: install frontend-install
+
 run:
-	$(PYTHON) main.py --with-scheduler
+	$(PYTHON) main.py --with-scheduler --api-port $(API_PORT) --frontend-port $(WEB_PORT)
 
-run-ui-only:
-	$(PYTHON) main.py --no-scheduler
+run-web:
+	$(MAKE) run
 
-run-headless:
-	$(PYTHON) main.py --with-scheduler --headless --no-browser --port $(PORT)
+api:
+	PYTHONPATH=src $(PYTHON) -m uvicorn saxo_daytrader_xai.api.app:create_app --factory --host 127.0.0.1 --port $(API_PORT)
+
+frontend:
+	cd frontend && NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:$(API_PORT) WATCHPACK_POLLING=true CHOKIDAR_USEPOLLING=true $(PNPM) exec next dev --port $(WEB_PORT) --hostname 127.0.0.1
 
 stop:
 	$(PYTHON) scripts/stop_runtime.py
 
 restart:
 	$(PYTHON) scripts/stop_runtime.py
-	$(PYTHON) main.py --with-scheduler
+	$(PYTHON) main.py --with-scheduler --api-port $(API_PORT) --frontend-port $(WEB_PORT)
+
+restart-web:
+	$(MAKE) restart
 
 scheduler:
 	$(PYTHON) scripts/run_scheduler.py
@@ -92,7 +111,7 @@ scheduler-once:
 sync:
 	$(PYTHON) main.py --sync-only
 
-validate: validate-phase40
+validate: validate-phase42
 
 validate-phase1:
 	$(PYTHON) scripts/validate_phase1.py
@@ -216,6 +235,12 @@ validate-phase39:
 
 validate-phase40:
 	PYTHONPATH=src $(PYTHON) scripts/validate_phase40.py
+
+validate-phase41:
+	PYTHONPATH=src $(PYTHON) scripts/validate_phase41.py
+
+validate-phase42:
+	PYTHONPATH=src $(PYTHON) scripts/validate_phase42.py
 
 render-services:
 	$(PYTHON) scripts/render_service_templates.py

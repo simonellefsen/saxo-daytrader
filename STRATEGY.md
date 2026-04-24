@@ -1,7 +1,7 @@
 # Multi-Market Daily Ladder Trading Strategy  
-**Saxo Bank OpenAPI Edition + Existing Python/Streamlit + xAI API Integration**
+**Saxo Bank OpenAPI Edition + Existing Python/FastAPI + Next.js Integration**
 
-**Version:** 1.1 (Updated with user’s existing codebase details)  
+**Version:** 1.3 (Updated for FastAPI backend + Next.js frontend)  
 **Author:** Grok (for ChatGPT 5.4 Codex implementation)  
 **Date:** April 2026  
 **Broker:** Saxo Bank OpenAPI[](https://developer.saxobank.com/openapi/referencedocs)  
@@ -9,12 +9,16 @@
 **Base Location:** Copenhagen (CET/CEST)  
 **Base Currency:** DKK or EUR (configurable)
 
-## Existing Codebase Integration Notes
-- You **already have** a working Python 3 + Streamlit application.  
-- The new bot **must build upon or integrate with** your existing code (reuse classes, functions, config, logging, etc. where possible).  
-- **UI issue:** Current Streamlit dashboard is slow and unresponsive → the new implementation should optimize it (caching, background tasks, st.experimental_rerun avoidance, or consider migrating performance-critical parts to FastAPI + modern frontend if full rewrite is preferred).  
-- **Universe:** Already limited to **Nordic Top 50 + EU/UK Top 100 + US Top 100** stocks → use **exactly this combined watchlist** (maintain as a configurable list or Saxo instrument query).  
-- **xAI API:** You are already using the xAI API for evaluating company news + global news to identify **5–20 interesting assets**. This must become the **primary driver** of the News/Sentiment component (and optionally the full Asset Selection Engine).
+## Architecture Update (Important for Codex)
+- You have **migrated** from Streamlit to a modern stack:
+  - **Backend**: Python 3 + FastAPI (handles all trading logic, Saxo API calls, xAI evaluation, ladder engine, scheduling, etc.)
+  - **Frontend**: Next.js (React-based, highly interactive and responsive UI)
+  - **Communication**: REST/WebSocket endpoints provided by FastAPI
+- The new bot **must build upon or integrate directly with** your existing FastAPI backend and Next.js frontend.
+- Reuse:
+  - Your fixed universe (Nordic Top 50 + EU/UK Top 100 + US Top 100)
+  - Your existing xAI API integration for news evaluation
+  - Any existing config, logging, or helper modules
 
 ## Objective
 Each trading **session** the system:
@@ -24,122 +28,91 @@ Each trading **session** the system:
 4. Runs a **dynamic price-ladder strategy** on the selected assets, strictly factoring in Saxo’s commissions.
 5. Re-evaluates every 15 minutes while each market is open.
 
-All risk is managed in one base currency.
+All risk and cash-flow managed in one base currency.
 
-## 1. Daily Schedule (all times in CET/CEST – Copenhagen local time)
-
-### EU Session (London/Frankfurt/Nordic exchanges)
-- Market open window: ~08:00–09:00 CEST → **no trading**
-- **~10:00 CEST** (T+1h after most EU opens): Run full Asset Selection Engine
-- Trading & re-evaluation window: 10:00 – ~17:00 CEST (every 15 minutes on the quarter-hour)
-- **16:45 CEST**: Flatten all EU positions and cancel open orders
-
-### US Session (NYSE & NASDAQ)
-- Market open: ~15:30 CEST → **no trading** until selection
-- **~16:30 CEST** (T+1h after US open): Run full Asset Selection Engine
-- Trading & re-evaluation window: 16:30 – 22:00 CEST (every 15 minutes)
-- **21:45 CEST**: Flatten all US positions and cancel open orders
-
-**Overlap (15:30–17:00 CEST):** Both sessions run in parallel with independent ladders and capital allocation.  
-System runs 24/5 but only activates during the above windows per exchange.
+## 1. Daily Schedule (CET/CEST)
+(unchanged from v1.2)
 
 ## 2. Asset Selection Engine (uses your existing xAI API)
-Run per session at T+1h **and every 15 minutes thereafter** on the **fixed universe** (Nordic Top 50 + EU/UK Top 100 + US Top 100).
-
-### Step 1: xAI News Evaluation (your existing logic – reuse or call directly)
-- Feed the latest company news (Saxo news stream) + relevant global news into your xAI API pipeline.
-- Ask xAI to evaluate and return **5–20 interesting assets** with reasoning (bullish/bearish signals, catalysts, sentiment, etc.).
-- Store the xAI response (JSON) for logging and transparency.
-
-### Step 2: Technical + Volume Scoring (applied only to xAI’s 5–20 candidates)
-**Technical Component (40% of final score)**  
-- Most successful running averages: 9, 21, 50, 200 EMA on 1-min / 5-min / 15-min charts (Saxo chart data)  
-- Bullish stack or strong price action above key EMAs  
-- Recent MA crossover success rate (last 20 signals)  
-- Momentum: price above VWAP + positive slope on short EMAs
-
-**Volume Component (30% of final score)**  
-- Current 15-min volume ≥ 1.5× average 15-min volume for that time-of-day  
-- Relative Volume (RVOL) > 1.8
-
-**Combined Final Score**  
-- xAI news evaluation weight: **30%** (map xAI’s qualitative output to a numeric score 0–100)  
-- Select top **3–8 assets** that also pass minimum liquidity & price filters.  
-- Maximum 2 stocks per sector.  
-- Configurable capital allocation split between EU/US sessions.
+(unchanged from v1.2)
 
 ## 3. Price-Ladder Strategy (core execution)
-Once selected, deploy a **dynamic buy/sell ladder** around current price (long bias by default; short ladder if xAI + technical score is strongly bearish).
-
-### Ladder Parameters (exchange-aware & ATR-based)
-- Number of rungs: 5 buy + 5 sell  
-- Rung spacing: 0.15–0.4 × 1-min ATR (calculated from Saxo 1-min bars)  
-- Position size per rung: fixed €/DKK risk per rung (or fixed shares)  
-- Total max position per stock: 2–4% of account equity (base currency)  
-- Respect exchange-specific tick size, minimum order size, and trading hours (via Saxo instrument details)
-
-### Ladder Behaviour (using Saxo `/trade/v1/orders` + streaming)
-- Maintain balanced ladder with **limit orders**  
-- On fill (via streaming order events): place corresponding take-profit rung + refill opposite side to keep ladder full (ratcheting)  
-- Trail ladder to current price if it moves > 1 rung (using streaming quotes)  
-- **Only place orders** if expected round-trip net profit (after Saxo commission + spread + slippage) > 0 **and** > 1.5× round-trip commission cost  
-- Flatten automatically at session close
+(unchanged from v1.2)
 
 ## 4. Re-evaluation Logic (every 15 minutes during each session)
-- Re-run full Asset Selection Engine (xAI news call + technical/volume filters) using live Saxo data.  
-- Drop stocks whose score falls below threshold → flatten & cancel orders.  
-- Add new high-scoring stocks → deploy fresh ladders.  
-- Dynamically adjust rung spacing and size based on latest ATR/volatility.
+(unchanged from v1.2)
 
 ## 5. Commission & Cost-Aware Logic (Saxo-specific)
-- Store or query Saxo commission schedule per exchange (Classic/Platinum/VIP tiers).  
-- **Before any order**: calculate expected net profit after **all** costs (commission + FX conversion if needed + estimated slippage).  
-- Only execute if net expected profit exceeds minimum threshold.  
-- All P&L reports show **net-of-all-commissions** results.  
-- Optional daily commission budget cap.
+(unchanged from v1.2)
 
 ## 6. Risk Management & Safety (global across all markets)
-- Max daily loss (account-wide): X% → auto-shutdown.  
-- Max position per stock: 4% of equity.  
-- Max total exposure (all markets): 25–30% of equity.  
-- Hard stop-loss per position: 2× ATR against (via Saxo stop orders or monitoring).  
-- No trading on earnings days or high-impact macro events (configurable filter).  
-- Circuit-breaker if volatility spikes.  
-- Full base-currency risk conversion via Saxo multi-currency handling.
+(unchanged from v1.2)
 
 ## 7. Saxo Bank OpenAPI Requirements
-- **Authentication**: OAuth 2.0 / SAML2.  
-- **Key Endpoints**:
-  - Streaming quotes & Level 1 (WebSocket).  
-  - Chart data for OHLCV / VWAP / volume.  
-  - `/trade/v1/orders` for limit orders and ladder management.  
-  - Positions, balances, orders (real-time streaming).  
-  - News streaming.  
-  - `/ref/v1` for instruments, tick sizes, trading hours.  
-- Handle market-data subscriptions and rate limits.
+(unchanged from v1.2)
 
-## 8. Logging & Monitoring + Streamlit Integration
-- Detailed JSON logs per session, per asset, every decision/order/fill (reuse your existing logging).  
-- End-of-session P&L report (assets selected, xAI reasoning, ladders executed, net P&L after commissions, win rate, etc.).  
-- **Streamlit UI**: Optimize the existing dashboard for speed and responsiveness (background threads, caching with `@st.cache_data`, session state, etc.). If still too slow, Codex may propose a FastAPI backend + lighter frontend while keeping your current Streamlit as an optional dashboard.
+## 8. Logging & Monitoring + Next.js Frontend Integration
+- Detailed JSON logs per session, per asset, every decision/order/fill (reuse your existing logging).
+- End-of-session P&L report (assets selected, xAI reasoning, ladders executed, net P&L after commissions, win rate, etc.).
+- **FastAPI Backend** must expose WebSocket and REST endpoints for real-time updates:
+  - Live ladder status
+  - Current deployed % and cash buffer
+  - Active positions, open orders, P&L
+  - xAI evaluation results
+  - Session schedule and next re-evaluation timer
+- **Next.js Frontend** should consume these endpoints to display a clean, responsive dashboard (no more slow/unresponsive UI). Suggested pages/components:
+  - Dashboard (live metrics, gauges for cash buffer / deployed %)
+  - Asset Selection view (xAI reasoning + technical scores)
+  - Ladder Visualizer (per-stock ladder with current price, rungs, fills)
+  - Session Control (start/stop, manual flatten)
+  - Historical P&L and logs
+
+## 9. Cash Flow & Capital Management Practices
+**Core Principle:**  
+The strategy is **purely intraday**. All positions must be flattened at session close to free up full buying power for the next trading day and eliminate overnight risk.
+
+### 9.1 End-of-Session Flattening (Mandatory)
+- **EU Session:** At 16:45 CEST — cancel all open ladder orders and close **all** EU positions.
+- **US Session:** At 21:45 CEST — cancel all open ladder orders and close **all** US positions.
+- If any position fails to close, trigger emergency flatten on next startup.
+
+### 9.2 Intra-Day Capital Deployment Rules
+- **Never deploy 100 % of available equity.**  
+  - Recommended max deployment: **60–75 %** of current equity at any time (configurable).
+  - This leaves a **25–40 % cash buffer** for margin cushion, new ladders, slippage, and Saxo margin requirements.
+- Position-sizing logic must enforce this cap **before** placing any ladder rung.
+
+### 9.3 Settlement & Buying Power Considerations (Saxo-specific)
+- Monitor Saxo `/port/v1/balances` and `/port/v1/margin` continuously.
+- FastAPI background task should push real-time cash and margin updates to Next.js via WebSocket.
 
 ## Implementation Notes for ChatGPT 5.4 Codex
-- **Start from your existing Python/Streamlit codebase** – do not rewrite from scratch unless necessary.  
-- Reuse your xAI API integration exactly as it is for the news evaluation step.  
-- Use official Saxo OpenAPI Python client or `requests` + WebSocket for streaming.  
-- Full error handling, graceful reconnection, and logging.  
-- Configurable via YAML/JSON file (API keys, risk parameters, universes, commission tiers, xAI prompts, etc.).  
-- Multi-timezone awareness (`pytz`).  
-- Production-ready: no hard-coded secrets, proper shutdown on session close, and UI performance improvements.
+- **Start from your existing FastAPI + Next.js codebase** – do not rewrite from scratch.
+- Add the ladder engine, asset selection, re-evaluation scheduler, and Saxo integration into the FastAPI backend (use background tasks / APScheduler or Celery for timed jobs).
+- Expose new API endpoints and WebSockets that your Next.js frontend can consume immediately.
+- Reuse your xAI API call exactly as it exists today.
+- Implement the new Section 9 cash-flow rules (max deployment %, mandatory flatten, cash buffer monitoring).
+- Add comprehensive error handling, graceful reconnection to Saxo streaming, and rate-limit handling.
+- Configurable via environment variables or YAML (API keys, risk parameters, universes, commission tiers, xAI prompts, max deployment %, etc.).
+- Multi-timezone awareness (`pytz`).
+- Production-ready: proper shutdown on session close, logging, and security (API keys, CORS for Next.js).
 
 ---
 
 **Ready for Codex**  
-Copy this entire Markdown file and paste it into ChatGPT 5.4 Codex with the prompt:  
-*"Build an improved version of my existing Python 3 + Streamlit automated trading bot that implements the following multi-market ladder strategy exactly. Integrate with my current xAI API news evaluation logic and the fixed universe (Nordic Top 50 + EU/UK Top 100 + US Top 100). Use Saxo Bank OpenAPI..."*
+Copy this entire Markdown file (v1.3) and paste it into ChatGPT 5.4 Codex with the prompt:  
+*"Update my existing Python 3 + FastAPI backend and Next.js frontend to implement the following multi-market ladder strategy exactly (version 1.3). Integrate with my current xAI API news evaluation, fixed universe, and Saxo Bank OpenAPI..."*
 
-You can now save this as `saxo-multi-market-ladder-trading-strategy-v1.1.md`.
+This version is now perfectly aligned with your new, much faster and more interactive FastAPI + Next.js architecture.
 
-**Next step:** Paste the Markdown into Codex and also share any key snippets from your existing code (xAI call, universe list, Streamlit layout) if you want Codex to merge them cleanly.  
+**Next step suggestion:**  
+When you feed this to Codex, also share:
+- The main FastAPI router/file structure (or key endpoint names)
+- How your xAI API call is currently implemented
+- Any existing Saxo connection code you already have
 
-Want any final adjustments (e.g. weight xAI higher, change selection count, suggest specific Streamlit optimizations)? Just say the word! 🚀
+That way Codex can merge everything cleanly without duplication.
+
+Congrats on the migration — FastAPI + Next.js is a fantastic combo for a responsive trading dashboard!  
+
+Any final tweaks (e.g. change max deployment % to 65 %, add specific Next.js UI mockups, add manual override buttons, etc.) before you update the code? Just let me know! 🚀

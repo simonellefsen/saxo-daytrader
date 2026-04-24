@@ -41,7 +41,11 @@ from saxo_daytrader_xai.portfolio import (
     fetch_portfolio_positions,
     fetch_portfolio_summary,
 )
-from saxo_daytrader_xai.strategy_engine import TERMINAL_ORDER_STATUSES, strategy_enabled
+from saxo_daytrader_xai.strategy_engine import (
+    TERMINAL_ORDER_STATUSES,
+    strategy_capital_limits,
+    strategy_enabled,
+)
 from saxo_daytrader_xai.tax_engine import calculate_sell_outcome, update_ledger
 from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report
 
@@ -239,13 +243,23 @@ def _evaluate_virtual_buy_budget_gate(order: dict[str, Any], config: dict[str, A
     gross_dkk = gross_local * fx_rate
     commission = _calculate_buy_commission(order["symbol"], gross_local, gross_dkk, order["currency"], fx_rate, config)
     required_dkk = gross_dkk + commission["commission_dkk"]
-    available_dkk = float(portfolio_summary["cash_balance_dkk"] or 0.0)
+    capital_limits = strategy_capital_limits(
+        config=config,
+        total_market_value_dkk=float(portfolio_summary["total_market_value_dkk"] or 0.0),
+        invested_market_value_dkk=float(portfolio_summary["invested_market_value_dkk"] or 0.0),
+        cash_balance_dkk=float(portfolio_summary["cash_balance_dkk"] or 0.0),
+    )
+    available_dkk = float(capital_limits["spendable_cash_dkk"] or 0.0)
     capital_limit_dkk = _virtual_cash_cap_dkk(config)
     return {
         "allowed": available_dkk + 1e-9 >= required_dkk,
         "required_dkk": required_dkk,
         "available_dkk": available_dkk,
         "capital_limit_dkk": capital_limit_dkk,
+        "deployment_headroom_dkk": float(capital_limits["deployment_headroom_dkk"] or 0.0),
+        "min_cash_buffer_dkk": float(capital_limits["min_cash_buffer_dkk"] or 0.0),
+        "max_deployment_pct": float(capital_limits["max_deployment_pct"] or 0.0),
+        "min_cash_buffer_pct": float(capital_limits["min_cash_buffer_pct"] or 0.0),
         "invested_market_value_dkk": float(portfolio_summary["invested_market_value_dkk"] or 0.0),
         "cash_source": portfolio_summary.get("cash_source"),
     }
@@ -787,7 +801,17 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         symbol = suggestion["symbol"]
         if action not in {"BUY", "SELL"}:
             continue
-        if desired_strategy_orders and action == "BUY":
+        if strategy_enabled(config) and action == "BUY":
+            append_audit_log(
+                connection,
+                "execution_order_skipped_strategy_buy_fallback",
+                {
+                    "report_id": report["id"],
+                    "symbol": symbol,
+                    "strategy_status": strategy_plan.get("status"),
+                    "reason": "Strategy-managed buys only execute from ladder orders; fallback market buys are disabled.",
+                },
+            )
             continue
         market_row = _market_status_for_symbol(symbol, config)
         if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
@@ -2397,6 +2421,8 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                             f"Waiting for virtual cash budget before buying {order['symbol']}. "
                             f"Required {virtual_budget_gate['required_dkk']:.2f} DKK, "
                             f"virtual cash available {virtual_budget_gate['available_dkk']:.2f} DKK, "
+                            f"deployment headroom {virtual_budget_gate['deployment_headroom_dkk']:.2f} DKK, "
+                            f"cash buffer reserved {virtual_budget_gate['min_cash_buffer_dkk']:.2f} DKK, "
                             f"capital limit {virtual_budget_gate['capital_limit_dkk']:.2f} DKK."
                         )
                         resolved_connection.execute(

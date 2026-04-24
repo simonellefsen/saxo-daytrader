@@ -29,8 +29,10 @@ def main() -> int:
         str(ROOT),
         "--python-bin",
         str(ROOT / ".venv" / "bin" / "python"),
-        "--port",
-        "8501",
+        "--frontend-port",
+        "3000",
+        "--api-port",
+        "8000",
     ]
     try:
         render_main = _load_render_main()
@@ -45,9 +47,11 @@ def main() -> int:
     dashboard_plist = (output_dir / "launchd" / "com.saxo-daytrader.dashboard.plist").read_text(encoding="utf-8")
 
     assert "scripts/run_scheduler.py --config" in scheduler_unit
-    assert "main.py --headless --no-browser --port 8501" in dashboard_unit
+    assert "main.py --no-scheduler --api-port 8000 --frontend-port 3000" in dashboard_unit
     assert "<string>com.saxo-daytrader.scheduler</string>" in scheduler_plist
     assert "<string>com.saxo-daytrader.dashboard</string>" in dashboard_plist
+    assert "<string>--frontend-port</string>" in dashboard_plist
+    assert "<string>3000</string>" in dashboard_plist
 
     print("Phase 11 validation passed.")
     print(f"Rendered output dir: {output_dir}")

@@ -1,0 +1,569 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+
+import useSWR, { mutate } from "swr";
+
+import { apiFetch, getFetcher, postAction } from "@/lib/api";
+import { formatDkk, formatLocalMoney, formatNumber, formatPercent, formatTimestamp, signedClass, toYahooFinanceUrl } from "@/lib/format";
+import type {
+  DecisionResponse,
+  ExecutionResponse,
+  MarketResponse,
+  OverviewResponse,
+  PerformanceResponse,
+  PositionsResponse,
+  SchedulerResponse,
+} from "@/lib/types";
+import { LineChart } from "@/components/line-chart";
+
+type TabKey = "portfolio" | "performance" | "market" | "decision" | "execution";
+
+const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
+  { key: "portfolio", label: "Portfolio" },
+  { key: "performance", label: "Performance" },
+  { key: "market", label: "Market Status" },
+  { key: "decision", label: "Decision Report" },
+  { key: "execution", label: "Execution" },
+];
+
+const PERFORMANCE_RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "ALL"] as const;
+
+function metricSubvalue(value: unknown, formatter: (value: unknown) => string) {
+  if (value === null || value === undefined) {
+    return "n/a";
+  }
+  return formatter(value);
+}
+
+export function DashboardShell() {
+  const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
+  const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
+  const [statusMessage, setStatusMessage] = useState<string>("");
+  const [statusTone, setStatusTone] = useState<"info" | "warn" | "good">("info");
+
+  useEffect(() => {
+    const stored = window.localStorage.getItem("daytrader-active-tab") as TabKey | null;
+    if (stored && TAB_OPTIONS.some((tab) => tab.key === stored)) {
+      setActiveTab(stored);
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("daytrader-active-tab", activeTab);
+  }, [activeTab]);
+
+  const overview = useSWR<OverviewResponse>("/api/overview", getFetcher, {
+    refreshInterval: 15_000,
+  });
+
+  const priceRefreshMs = Math.max(
+    15_000,
+    Number(overview.data?.refresh?.price_poll_interval_minutes ?? 1) * 60_000,
+  );
+
+  const positions = useSWR<PositionsResponse>(
+    activeTab === "portfolio" ? "/api/portfolio/positions?limit=25" : null,
+    getFetcher,
+    { refreshInterval: priceRefreshMs },
+  );
+  const performance = useSWR<PerformanceResponse>(
+    activeTab === "performance" ? `/api/performance?range_key=${performanceRange}` : null,
+    getFetcher,
+    { refreshInterval: priceRefreshMs },
+  );
+  const market = useSWR<MarketResponse>(
+    activeTab === "market" ? "/api/market/status" : null,
+    getFetcher,
+    { refreshInterval: 60_000 },
+  );
+  const decision = useSWR<DecisionResponse>(
+    activeTab === "decision" ? "/api/decision/latest" : null,
+    getFetcher,
+    { refreshInterval: 60_000 },
+  );
+  const execution = useSWR<ExecutionResponse>(
+    activeTab === "execution" ? "/api/execution?limit=150" : null,
+    getFetcher,
+    { refreshInterval: 15_000 },
+  );
+  const scheduler = useSWR<SchedulerResponse>(
+    activeTab === "execution" ? "/api/scheduler?limit=10" : null,
+    getFetcher,
+    { refreshInterval: 30_000 },
+  );
+
+  async function runAction(path: string, body?: unknown) {
+    try {
+      const result = await postAction<Record<string, unknown>>(path, body);
+      setStatusTone("good");
+      setStatusMessage(`Action completed: ${JSON.stringify(result)}`);
+      await Promise.all([
+        mutate("/api/overview"),
+        mutate("/api/portfolio/positions?limit=25"),
+        mutate(`/api/performance?range_key=${performanceRange}`),
+        mutate("/api/execution?limit=150"),
+        mutate("/api/decision/latest"),
+        mutate("/api/scheduler?limit=10"),
+      ]);
+    } catch (error) {
+      setStatusTone("warn");
+      setStatusMessage(error instanceof Error ? error.message : "Action failed.");
+    }
+  }
+
+  const summary = overview.data?.portfolio_summary ?? {};
+  const afterTaxSummary = overview.data?.after_tax_summary ?? {};
+  const integrityWarnings = overview.data?.integrity?.warnings ?? [];
+  const analysisSummary = overview.data?.analysis_summary;
+
+  const performanceSeries = useMemo(() => {
+    return (performance.data?.history ?? []).map((row) => Number(row.total_market_value_dkk ?? 0));
+  }, [performance.data?.history]);
+
+  const latestDecision = decision.data?.report;
+  const decisionSuggestions = Array.isArray(latestDecision?.report_json?.suggested_trades)
+    ? (latestDecision?.report_json?.suggested_trades as Array<Record<string, unknown>>)
+    : [];
+  const selectedAssets = Array.isArray(latestDecision?.report_json?.strategy_plan?.selected_assets)
+    ? (latestDecision?.report_json?.strategy_plan?.selected_assets as Array<Record<string, unknown>>)
+    : [];
+
+  const executionOrders = execution.data?.orders ?? [];
+  const manageableOrders = executionOrders.filter((row) =>
+    [
+      "submitted_to_broker",
+      "broker_working",
+      "broker_amended",
+      "broker_partially_filled",
+      "broker_replace_requested",
+      "broker_cancel_requested",
+    ].includes(String(row.status ?? "")),
+  );
+
+  return (
+    <main className="shell">
+      <header className="page-header">
+        <div className="title-block">
+          <h1>{overview.data?.app?.project_name ?? "saxo-daytrader-xai"}</h1>
+          <p>
+            Modern web frontend over the existing Python trading runtime. Targeted polling keeps the active
+            view fresh without re-running the whole page.
+          </p>
+        </div>
+        <div className="pill-row">
+          <span className="pill">Execution: {String(overview.data?.execution?.mode ?? "n/a").toUpperCase()}</span>
+          <span className="pill">Adapter: {overview.data?.execution?.adapter ?? "n/a"}</span>
+          <span className="pill">Environment: {overview.data?.app?.environment ?? "n/a"}</span>
+        </div>
+      </header>
+
+      {integrityWarnings.map((warning) => (
+        <section className="banner warn" key={warning}>
+          {warning}
+        </section>
+      ))}
+
+      {analysisSummary?.analysis_window_active ? (
+        <section className="banner good">
+          Analysis window active for {analysisSummary.active_windows.join(", ")}.
+        </section>
+      ) : analysisSummary?.pre_sync_markets?.length ? (
+        <section className="banner info">
+          Pre-analysis broker sync window active for {analysisSummary.pre_sync_markets.join(", ")}.
+        </section>
+      ) : (
+        <section className="banner info">Analysis window inactive right now.</section>
+      )}
+
+      <section className="metric-grid">
+        <article className="metric-card">
+          <div className="label">Portfolio Value</div>
+          <div className="value">{formatDkk(summary.total_market_value_dkk)}</div>
+          <div className="subvalue">Invested {formatDkk(summary.invested_market_value_dkk)}</div>
+        </article>
+        <article className="metric-card">
+          <div className="label">Cash</div>
+          <div className="value">{formatDkk(summary.cash_balance_dkk)}</div>
+          <div className="subvalue">
+            Initial {formatDkk(summary.initial_cash_dkk)} · Trades {formatDkk(summary.cash_from_trades_dkk)}
+          </div>
+        </article>
+        <article className="metric-card">
+          <div className="label">Unrealised P/L</div>
+          <div className={`value ${signedClass(summary.total_unrealised_pnl_dkk)}`}>
+            {formatDkk(summary.total_unrealised_pnl_dkk)}
+          </div>
+          <div className="subvalue">
+            After tax {formatDkk(afterTaxSummary.after_tax_unrealised_pnl_dkk)}
+          </div>
+        </article>
+        <article className="metric-card">
+          <div className="label">Daily P/L Since 06:00</div>
+          <div className={`value ${signedClass(summary.total_daily_pnl_dkk)}`}>
+            {formatDkk(summary.total_daily_pnl_dkk)}
+          </div>
+          <div className="subvalue">{formatNumber(summary.position_count, 0)} positions</div>
+        </article>
+      </section>
+
+      <nav className="tabs" aria-label="Primary dashboard tabs">
+        {TAB_OPTIONS.map((tab) => (
+          <button
+            key={tab.key}
+            className={`tab ${activeTab === tab.key ? "active" : ""}`}
+            onClick={() => setActiveTab(tab.key)}
+            type="button"
+          >
+            {tab.label}
+          </button>
+        ))}
+      </nav>
+
+      {statusMessage ? (
+        <section className={`banner ${statusTone}`}>
+          {statusMessage}
+        </section>
+      ) : null}
+
+      {activeTab === "portfolio" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>Portfolio Snapshot</h2>
+              <p>Broker-aligned live holdings with a capped local budget model for new buys.</p>
+            </div>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Instrument</th>
+                  <th>Qty</th>
+                  <th>Currency</th>
+                  <th>Paid Price</th>
+                  <th>Current Price</th>
+                  <th>Cost Basis DKK</th>
+                  <th>Market Value DKK</th>
+                  <th>Unrealised P/L DKK</th>
+                  <th>FX Gain/Loss DKK</th>
+                  <th>Daily P/L DKK</th>
+                  <th>Allocation</th>
+                  <th>Quote Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(positions.data?.items ?? []).map((row) => {
+                  const symbol = String(row.symbol ?? "");
+                  return (
+                    <tr key={symbol}>
+                      <td>
+                        <a href={toYahooFinanceUrl(symbol)} target="_blank" rel="noreferrer">
+                          {symbol}
+                        </a>
+                      </td>
+                      <td>{String(row.instrument_name ?? symbol)}</td>
+                      <td>{formatNumber(row.quantity, 0)}</td>
+                      <td>{String(row.currency ?? "")}</td>
+                      <td>
+                        {row.paid_price_local === null || row.paid_price_local === undefined
+                          ? "n/a"
+                          : formatLocalMoney(row.paid_price_local, row.currency)}
+                      </td>
+                      <td>{formatLocalMoney(row.current_price_local, row.currency)}</td>
+                      <td>{formatDkk(row.cost_basis_dkk)}</td>
+                      <td>{formatDkk(row.market_value_dkk)}</td>
+                      <td className={signedClass(row.unrealised_pnl_dkk)}>{formatDkk(row.unrealised_pnl_dkk)}</td>
+                      <td className={signedClass(row.fx_unrealised_pnl_dkk)}>
+                        {row.fx_unrealised_pnl_dkk === null || row.fx_unrealised_pnl_dkk === undefined
+                          ? "n/a"
+                          : formatDkk(row.fx_unrealised_pnl_dkk)}
+                      </td>
+                      <td className={signedClass(row.daily_pnl_dkk)}>{formatDkk(row.daily_pnl_dkk)}</td>
+                      <td>{formatPercent(row.allocation_pct)}</td>
+                      <td>{formatTimestamp(row.latest_quote_updated_at)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === "performance" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>Performance</h2>
+              <p>Portfolio value history and progress against the DKK 500/day before-tax target.</p>
+            </div>
+            <div className="range-picker">
+              {PERFORMANCE_RANGES.map((range) => (
+                <button
+                  key={range}
+                  className={`range-button ${performanceRange === range ? "active" : ""}`}
+                  type="button"
+                  onClick={() => setPerformanceRange(range)}
+                >
+                  {range}
+                </button>
+              ))}
+            </div>
+          </div>
+          <LineChart
+            values={performanceSeries}
+            positive={(performanceSeries.at(-1) ?? 0) >= (performanceSeries[0] ?? 0)}
+          />
+          <div className="mini-grid">
+            {["day", "week", "month", "year", "all_time"].map((periodKey) => {
+              const period = (performance.data?.goal_tracking?.periods?.[periodKey] ?? {}) as Record<string, unknown>;
+              return (
+                <article className="mini-card" key={periodKey}>
+                  <div className="label">{periodKey.replace("_", " ").toUpperCase()}</div>
+                  <div className={`value ${signedClass(period.pnl_dkk)}`}>{formatDkk(period.pnl_dkk)}</div>
+                  <div className="muted">
+                    Target {metricSubvalue(period.target_dkk, formatDkk)} · Gap {metricSubvalue(period.gap_dkk, formatDkk)}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === "market" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>Market Status</h2>
+              <p>Tradability, analysis windows, and calendar timing for tracked exchanges.</p>
+            </div>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Exchange</th>
+                  <th>Status</th>
+                  <th>Tradable</th>
+                  <th>Session Open</th>
+                  <th>Tradable Close</th>
+                  <th>Pre-Sync</th>
+                  <th>Open Window</th>
+                  <th>Close Window</th>
+                  <th>Next Open</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(market.data?.items ?? []).map((row) => (
+                  <tr key={String(row.code)}>
+                    <td>{String(row.market ?? row.code)}</td>
+                    <td>{String(row.status_reason ?? "")}</td>
+                    <td>{row.is_tradable ? "Yes" : "No"}</td>
+                    <td>{String(row.session_open_local ?? "n/a")}</td>
+                    <td>{String(row.tradable_close_local ?? "n/a")}</td>
+                    <td>{row.pre_analysis_sync_active ? "Active" : "No"}</td>
+                    <td>{row.open_analysis_window_active ? "Active" : "No"}</td>
+                    <td>{row.close_analysis_window_active ? "Active" : "No"}</td>
+                    <td>{String(row.next_open ?? "n/a")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === "decision" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>Decision Report</h2>
+              <p>Latest xAI report plus deterministic strategy selection output.</p>
+            </div>
+            <div className="action-row">
+              <button className="button" type="button" onClick={() => runAction("/api/actions/decision-report")}>
+                Generate Report
+              </button>
+            </div>
+          </div>
+          <div className="mini-grid">
+            <article className="mini-card">
+              <div className="label">Created</div>
+              <div className="value">{formatTimestamp(latestDecision?.created_at)}</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Status</div>
+              <div className="value">{String(latestDecision?.status ?? "n/a")}</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Selected Assets</div>
+              <div className="value">{formatNumber(selectedAssets.length, 0)}</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Suggested Trades</div>
+              <div className="value">{formatNumber(decisionSuggestions.length, 0)}</div>
+            </article>
+          </div>
+          <div className="grid-2">
+            <div className="stack">
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Action</th>
+                      <th>Priority</th>
+                      <th>Confidence</th>
+                      <th>Rationale</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {decisionSuggestions.map((row, index) => (
+                      <tr key={`${String(row.symbol ?? "symbol")}-${index}`}>
+                        <td>{String(row.symbol ?? "")}</td>
+                        <td>{String(row.action ?? "")}</td>
+                        <td>{String(row.priority ?? "")}</td>
+                        <td>{formatNumber(row.confidence, 2)}</td>
+                        <td>{String(row.rationale ?? "")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Selected</th>
+                      <th>Score</th>
+                      <th>Notes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedAssets.map((row, index) => (
+                      <tr key={`${String(row.symbol ?? "asset")}-${index}`}>
+                        <td>{String(row.symbol ?? "")}</td>
+                        <td>{formatNumber(row.score, 2)}</td>
+                        <td>{Array.isArray(row.notes) ? (row.notes as string[]).join(", ") : ""}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <pre className="code-block">{JSON.stringify(latestDecision?.report_json ?? {}, null, 2)}</pre>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === "execution" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>Execution</h2>
+              <p>Queue control, broker sync, and live order management without page-wide reruns.</p>
+            </div>
+            <div className="pill-row">
+              <span className="pill">Queued {formatNumber(overview.data?.execution?.counts?.queued ?? 0, 0)}</span>
+              <span className="pill">Broker Live {formatNumber(overview.data?.execution?.counts?.broker_live ?? 0, 0)}</span>
+              <span className="pill">Failed {formatNumber(overview.data?.execution?.counts?.failed ?? 0, 0)}</span>
+            </div>
+          </div>
+          <div className="action-row">
+            <button className="button" type="button" onClick={() => runAction("/api/actions/queue-process")}>
+              Run Queue Processor
+            </button>
+            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/sync-broker")}>
+              Sync Broker Status
+            </button>
+            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/retry-failed")}>
+              Retry Failed Orders
+            </button>
+            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/reconcile-broker")}>
+              Reconcile Portfolio To Saxo
+            </button>
+            <button className="ghost-button" type="button" onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
+              Run Scheduler Cycle
+            </button>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Created</th>
+                  <th>Symbol</th>
+                  <th>Action</th>
+                  <th>Strategy</th>
+                  <th>Role</th>
+                  <th>Order Type</th>
+                  <th>Status</th>
+                  <th>Qty</th>
+                  <th>Price</th>
+                  <th>Limit</th>
+                  <th>Stop</th>
+                  <th>Error</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {executionOrders.map((row) => {
+                  const isManageable = manageableOrders.some((order) => order.id === row.id);
+                  return (
+                    <tr key={String(row.id)}>
+                      <td>{String(row.id)}</td>
+                      <td>{formatTimestamp(row.created_at)}</td>
+                      <td>{String(row.symbol ?? "")}</td>
+                      <td>{String(row.action ?? "")}</td>
+                      <td>{String(row.strategy_type ?? "manual")}</td>
+                      <td>{String(row.strategy_role ?? "primary")}</td>
+                      <td>{String(row.order_type ?? "Market")}</td>
+                      <td>{String(row.status ?? "")}</td>
+                      <td>{formatNumber(row.quantity, 0)}</td>
+                      <td>{row.price_local ? formatLocalMoney(row.price_local, row.currency) : "n/a"}</td>
+                      <td>{row.limit_price_local ? formatLocalMoney(row.limit_price_local, row.currency) : "n/a"}</td>
+                      <td>{row.stop_price_local ? formatLocalMoney(row.stop_price_local, row.currency) : "n/a"}</td>
+                      <td>{String(row.error_text ?? "")}</td>
+                      <td>
+                        {isManageable ? (
+                          <div className="row-actions">
+                            <button
+                              className="danger-button"
+                              type="button"
+                              onClick={() => runAction(`/api/orders/${row.id}/manage`, { action: "cancel" })}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        ) : (
+                          <span className="muted">n/a</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="grid-2">
+            <div className="stack">
+              <div className="mini-grid">
+                {(scheduler.data?.cycles ?? []).slice(0, 4).map((cycle) => (
+                  <article className="mini-card" key={String(cycle.id)}>
+                    <div className="label">Cycle #{String(cycle.id)}</div>
+                    <div className="value">{String(cycle.status ?? "n/a")}</div>
+                    <div className="muted">{formatTimestamp(cycle.started_at)}</div>
+                  </article>
+                ))}
+              </div>
+            </div>
+            <pre className="code-block">{JSON.stringify(scheduler.data?.status ?? {}, null, 2)}</pre>
+          </div>
+        </section>
+      ) : null}
+    </main>
+  );
+}

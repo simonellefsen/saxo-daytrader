@@ -19,8 +19,11 @@ htmlcov/
 
 .DS_Store
 
-.streamlit/secrets.toml
 logs/
 tmp/
 .secrets/
 .run/
+frontend/node_modules/
+frontend/.next/
+frontend/tsconfig.tsbuildinfo
+.pnpm-store/

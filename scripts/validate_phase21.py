@@ -12,7 +12,12 @@ from saxo_daytrader_xai.config import load_config
 
 
 def _should_launch_scheduler(config: dict, *, with_scheduler: bool, no_scheduler: bool) -> bool:
-    return bool(with_scheduler or config.get("app", {}).get("launch_scheduler_with_dashboard", False)) and not no_scheduler
+    app_config = config.get("app", {})
+    default_enabled = app_config.get(
+        "launch_scheduler_with_ui",
+        app_config.get("launch_scheduler_with_dashboard", False),
+    )
+    return bool(with_scheduler or default_enabled) and not no_scheduler
 
 
 def main() -> int:
@@ -21,7 +26,7 @@ def main() -> int:
     default_launch = _should_launch_scheduler(config, with_scheduler=False, no_scheduler=False)
     disabled_launch = _should_launch_scheduler(config, with_scheduler=False, no_scheduler=True)
     explicit_launch = _should_launch_scheduler(
-        {**config, "app": {**config.get("app", {}), "launch_scheduler_with_dashboard": False}},
+        {**config, "app": {**config.get("app", {}), "launch_scheduler_with_ui": False}},
         with_scheduler=True,
         no_scheduler=False,
     )

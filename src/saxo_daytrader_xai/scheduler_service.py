@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import time
 import os
+import signal
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import FrameType
 from typing import Any
 
 from apscheduler.schedulers.blocking import BlockingScheduler
@@ -16,6 +18,23 @@ from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, disp
 from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
 from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
+
+
+def _scheduler_shutdown_signal_handler(signum: int, _frame: FrameType | None) -> None:
+    raise SystemExit(f"Received signal {signal.Signals(signum).name}")
+
+
+def _install_scheduler_signal_handlers() -> dict[int, signal.Handlers]:
+    previous: dict[int, signal.Handlers] = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous[sig] = signal.getsignal(sig)
+        signal.signal(sig, _scheduler_shutdown_signal_handler)
+    return previous
+
+
+def _restore_scheduler_signal_handlers(previous: dict[int, signal.Handlers]) -> None:
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
 
 
 def _resolve_config(config: dict[str, Any] | None, config_path: str | Path) -> dict[str, Any]:
@@ -317,6 +336,7 @@ def run_scheduler_forever(
     config_path: str | Path = "config.yaml",
     force_mock: bool = False,
 ) -> None:
+    previous_handlers = _install_scheduler_signal_handlers()
     resolved_config = load_config(config_path)
     connection = connect(resolved_config["portfolio"]["database_path"])
     init_db(connection)
@@ -375,3 +395,4 @@ def run_scheduler_forever(
         if scheduler.running:
             scheduler.shutdown(wait=False)
         time.sleep(0.1)
+        _restore_scheduler_signal_handlers(previous_handlers)

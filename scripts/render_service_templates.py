@@ -30,7 +30,8 @@ def main() -> int:
     parser.add_argument("--project-dir", default=str(ROOT), help="Absolute project directory to embed")
     parser.add_argument("--python-bin", default=str(ROOT / ".venv" / "bin" / "python"), help="Python executable to embed")
     parser.add_argument("--user", default=getpass.getuser(), help="User to embed in systemd units")
-    parser.add_argument("--port", default="8501", help="Dashboard port")
+    parser.add_argument("--frontend-port", default="3000", help="Frontend port")
+    parser.add_argument("--api-port", default="8000", help="API port")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -41,7 +42,8 @@ def main() -> int:
         "PROJECT_DIR": str(Path(args.project_dir).expanduser().resolve()),
         "PYTHON_BIN": str(Path(args.python_bin).expanduser().resolve()),
         "USER": args.user,
-        "PORT": str(args.port),
+        "FRONTEND_PORT": str(args.frontend_port),
+        "API_PORT": str(args.api_port),
     }
 
     rendered_files: dict[str, str] = {}

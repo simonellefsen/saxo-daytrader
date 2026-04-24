@@ -50,12 +50,61 @@ def _strategy_cfg(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("strategy", {})
 
 
+def _normalized_pct(value: Any, default: float) -> float:
+    raw = _safe_float(value, default)
+    if raw > 1.0:
+        raw = raw / 100.0
+    return max(0.0, min(raw, 1.0))
+
+
+def _capital_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    return _strategy_cfg(config).get("capital", {})
+
+
 def strategy_enabled(config: dict[str, Any]) -> bool:
     return bool(_strategy_cfg(config).get("enabled", True))
 
 
 def strategy_selection_interval_minutes(config: dict[str, Any]) -> int:
     return int(_strategy_cfg(config).get("selection_interval_minutes", 15) or 15)
+
+
+def strategy_max_deployment_pct(config: dict[str, Any]) -> float:
+    return _normalized_pct(_capital_cfg(config).get("max_deployment_pct", 0.75), 0.75)
+
+
+def strategy_min_cash_buffer_pct(config: dict[str, Any]) -> float:
+    capital_cfg = _capital_cfg(config)
+    default_buffer = max(0.0, 1.0 - strategy_max_deployment_pct(config))
+    return _normalized_pct(capital_cfg.get("min_cash_buffer_pct", default_buffer), default_buffer)
+
+
+def strategy_capital_limits(
+    *,
+    config: dict[str, Any],
+    total_market_value_dkk: float,
+    invested_market_value_dkk: float,
+    cash_balance_dkk: float,
+) -> dict[str, float]:
+    total_value = max(_safe_float(total_market_value_dkk), 0.0)
+    invested_value = max(_safe_float(invested_market_value_dkk), 0.0)
+    cash_value = max(_safe_float(cash_balance_dkk), 0.0)
+    max_deployment_pct = strategy_max_deployment_pct(config)
+    min_cash_buffer_pct = strategy_min_cash_buffer_pct(config)
+    max_deployment_dkk = total_value * max_deployment_pct
+    min_cash_buffer_dkk = total_value * min_cash_buffer_pct
+    deployment_headroom_dkk = max(max_deployment_dkk - invested_value, 0.0)
+    cash_after_buffer_dkk = max(cash_value - min_cash_buffer_dkk, 0.0)
+    spendable_cash_dkk = min(cash_value, deployment_headroom_dkk, cash_after_buffer_dkk)
+    return {
+        "max_deployment_pct": max_deployment_pct,
+        "min_cash_buffer_pct": min_cash_buffer_pct,
+        "max_deployment_dkk": max_deployment_dkk,
+        "min_cash_buffer_dkk": min_cash_buffer_dkk,
+        "deployment_headroom_dkk": deployment_headroom_dkk,
+        "cash_after_buffer_dkk": cash_after_buffer_dkk,
+        "spendable_cash_dkk": max(spendable_cash_dkk, 0.0),
+    }
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -549,8 +598,15 @@ def build_strategy_plan(
         selected = scored[: min(max_selected, max(min_selected, len(scored)))]
 
     position_map = _current_position_map(context)
-    portfolio_value_dkk = _safe_float(context.get("portfolio_summary", {}).get("total_market_value_dkk"), 0.0)
-    remaining_cash_dkk = _safe_float(context.get("portfolio_summary", {}).get("cash_balance_dkk"), 0.0)
+    portfolio_summary = dict(context.get("portfolio_summary", {}) or {})
+    portfolio_value_dkk = _safe_float(portfolio_summary.get("total_market_value_dkk"), 0.0)
+    capital_limits = strategy_capital_limits(
+        config=config,
+        total_market_value_dkk=portfolio_value_dkk,
+        invested_market_value_dkk=_safe_float(portfolio_summary.get("invested_market_value_dkk"), 0.0),
+        cash_balance_dkk=_safe_float(portfolio_summary.get("cash_balance_dkk"), 0.0),
+    )
+    remaining_cash_dkk = capital_limits["spendable_cash_dkk"]
     remaining_capacity = int(config.get("execution", {}).get("max_daily_orders", 6) or 6)
     min_weight = float(config.get("strategy", {}).get("ladder", {}).get("min_position_weight", 0.02) or 0.02)
     max_weight = float(config.get("strategy", {}).get("ladder", {}).get("max_position_weight", 0.04) or 0.04)
@@ -603,14 +659,21 @@ def build_strategy_plan(
         "Level-1 Saxo chart data drives EMA, ATR, VWAP, and RVOL scoring.",
         "Depth of Market is not yet integrated; ladder spacing currently uses ATR and minute bars only.",
         "Each ladder entry is submitted as a limit order with related take-profit and stop child orders.",
+        (
+            f"Capital guardrails reserve {capital_limits['min_cash_buffer_pct'] * 100:.0f}% cash and cap "
+            f"deployment at {capital_limits['max_deployment_pct'] * 100:.0f}% of equity."
+        ),
     ]
     if portfolio_value_dkk <= 0:
         notes.append("Portfolio value was non-positive; sizing fell back to available cash only.")
+    if capital_limits["spendable_cash_dkk"] <= 0:
+        notes.append("No new ladder cash was available after applying the deployment cap and next-session cash buffer.")
     return {
         "status": status,
         "selected_assets": selected_rows,
         "ladder_orders": orders,
         "candidate_count": len(candidates),
         "scored_count": len(scored),
+        "capital_limits": capital_limits,
         "notes": notes,
     }
