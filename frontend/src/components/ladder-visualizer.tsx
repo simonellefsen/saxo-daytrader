@@ -20,6 +20,7 @@ import type { AssetLadderHistoryResponse } from "@/lib/types";
 
 const RANGE_OPTIONS = ["1H", "4H", "SESSION"] as const;
 const CHART_HEIGHT = 420;
+const EMPTY_LIST: any[] = [];
 
 interface LadderVisualizerProps {
   symbol: string;
@@ -90,13 +91,13 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
     { refreshInterval: 30_000 },
   );
 
-  const chartPoints = history.data?.chart?.points ?? [];
+  const chartPoints = history.data?.chart?.points ?? EMPTY_LIST;
   const chartError = history.data?.chart?.error;
   const chartHasRealData = Boolean(history.data?.chart?.has_real_data);
   const chartSource = String(history.data?.chart?.source ?? "fallback");
-  const markers = history.data?.markers ?? [];
-  const activeLines = history.data?.active_lines ?? [];
-  const ladderLevels = history.data?.ladder_levels ?? [];
+  const markers = history.data?.markers ?? EMPTY_LIST;
+  const activeLines = history.data?.active_lines ?? EMPTY_LIST;
+  const ladderLevels = history.data?.ladder_levels ?? EMPTY_LIST;
   const ladderParameters = history.data?.ladder_parameters ?? {};
   const position = history.data?.position ?? null;
   const ladderSummary = history.data?.ladder_summary ?? {};
@@ -285,7 +286,22 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
         }
         anchors.push({ marker, x, y });
       }
-      setMarkerAnchors(anchors);
+      setMarkerAnchors((current) => {
+        if (
+          current.length === anchors.length &&
+          current.every((item, index) => {
+            const next = anchors[index];
+            return (
+              item.marker?.id === next.marker?.id &&
+              Math.abs(item.x - next.x) < 0.5 &&
+              Math.abs(item.y - next.y) < 0.5
+            );
+          })
+        ) {
+          return current;
+        }
+        return anchors;
+      });
     };
 
     chart.timeScale().fitContent();
@@ -314,7 +330,6 @@ export function LadderVisualizer({ symbol, open, onClose }: LadderVisualizerProp
 
     return () => {
       resizeObserver.disconnect();
-      setMarkerAnchors([]);
       for (const series of overlaySeries) {
         chart.removeSeries(series);
       }

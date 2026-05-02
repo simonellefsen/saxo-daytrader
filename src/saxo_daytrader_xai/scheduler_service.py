@@ -16,6 +16,7 @@ from saxo_daytrader_xai.execution_engine import enqueue_session_flatten_orders, 
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
 from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
+from saxo_daytrader_xai.runtime_settings import apply_runtime_settings
 from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
@@ -136,6 +137,7 @@ def run_scheduler_cycle(
     resolved_config = _resolve_config(config, config_path)
     resolved_connection = connection or connect(resolved_config["portfolio"]["database_path"])
     init_db(resolved_connection)
+    resolved_config = apply_runtime_settings(resolved_config, resolved_connection)
     should_close = connection is None
 
     try:
@@ -306,6 +308,7 @@ def run_price_monitor_cycle(
     queue_result = None
     with connect(resolved_config["portfolio"]["database_path"]) as connection:
         init_db(connection)
+        resolved_config = apply_runtime_settings(resolved_config, connection)
         analysis_summary = summarize_analysis_window(get_market_status(resolved_config))
         if should_auto_run_decision_report(connection, resolved_config, analysis_summary["analysis_window_active"]):
             decision_result = generate_decision_report(

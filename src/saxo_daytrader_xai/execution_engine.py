@@ -10,7 +10,7 @@ from typing import Any
 import requests
 
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import append_audit_log, connect, init_db
+from saxo_daytrader_xai.db import append_audit_log, connect, init_db, release_postgres_advisory_lock, try_postgres_advisory_lock
 from saxo_daytrader_xai.fx_service import fetch_ecb_fx_rates, fx_rate_to_dkk
 from saxo_daytrader_xai.identifier_lookup import resolve_instrument_identity
 from saxo_daytrader_xai.market_data import fetch_live_prices
@@ -33,7 +33,7 @@ from saxo_daytrader_xai.saxo_openapi import (
     place_order,
     precheck_order,
 )
-from saxo_daytrader_xai.market_symbols import saxo_to_yahoo
+from saxo_daytrader_xai.market_symbols import parse_exchange_code, saxo_to_yahoo
 from saxo_daytrader_xai.portfolio import (
     fetch_cash_summary,
     fetch_latest_batch_id,
@@ -64,6 +64,20 @@ MANAGEABLE_LIVE_STATUSES = {
     "broker_cancel_requested",
 }
 
+SELL_RESERVATION_STATUSES = {
+    "pending_execution",
+    "pending_approval",
+    "waiting_for_market_open",
+    "waiting_for_cash_settlement",
+    "waiting_for_virtual_cash_budget",
+    "submitted_to_broker",
+    "broker_working",
+    "broker_amended",
+    "broker_partially_filled",
+    "broker_replace_requested",
+    "broker_cancel_requested",
+}
+
 
 def _get_connection_and_config(config: dict[str, Any] | None, connection):
     resolved_config = config or _load_default_config()
@@ -81,6 +95,39 @@ def _current_position_map(connection, batch_id: str | None = None) -> dict[str, 
             "quantity_open": row["quantity"],
         }
     return positions
+
+
+def _active_sell_reservations(connection, *, exclude_order_id: int | None = None) -> dict[str, float]:
+    placeholders = ",".join("?" for _ in SELL_RESERVATION_STATUSES)
+    params: list[Any] = list(SELL_RESERVATION_STATUSES)
+    exclude_clause = ""
+    if exclude_order_id is not None:
+        exclude_clause = "AND id != ?"
+        params.append(int(exclude_order_id))
+    rows = connection.execute(
+        f"""
+        SELECT symbol, COALESCE(SUM(quantity), 0) AS reserved_quantity
+        FROM execution_orders
+        WHERE action = 'SELL'
+          AND status IN ({placeholders})
+          {exclude_clause}
+        GROUP BY symbol
+        """,
+        tuple(params),
+    ).fetchall()
+    return {str(row["symbol"]): float(row["reserved_quantity"] or 0.0) for row in rows}
+
+
+def _available_sell_quantity(
+    connection,
+    symbol: str,
+    held_quantity: float,
+    *,
+    exclude_order_id: int | None = None,
+) -> float:
+    reservations = _active_sell_reservations(connection, exclude_order_id=exclude_order_id)
+    reserved_quantity = float(reservations.get(symbol, 0.0))
+    return max(float(held_quantity or 0.0) - reserved_quantity, 0.0)
 
 
 def _get_live_price_map(symbols: list[str], config: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -112,6 +159,18 @@ def _request_payload(order: dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, dict):
         return payload
     return {}
+
+
+def _defer_ladder_entry_bracket(config: dict[str, Any], order: dict[str, Any], request_payload: dict[str, Any]) -> bool:
+    ladder_cfg = config.get("strategy", {}).get("ladder", {})
+    submit_with_entry = bool(ladder_cfg.get("submit_bracket_with_entry", False))
+    return (
+        not submit_with_entry
+        and str(order.get("action") or "").upper() == "BUY"
+        and str(order.get("strategy_type") or request_payload.get("strategy_type") or "") == "ladder"
+        and str(order.get("strategy_role") or request_payload.get("strategy_role") or "") == "entry"
+        and bool(request_payload.get("related_orders"))
+    )
 
 
 def _strategy_plan(report: dict[str, Any] | None) -> dict[str, Any]:
@@ -334,17 +393,46 @@ def _remaining_daily_order_capacity(connection, config: dict[str, Any]) -> int:
     used = connection.execute(
         """
         SELECT COUNT(*) AS count_orders
-        FROM execution_orders
-        WHERE substr(created_at, 1, 10) = ?
-          AND status NOT IN ('error', 'cancelled')
+        FROM (
+            SELECT id AS execution_order_id
+            FROM execution_orders
+            WHERE substr(created_at, 1, 10) = ?
+              AND status = 'executed'
+              AND ledger_id IS NOT NULL
+            UNION
+            SELECT execution_order_id
+            FROM execution_fills
+            WHERE substr(created_at, 1, 10) = ?
+              AND ledger_id IS NOT NULL
+        ) successful_orders
         """,
-        (today,),
+        (today, today),
     ).fetchone()["count_orders"]
     return max(limit - int(used), 0)
 
 
 def _whole_share_quantity(quantity: float) -> int:
     return max(int(math.floor(float(quantity))), 0)
+
+
+def _local_open_lot_quantity(connection, symbol: str) -> float:
+    row = connection.execute(
+        """
+        SELECT COALESCE(SUM(quantity_remaining), 0) AS quantity
+        FROM (
+            SELECT
+                pl.lot_id,
+                pl.quantity_original - COALESCE(SUM(lr.quantity_sold), 0) AS quantity_remaining
+            FROM position_lots pl
+            LEFT JOIN lot_realizations lr ON lr.lot_id = pl.lot_id
+            WHERE pl.symbol = ?
+            GROUP BY pl.lot_id, pl.quantity_original
+            HAVING pl.quantity_original - COALESCE(SUM(lr.quantity_sold), 0) > 0
+        ) open_lots
+        """,
+        (symbol,),
+    ).fetchone()
+    return float(row["quantity"] or 0.0) if row else 0.0
 
 
 def _initial_cash_dkk(config: dict[str, Any]) -> float:
@@ -522,6 +610,107 @@ def _record_related_orders_after_submission(
     return inserted_ids
 
 
+def _create_ladder_protection_orders_after_fill(
+    connection,
+    *,
+    parent_order: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    request_payload = _request_payload(parent_order)
+    related_orders = list(request_payload.get("related_orders") or [])
+    if not related_orders:
+        return []
+    ladder_cfg = ((config or {}).get("strategy", {}) or {}).get("ladder", {}) or {}
+    submit_stop_after_fill = bool(ladder_cfg.get("submit_stop_loss_after_fill", False))
+    submit_take_profit_after_fill = bool(ladder_cfg.get("submit_take_profit_after_fill", False))
+    created_at = datetime.now(UTC).isoformat(timespec="seconds")
+    inserted: list[dict[str, Any]] = []
+    for index, child in enumerate(related_orders):
+        strategy_role = str(child.get("strategy_role") or f"child_{index}")
+        strategy_key = None
+        if parent_order.get("strategy_key"):
+            strategy_key = f"{parent_order['strategy_key']}:{strategy_role}"
+        if strategy_key:
+            existing = connection.execute(
+                """
+                SELECT id, status
+                FROM execution_orders
+                WHERE strategy_key = ?
+                  AND parent_execution_order_id = ?
+                LIMIT 1
+                """,
+                (strategy_key, parent_order["id"]),
+            ).fetchone()
+            if existing:
+                inserted.append({"order_id": int(existing["id"]), "status": str(existing["status"]), "strategy_role": strategy_role})
+                continue
+        order_type = str(child.get("order_type") or "Limit")
+        limit_price = _coerce_float(child.get("limit_price"))
+        stop_price = _coerce_float(child.get("stop_price"))
+        price_local = limit_price if order_type == "Limit" else stop_price
+        if strategy_role == "stop_loss":
+            status = "pending_execution" if submit_stop_after_fill else "planned_stop_loss"
+        elif strategy_role == "take_profit":
+            status = "pending_execution" if submit_take_profit_after_fill else "planned_take_profit"
+        else:
+            status = "planned_child_order"
+        error_text = None
+        if status == "planned_take_profit":
+            error_text = "Planned take-profit level; not submitted with entry to avoid Saxo rejecting the bracket request."
+        elif status == "planned_stop_loss":
+            error_text = "Planned stop-loss level; automatic Saxo stop-limit submission is disabled until broker-side validation passes."
+        cursor = connection.execute(
+            """
+            INSERT INTO execution_orders (
+                created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                approval_required, approved_at, broker_order_id, parent_execution_order_id,
+                strategy_type, strategy_session, strategy_key, strategy_role,
+                request_json, execution_result_json, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                parent_order.get("report_id"),
+                parent_order["symbol"],
+                child.get("action", "SELL"),
+                order_type,
+                parent_order["mode"],
+                status,
+                parent_order["adapter"],
+                parent_order.get("requested_weight_pct"),
+                float(child.get("quantity") or parent_order["quantity"]),
+                price_local,
+                limit_price,
+                stop_price,
+                parent_order.get("currency"),
+                parent_order.get("estimated_value_dkk"),
+                0,
+                None,
+                None,
+                parent_order["id"],
+                parent_order.get("strategy_type"),
+                parent_order.get("strategy_session"),
+                strategy_key,
+                strategy_role,
+                json.dumps(child, ensure_ascii=False, sort_keys=True),
+                json.dumps(
+                    {
+                        "parent_execution_order_id": parent_order["id"],
+                        "parent_broker_order_id": parent_order.get("broker_order_id"),
+                        "created_after_parent_fill": True,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                error_text,
+            ),
+        )
+        inserted.append({"order_id": int(cursor.lastrowid), "status": status, "strategy_role": strategy_role})
+    connection.commit()
+    return inserted
+
+
 def _is_retryable_execution_failure(error_text: str | None) -> bool:
     text = str(error_text or "").casefold()
     if not text:
@@ -534,6 +723,7 @@ def _is_retryable_execution_failure(error_text: str | None) -> bool:
         "temporarily unavailable",
         "connection aborted",
         "connection reset",
+        "order not placed as other order in request was rejected",
         "service unavailable",
         "too many requests",
     )
@@ -566,11 +756,18 @@ def _retry_block_reason(
     holdings = _current_holdings_map_for_retry(connection, config)
     symbol = str(order.get("symbol") or "")
     held_qty = float((holdings.get(symbol) or {}).get("quantity") or 0.0)
+    available_qty = _available_sell_quantity(
+        connection,
+        symbol,
+        held_qty,
+        exclude_order_id=int(order.get("id") or 0) or None,
+    )
     requested_qty = float(order.get("quantity") or 0.0)
-    if held_qty + 1e-9 >= requested_qty:
+    if available_qty + 1e-9 >= requested_qty:
         return None
     return (
         f"Retry blocked: current broker-aligned holdings for {symbol} are {held_qty:g}, "
+        f"with {available_qty:g} available after active sell reservations, "
         f"below requested sell quantity {requested_qty:g}."
     )
 
@@ -749,6 +946,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     min_trade_value_dkk = float(config["execution"]["min_trade_value_dkk"])
     remaining_capacity = _remaining_daily_order_capacity(connection, config)
     remaining_cash_dkk = float(portfolio_summary["cash_balance_dkk"] or 0.0)
+    sell_reservations = _active_sell_reservations(connection)
     approval_required = _approval_required_for_order(config)
     desired_strategy_orders = list(strategy_plan.get("ladder_orders") or []) if strategy_enabled(config) else []
     active_strategy_by_key: dict[str, dict[str, Any]] = {}
@@ -930,6 +1128,9 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
         if symbol in position_map:
             current_quantity = float(position_map[symbol]["quantity_open"])
             current_value_dkk = current_quantity * price_local * fx_rate
+        available_sell_quantity = current_quantity
+        if action == "SELL":
+            available_sell_quantity = max(current_quantity - float(sell_reservations.get(symbol, 0.0)), 0.0)
         target_value_dkk = float(portfolio_summary["total_market_value_dkk"]) * requested_weight_pct
         delta_value_dkk = target_value_dkk - current_value_dkk
         if action == "BUY" and delta_value_dkk <= 0:
@@ -938,7 +1139,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
             continue
         quantity = abs(delta_value_dkk) / max(price_local * fx_rate, 1e-9)
         if action == "SELL":
-            quantity = min(quantity, current_quantity)
+            quantity = min(quantity, available_sell_quantity)
             whole_quantity = _whole_share_quantity(quantity)
             estimated_value_dkk = whole_quantity * price_local * fx_rate
         else:
@@ -979,6 +1180,7 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
                 remaining_cash_dkk += float(sell_outcome["net_DKK"])
             except ValueError:
                 pass
+            sell_reservations[symbol] = float(sell_reservations.get(symbol, 0.0)) + float(whole_quantity)
 
         new_orders.append(
             {
@@ -1111,7 +1313,20 @@ def enqueue_session_flatten_orders(*, config: dict[str, Any] | None = None, conn
         created: list[int] = []
         for position in positions:
             symbol = str(position["symbol"])
-            quantity = _whole_share_quantity(float(position["quantity"] or 0.0))
+            broker_aligned_quantity = _whole_share_quantity(float(position["quantity"] or 0.0))
+            local_lot_quantity = _whole_share_quantity(_local_open_lot_quantity(resolved_connection, symbol))
+            quantity = min(broker_aligned_quantity, local_lot_quantity)
+            if broker_aligned_quantity > local_lot_quantity:
+                append_audit_log(
+                    resolved_connection,
+                    "flatten_quantity_capped_to_local_lots",
+                    {
+                        "symbol": symbol,
+                        "broker_aligned_quantity": broker_aligned_quantity,
+                        "local_lot_quantity": local_lot_quantity,
+                        "flatten_quantity": quantity,
+                    },
+                )
             if quantity <= 0 or not _flatten_due_for_symbol(symbol, resolved_config):
                 continue
             existing_flatten = resolved_connection.execute(
@@ -1538,20 +1753,55 @@ def _sync_incremental_live_fill(
     synced_order = {**order, "quantity": delta_quantity, "price_local": average_price}
 
     if order["action"] == "SELL":
-        trade = calculate_sell_outcome(
-            order["symbol"],
-            delta_quantity,
-            average_price,
-            config=config,
-            connection=connection,
-            batch_id=batch_id,
-            tax_year=datetime.now(UTC).year,
-        )
+        ledger_quantity = delta_quantity
+        broker_only_quantity = 0.0
+        reconciliation_note = None
+        try:
+            trade = calculate_sell_outcome(
+                order["symbol"],
+                ledger_quantity,
+                average_price,
+                config=config,
+                connection=connection,
+                batch_id=batch_id,
+                tax_year=datetime.now(UTC).year,
+            )
+        except ValueError:
+            local_open_quantity = _local_open_lot_quantity(connection, str(order["symbol"]))
+            if local_open_quantity <= 1e-9 or local_open_quantity >= delta_quantity - 1e-9:
+                raise
+            ledger_quantity = min(delta_quantity, local_open_quantity)
+            broker_only_quantity = max(delta_quantity - ledger_quantity, 0.0)
+            trade = calculate_sell_outcome(
+                order["symbol"],
+                ledger_quantity,
+                average_price,
+                config=config,
+                connection=connection,
+                batch_id=batch_id,
+                tax_year=datetime.now(UTC).year,
+            )
+            reconciliation_note = (
+                f"Broker filled {delta_quantity:g} shares, but local tax lots only covered "
+                f"{ledger_quantity:g}; {broker_only_quantity:g} broker-only shares were not booked to tax lots."
+            )
         trade["mode"] = order["mode"]
         trade["status"] = "executed"
         trade["notes"] = f"Saxo broker {fill_status.lower()} sync"
-        trade["decision_context"] = activity
+        if reconciliation_note:
+            trade["notes"] = f"{trade['notes']} | {reconciliation_note}"
+        trade["decision_context"] = {
+            **activity,
+            "local_ledger_quantity": ledger_quantity,
+            "broker_filled_quantity": delta_quantity,
+            "broker_only_quantity": broker_only_quantity,
+            "reconciliation_note": reconciliation_note,
+        }
         result = update_ledger(trade, config=config, connection=connection)
+        result["ledger_quantity"] = ledger_quantity
+        result["broker_only_quantity"] = broker_only_quantity
+        if reconciliation_note:
+            result["reconciliation_note"] = reconciliation_note
     else:
         result = _record_buy_trade(connection, config, synced_order, batch_id)
         connection.execute(
@@ -1951,7 +2201,17 @@ def refresh_broker_instrument_exposures(
 
 def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connection=None, limit: int = 25) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    lock_key = "saxo_daytrader_xai:broker_sync"
+    lock_acquired = False
     try:
+        lock_acquired = try_postgres_advisory_lock(resolved_connection, lock_key)
+        if not lock_acquired:
+            return {
+                "status": "skipped",
+                "reason": "broker_sync_already_running",
+                "updated": 0,
+                "orders": [],
+            }
         rows = resolved_connection.execute(
             """
             SELECT *
@@ -1988,6 +2248,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             }
 
         updates: list[dict[str, Any]] = []
+        sell_fill_symbols: set[str] = set()
 
         for row in rows:
             order = dict(row)
@@ -2095,6 +2356,13 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                             broker_order_id=str(broker_order_id),
                             fill_status="FinalFill",
                         )
+                        if float(result.get("broker_only_quantity") or 0.0) > 0:
+                            payload["local_reconciliation"] = {
+                                "status": "partial_local_lot_reconciled",
+                                "ledger_quantity": result.get("ledger_quantity"),
+                                "broker_only_quantity": result.get("broker_only_quantity"),
+                                "note": result.get("reconciliation_note"),
+                            }
                         event_id = _record_execution_event(
                             resolved_connection,
                             order=order,
@@ -2126,7 +2394,40 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                                 "event_id": event_id,
                             },
                         )
-                        updates.append({"order_id": order["id"], "status": "executed", "ledger_id": result["ledger_id"]})
+                        if str(order.get("action") or "").upper() == "SELL" and float(result.get("delta_quantity") or 0.0) > 0:
+                            sell_fill_symbols.add(str(order["symbol"]))
+                        protection_orders = []
+                        protection_results = []
+                        if (
+                            str(order.get("action") or "").upper() == "BUY"
+                            and str(order.get("strategy_type") or "") == "ladder"
+                            and str(order.get("strategy_role") or "") == "entry"
+                        ):
+                            protection_orders = _create_ladder_protection_orders_after_fill(
+                                resolved_connection,
+                                parent_order={**order, "status": "executed", "broker_order_id": str(broker_order_id)},
+                                config=resolved_config,
+                            )
+                            for child in protection_orders:
+                                if child["status"] != "pending_execution":
+                                    continue
+                                protection_results.append(
+                                    execute_order(
+                                        int(child["order_id"]),
+                                        config=resolved_config,
+                                        connection=resolved_connection,
+                                        approved=_should_auto_submit_live_orders(resolved_config),
+                                    )
+                                )
+                        updates.append(
+                            {
+                                "order_id": order["id"],
+                                "status": "executed",
+                                "ledger_id": result["ledger_id"],
+                                "protection_orders": protection_orders,
+                                "protection_results": protection_results,
+                            }
+                        )
                     except ValueError as exc:
                         event_id = _record_unreconciled_broker_fill(
                             resolved_connection,
@@ -2157,6 +2458,13 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                             broker_order_id=str(broker_order_id),
                             fill_status="Fill",
                         )
+                        if float(result.get("broker_only_quantity") or 0.0) > 0:
+                            payload["local_reconciliation"] = {
+                                "status": "partial_local_lot_reconciled",
+                                "ledger_quantity": result.get("ledger_quantity"),
+                                "broker_only_quantity": result.get("broker_only_quantity"),
+                                "note": result.get("reconciliation_note"),
+                            }
                         event_id = _record_execution_event(
                             resolved_connection,
                             order=order,
@@ -2188,6 +2496,8 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                                 "event_id": event_id,
                             },
                         )
+                        if str(order.get("action") or "").upper() == "SELL" and float(result.get("delta_quantity") or 0.0) > 0:
+                            sell_fill_symbols.add(str(order["symbol"]))
                         updates.append(
                             {
                                 "order_id": order["id"],
@@ -2332,6 +2642,7 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                     )
                     updates.append({"order_id": order["id"], "status": order["status"]})
             except Exception as exc:
+                resolved_connection.rollback()
                 fallback_payload = {
                     **execution_result,
                     "last_sync_at": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -2358,11 +2669,18 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
         broker_balance_after = broker_balance
         broker_account_after = broker_account
         broker_exposures_after = broker_exposures
+        reconciliation_after_sell_fill = None
         if updates:
             broker_positions_after = refresh_broker_position_snapshots(resolved_connection, resolved_config, session)
             broker_balance_after = refresh_broker_balance_snapshot(resolved_connection, resolved_config, session)
             broker_account_after = refresh_broker_account_snapshot(resolved_connection, resolved_config, session)
             broker_exposures_after = refresh_broker_instrument_exposures(resolved_connection, resolved_config, session)
+            if sell_fill_symbols:
+                reconciliation_after_sell_fill = reconcile_portfolio_to_broker(
+                    connection=resolved_connection,
+                    config=resolved_config,
+                    symbols=sell_fill_symbols,
+                )
         return {
             "status": "ok",
             "updated": len(updates),
@@ -2371,8 +2689,15 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             "broker_balance": broker_balance_after,
             "broker_account": broker_account_after,
             "broker_exposures": broker_exposures_after,
+            "reconciliation_after_sell_fill": reconciliation_after_sell_fill,
         }
     finally:
+        if lock_acquired:
+            try:
+                release_postgres_advisory_lock(resolved_connection, lock_key)
+            except Exception:
+                resolved_connection.rollback()
+                release_postgres_advisory_lock(resolved_connection, lock_key)
         if should_close:
             resolved_connection.close()
 
@@ -2475,7 +2800,53 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 resolved_connection.commit()
                 _dispatch_execution_failure_alerts(resolved_connection, resolved_config)
                 return {"status": "execution_failed", "order_id": order_id, "error": error_text}
+            payload: dict[str, Any] | None = None
+            order_request: dict[str, Any] = {}
+            precheck: dict[str, Any] | None = None
             try:
+                if order["action"] == "SELL":
+                    holdings = _current_holdings_map_for_retry(resolved_connection, resolved_config)
+                    held_quantity = float((holdings.get(str(order["symbol"])) or {}).get("quantity") or 0.0)
+                    available_quantity = _available_sell_quantity(
+                        resolved_connection,
+                        str(order["symbol"]),
+                        held_quantity,
+                        exclude_order_id=order_id,
+                    )
+                    requested_quantity = float(order["quantity"] or 0.0)
+                    if available_quantity + 1e-9 < requested_quantity:
+                        error_text = (
+                            f"Sell blocked before Saxo precheck for {order['symbol']}: "
+                            f"requested {requested_quantity:g}, broker-aligned holdings {held_quantity:g}, "
+                            f"available after active sell reservations {available_quantity:g}."
+                        )
+                        resolved_connection.execute(
+                            """
+                            UPDATE execution_orders
+                            SET status = ?, approved_at = ?, error_text = ?, execution_result_json = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "execution_failed",
+                                datetime.now(UTC).isoformat(timespec="seconds") if approved else None,
+                                error_text,
+                                json.dumps(
+                                    {
+                                        "sell_guard": {
+                                            "requested_quantity": requested_quantity,
+                                            "held_quantity": held_quantity,
+                                            "available_quantity": available_quantity,
+                                        }
+                                    },
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                ),
+                                order_id,
+                            ),
+                        )
+                        resolved_connection.commit()
+                        _dispatch_execution_failure_alerts(resolved_connection, resolved_config)
+                        return {"status": "execution_failed", "order_id": order_id, "error": error_text}
                 session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
                 if order["action"] == "BUY" and _cash_gate_enabled(resolved_config):
                     virtual_budget_gate = _evaluate_virtual_buy_budget_gate(order, resolved_config, resolved_connection)
@@ -2538,6 +2909,8 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                             "cash_gate": cash_gate,
                         }
                 order_request = _request_payload(order)
+                related_orders = list(order_request.get("related_orders") or [])
+                bracket_deferred = _defer_ladder_entry_bracket(resolved_config, order, order_request)
                 payload = build_order_payload(
                     symbol=order["symbol"],
                     action=order["action"],
@@ -2549,7 +2922,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                     limit_price=_coerce_float(order.get("limit_price_local")) or _coerce_float(order_request.get("limit_price_local")),
                     stop_price=_coerce_float(order.get("stop_price_local")) or _coerce_float(order_request.get("stop_price_local")),
                     duration_type=str(order_request.get("duration_type") or "DayOrder"),
-                    related_orders=list(order_request.get("related_orders") or []),
+                    related_orders=[] if bracket_deferred else related_orders,
                 )
                 precheck = precheck_order(payload, resolved_config, session)
                 broker_result = place_order(payload, resolved_config, session)
@@ -2564,7 +2937,12 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                         datetime.now(UTC).isoformat(timespec="seconds"),
                         str(broker_result.get("OrderId", "")) or None,
                         json.dumps(
-                            {"precheck": precheck, "payload": payload, "broker_result": broker_result},
+                            {
+                                "precheck": precheck,
+                                "payload": payload,
+                                "broker_result": broker_result,
+                                "deferred_related_orders": related_orders if bracket_deferred else [],
+                            },
                             ensure_ascii=False,
                             sort_keys=True,
                         ),
@@ -2572,12 +2950,14 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                     ),
                 )
                 resolved_connection.commit()
-                child_order_ids = _record_related_orders_after_submission(
-                    resolved_connection,
-                    parent_order={**order, "broker_order_id": str(broker_result.get("OrderId", "")) or None},
-                    broker_payload=payload,
-                    broker_result=broker_result,
-                )
+                child_order_ids = []
+                if not bracket_deferred:
+                    child_order_ids = _record_related_orders_after_submission(
+                        resolved_connection,
+                        parent_order={**order, "broker_order_id": str(broker_result.get("OrderId", "")) or None},
+                        broker_payload=payload,
+                        broker_result=broker_result,
+                    )
                 append_audit_log(
                     resolved_connection,
                     "execution_order_submitted",
@@ -2587,6 +2967,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                         "adapter": order["adapter"],
                         "payload": payload,
                         "child_order_ids": child_order_ids,
+                        "deferred_related_orders": related_orders if bracket_deferred else [],
                     },
                 )
                 return {
@@ -2598,6 +2979,13 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                 }
             except (SaxoSessionError, requests.RequestException, ValueError) as exc:  # type: ignore[name-defined]
                 error_text = str(exc)
+                failure_payload = {"adapter": order["adapter"], "error": error_text}
+                if payload is not None:
+                    failure_payload["payload"] = payload
+                if precheck is not None:
+                    failure_payload["precheck"] = precheck
+                if order_request:
+                    failure_payload["request"] = order_request
                 resolved_connection.execute(
                     """
                     UPDATE execution_orders
@@ -2608,7 +2996,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                         "execution_failed",
                         datetime.now(UTC).isoformat(timespec="seconds") if approved else None,
                         error_text,
-                        json.dumps({"adapter": order["adapter"], "error": error_text}, ensure_ascii=False, sort_keys=True),
+                        json.dumps(failure_payload, ensure_ascii=False, sort_keys=True),
                         order_id,
                     ),
                 )
@@ -3142,7 +3530,12 @@ def repair_invalid_simulation_trades(*, connection, config: dict[str, Any] | Non
             resolved_connection.close()
 
 
-def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def reconcile_portfolio_to_broker(
+    *,
+    connection,
+    config: dict[str, Any] | None = None,
+    symbols: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
         batch_id = fetch_latest_batch_id(resolved_connection)
@@ -3168,12 +3561,17 @@ def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None =
                 SELECT DISTINCT symbol
                 FROM execution_orders
                 WHERE status = 'execution_failed'
-                  AND error_text LIKE '%NotOwned%'
-                  AND error_text NOT LIKE '%reconciled to Saxo broker holdings%'
-                """
+                  AND error_text LIKE ?
+                  AND error_text NOT LIKE ?
+                """,
+                ("%NotOwned%", "%reconciled to Saxo broker holdings%"),
             ).fetchall()
         }
-        symbols = sorted(set(local_by_symbol) | set(broker_by_symbol) | not_owned_symbols)
+        candidate_symbols = set(local_by_symbol) | set(broker_by_symbol) | not_owned_symbols
+        if symbols is not None:
+            requested_symbols = {str(symbol) for symbol in symbols}
+            candidate_symbols = (candidate_symbols | requested_symbols) & requested_symbols
+        symbols = sorted(candidate_symbols)
         fx_snapshot = fetch_ecb_fx_rates()
         created_at = datetime.now(UTC).isoformat(timespec="seconds")
         adjustments: list[dict[str, Any]] = []
@@ -3263,10 +3661,10 @@ def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None =
                 WHERE symbol IN ({placeholders})
                   AND (
                       status = 'broker_fill_unreconciled'
-                      OR (status = 'execution_failed' AND error_text LIKE '%NotOwned%')
+                      OR (status = 'execution_failed' AND error_text LIKE ?)
                   )
                 """,
-                affected_symbols,
+                (*affected_symbols, "%NotOwned%"),
             )
         aligned_symbols = tuple(symbols)
         if aligned_symbols:
@@ -3280,10 +3678,10 @@ def reconcile_portfolio_to_broker(*, connection, config: dict[str, Any] | None =
                     END
                 WHERE symbol IN ({placeholders})
                   AND status = 'execution_failed'
-                  AND error_text LIKE '%NotOwned%'
-                  AND error_text NOT LIKE '%reconciled to Saxo broker holdings%'
+                  AND error_text LIKE ?
+                  AND error_text NOT LIKE ?
                 """,
-                aligned_symbols,
+                (*aligned_symbols, "%NotOwned%", "%reconciled to Saxo broker holdings%"),
             )
 
         append_audit_log(

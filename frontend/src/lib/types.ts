@@ -39,11 +39,42 @@ export interface OverviewResponse {
   };
   scheduler_status: JsonObject | null;
   scheduler_health: JsonObject | null;
+  saxo_auth?: SaxoAuthStatus;
+  settings?: {
+    cash_buffer?: CashBufferSettings;
+  };
   refresh: {
     price_poll_interval_minutes: number;
     scheduler_poll_interval_minutes: number;
     decision_interval_minutes: number;
   };
+}
+
+export interface CashBufferSettings {
+  min_cash_buffer_pct: number;
+  max_deployment_pct: number;
+  source?: string;
+  updated_at?: string | null;
+  config_default_min_cash_buffer_pct?: number;
+}
+
+export interface SaxoAuthStatus {
+  connected: boolean;
+  environment: "sim" | "live" | string;
+  configured_environment?: string;
+  token_valid: boolean;
+  refresh_token_valid?: boolean;
+  expires_at: string | null;
+  expires_in_minutes: number | null;
+  refresh_expires_at?: string | null;
+  refresh_expires_in_minutes?: number | null;
+  last_refreshed_at?: string | null;
+  refreshing: boolean;
+  needs_reauth: boolean;
+  status: string;
+  status_text?: string;
+  session_path?: string;
+  error?: string | null;
 }
 
 export interface PositionsResponse {

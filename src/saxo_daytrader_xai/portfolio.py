@@ -28,9 +28,74 @@ def _normalize_asset_class(value: str | None) -> str:
 
 def fetch_latest_batch_id(connection: sqlite3.Connection) -> str | None:
     row = connection.execute(
-        "SELECT batch_id FROM import_batches ORDER BY imported_at DESC, rowid DESC LIMIT 1"
+        "SELECT batch_id FROM import_batches ORDER BY imported_at DESC, batch_id DESC LIMIT 1"
     ).fetchone()
     return row["batch_id"] if row else None
+
+
+def _daily_pnl_reset_start_utc() -> str:
+    timezone = pytz.timezone("Europe/Copenhagen")
+    now_local = datetime.now(timezone)
+    reset_local = now_local.replace(hour=6, minute=0, second=0, microsecond=0)
+    if now_local < reset_local:
+        reset_local -= timedelta(days=1)
+    return reset_local.astimezone(pytz.UTC).isoformat(timespec="seconds")
+
+
+def fetch_realised_daily_pnl_summary(connection: sqlite3.Connection, *, since_utc: str | None = None) -> dict[str, float]:
+    reset_start = since_utc or _daily_pnl_reset_start_utc()
+    row = connection.execute(
+        """
+        SELECT
+            COALESCE(SUM(realised_gain_dkk), 0) AS realised_gain_dkk,
+            COALESCE(SUM(commission_dkk), 0) AS commission_dkk,
+            COUNT(*) AS trade_count
+        FROM trade_ledger
+        WHERE created_at >= ?
+          AND status IN ({})
+        """.format(",".join("?" for _ in ACTIVE_LEDGER_STATUSES)),
+        (reset_start, *tuple(ACTIVE_LEDGER_STATUSES)),
+    ).fetchone()
+    realised_gain_dkk = float(row["realised_gain_dkk"] or 0.0) if row else 0.0
+    commission_dkk = float(row["commission_dkk"] or 0.0) if row else 0.0
+    return {
+        "realised_gain_dkk": realised_gain_dkk,
+        "commission_dkk": commission_dkk,
+        "realised_pnl_after_commission_dkk": realised_gain_dkk - commission_dkk,
+        "trade_count": float(row["trade_count"] or 0.0) if row else 0.0,
+    }
+
+
+def _has_overlay_positions_without_batch(connection: sqlite3.Connection, *, use_broker_positions: bool) -> bool:
+    if use_broker_positions:
+        broker_row = connection.execute(
+            """
+            SELECT 1
+            FROM broker_position_snapshots
+            WHERE quantity > 0
+            LIMIT 1
+            """
+        ).fetchone()
+        if broker_row:
+            return True
+    trade_row = connection.execute(
+        """
+        SELECT 1
+        FROM trade_ledger
+        WHERE status IN ('executed', 'approved', 'recorded')
+        LIMIT 1
+        """
+    ).fetchone()
+    if trade_row:
+        return True
+    adjustment_row = connection.execute(
+        """
+        SELECT 1
+        FROM portfolio_reconciliation_adjustments
+        LIMIT 1
+        """
+    ).fetchone()
+    return bool(adjustment_row)
 
 
 def _base_snapshot_rows(connection: sqlite3.Connection, batch_id: str) -> list[dict[str, Any]]:
@@ -604,7 +669,10 @@ def fetch_portfolio_positions(
 ) -> list[dict[str, Any]]:
     batch_id = batch_id or fetch_latest_batch_id(connection)
     if not batch_id:
-        return []
+        if _has_overlay_positions_without_batch(connection, use_broker_positions=use_broker_positions):
+            batch_id = "__broker_overlay__"
+        else:
+            return []
     return _effective_positions(
         connection,
         batch_id,
@@ -612,6 +680,34 @@ def fetch_portfolio_positions(
         prefer_broker_cash=prefer_broker_cash,
         use_broker_positions=use_broker_positions,
     )
+
+
+def _empty_portfolio_summary(initial_cash_dkk: float) -> dict[str, Any]:
+    return {
+        "batch_id": None,
+        "position_count": 0,
+        "total_market_value_dkk": 0.0,
+        "invested_market_value_dkk": 0.0,
+        "cash_balance_dkk": float(initial_cash_dkk or 0.0),
+        "initial_cash_dkk": float(initial_cash_dkk or 0.0),
+        "cash_from_trades_dkk": 0.0,
+        "total_cost_basis_dkk": 0.0,
+        "total_unrealised_pnl_dkk": 0.0,
+        "total_daily_pnl_dkk": 0.0,
+        "total_open_daily_pnl_dkk": 0.0,
+        "total_realised_daily_pnl_dkk": 0.0,
+        "total_realised_daily_gain_dkk": 0.0,
+        "total_daily_commission_dkk": 0.0,
+    }
+
+
+def _summary_batch_id(connection: sqlite3.Connection, batch_id: str | None, *, use_broker_positions: bool) -> str | None:
+    resolved_batch_id = batch_id or fetch_latest_batch_id(connection)
+    if resolved_batch_id:
+        return resolved_batch_id
+    if _has_overlay_positions_without_batch(connection, use_broker_positions=use_broker_positions):
+        return "__broker_overlay__"
+    return None
 
 
 def fetch_portfolio_summary(
@@ -622,20 +718,9 @@ def fetch_portfolio_summary(
     prefer_broker_cash: bool = False,
     use_broker_positions: bool = True,
 ) -> dict[str, Any]:
-    batch_id = batch_id or fetch_latest_batch_id(connection)
+    batch_id = _summary_batch_id(connection, batch_id, use_broker_positions=use_broker_positions)
     if not batch_id:
-        return {
-            "batch_id": None,
-            "position_count": 0,
-            "total_market_value_dkk": 0.0,
-            "invested_market_value_dkk": 0.0,
-            "cash_balance_dkk": float(initial_cash_dkk or 0.0),
-            "initial_cash_dkk": float(initial_cash_dkk or 0.0),
-            "cash_from_trades_dkk": 0.0,
-            "total_cost_basis_dkk": 0.0,
-            "total_unrealised_pnl_dkk": 0.0,
-            "total_daily_pnl_dkk": 0.0,
-        }
+        return _empty_portfolio_summary(initial_cash_dkk)
     positions = _effective_positions(
         connection,
         batch_id,
@@ -644,6 +729,9 @@ def fetch_portfolio_summary(
         use_broker_positions=use_broker_positions,
     )
     invested_market_value_dkk = sum(float(row["market_value_dkk"] or 0.0) for row in positions)
+    open_daily_pnl_dkk = sum(float(row["daily_pnl_dkk"] or 0.0) for row in positions)
+    realised_daily = fetch_realised_daily_pnl_summary(connection)
+    realised_daily_pnl_dkk = float(realised_daily["realised_pnl_after_commission_dkk"])
     cash_summary = fetch_cash_summary(
         connection,
         initial_cash_dkk=initial_cash_dkk,
@@ -665,7 +753,11 @@ def fetch_portfolio_summary(
         "broker_cash_updated_at": cash_summary.get("broker_cash_updated_at"),
         "total_cost_basis_dkk": sum(float(row["cost_basis_dkk"] or 0.0) for row in positions),
         "total_unrealised_pnl_dkk": sum(float(row["unrealised_pnl_dkk"] or 0.0) for row in positions),
-        "total_daily_pnl_dkk": sum(float(row["daily_pnl_dkk"] or 0.0) for row in positions),
+        "total_daily_pnl_dkk": open_daily_pnl_dkk + realised_daily_pnl_dkk,
+        "total_open_daily_pnl_dkk": open_daily_pnl_dkk,
+        "total_realised_daily_pnl_dkk": realised_daily_pnl_dkk,
+        "total_realised_daily_gain_dkk": float(realised_daily["realised_gain_dkk"]),
+        "total_daily_commission_dkk": float(realised_daily["commission_dkk"]),
     }
 
 
@@ -709,30 +801,22 @@ def fetch_portfolio_integrity_status(
         WHERE status IN ('broker_fill_unreconciled', 'execution_failed')
           AND (
               status = 'broker_fill_unreconciled'
-              OR (error_text LIKE '%NotOwned%' AND error_text NOT LIKE '%reconciled to Saxo broker holdings%')
+              OR (error_text LIKE ? AND error_text NOT LIKE ?)
           )
         ORDER BY id DESC
         LIMIT 20
-        """
+        """,
+        ("%NotOwned%", "%reconciled to Saxo broker holdings%"),
     ).fetchall()
     unreconciled_orders: list[dict[str, Any]] = []
     for row in candidate_rows:
         item = dict(row)
         symbol = str(item.get("symbol") or "")
         if item["status"] == "execution_failed" and symbol not in mismatch_symbols:
-            later_executed = connection.execute(
-                """
-                SELECT 1
-                FROM execution_orders
-                WHERE symbol = ?
-                  AND id > ?
-                  AND status = 'executed'
-                LIMIT 1
-                """,
-                (symbol, int(item["id"])),
-            ).fetchone()
-            if later_executed:
-                continue
+            # A stale NotOwned precheck is only an integrity issue while the symbol
+            # still differs from Saxo. Once broker/local holdings agree, keep it in
+            # the audit trail but stop surfacing it as an actionable warning.
+            continue
         unreconciled_orders.append(item)
 
     warnings: list[str] = []

@@ -1,11 +1,16 @@
 # saxo-daytrader-xai
 
-Phase 41 foundation for a local Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
+Phase 42 foundation for a Python day-trading assistant focused on a Danish SaxoInvestor portfolio.
 
-## What Phase 41 includes
+## What Phase 42 includes
 
 - Python 3.11+ project scaffold
-- Local SQLite database at `ledger.db`
+- Local SQLite support at `ledger.db`
+- PostgreSQL support for Kubernetes deployments through `portfolio.database_url`
+- CloudNativePG deployment with one primary and one standby instance for Docker Desktop Kubernetes
+- MinIO-backed CloudNativePG backups for local development
+- SQLite-to-PostgreSQL migration job for existing `ledger.db` data
+- SIM/LIVE trading-environment metadata, account metadata, app-user metadata, and account-access tables prepared for future multi-account access control
 - Configurable `config.yaml` with placeholders for API keys, Saxo credentials, exclusions, tax brackets, and commission settings
 - CSV importer for the attached Saxo position export
 - Strict exclusion of `NOVOb:xcse` and `TSLA:xnas`
@@ -83,7 +88,7 @@ Useful options:
 .venv/bin/python main.py --api-port 8000 --frontend-port 3000 --no-scheduler
 ```
 
-`main.py` imports the configured portfolio baseline into `ledger.db`, then launches the FastAPI backend and the Next.js frontend.
+`main.py` imports the configured portfolio baseline into the configured database, then launches the FastAPI backend and the Next.js frontend.
 
 By default, this project is now set up for autonomous simulation mode:
 
@@ -127,6 +132,85 @@ make stop
 
 The web frontend is API-driven and only polls the active data surfaces. That removes the full-page rerun behavior that made the old Streamlit UI sluggish.
 
+## Docker Desktop Kubernetes
+
+The repository includes a local Docker Desktop Kubernetes deployment for namespace `saxo`. It runs three workloads:
+
+- `daytrader-api`: FastAPI backend on port `8000`.
+- `daytrader-frontend`: Next.js frontend on port `3000`.
+- `daytrader-scheduler`: APScheduler worker using the same config and persistent volume.
+
+The API and scheduler use CloudNativePG as the live database via `DATABASE_URL`. They no longer mount the legacy `/data/ledger.db` volume. A small `daytrader-session` PVC is mounted at `/session` so both processes can share the refreshable Saxo session cache. The older `daytrader-data` PVC is only used by the one-time SQLite migration job as the source for `/data/ledger.db`. The frontend only talks to the API; it does not connect to PostgreSQL directly.
+
+The deployment also creates:
+
+- `daytrader-postgres`: a two-instance CloudNativePG cluster with one primary and one standby.
+- `daytrader-minio`: a Docker-managed local MinIO container used as the CloudNativePG backup target.
+- `daytrader-postgres-backup-schedule`: a weekday PostgreSQL backup CronJob.
+- `daytrader-postgres-backup-retention`: a retention CronJob that prunes old base backups from CNPG and MinIO.
+- `daytrader-postgres-app`: a Kubernetes secret containing the app database user and `DATABASE_URL`.
+
+The frontend is exposed through the ngrok Kubernetes operator with Google OAuth and an email allow-list.
+
+Required `.env` values:
+
+```bash
+NGROK_API_KEY=
+NGROK_AUTHTOKEN=
+NGROK_DOMAIN=your-domain.ngrok.app
+NGROK_OAUTH_PROVIDER=google
+NGROK_ALLOWED_EMAILS=you@example.com,another@example.com
+MINIO_HOST_PATH=
+MINIO_ROOT_USER=daytrader
+MINIO_ROOT_PASSWORD=change-me
+MINIO_API_PORT=9000
+MINIO_CONSOLE_PORT=9001
+MINIO_ENDPOINT_URL=http://host.docker.internal:9000
+POSTGRES_APP_USER=daytrader
+POSTGRES_APP_PASSWORD=change-me
+```
+
+`NGROK_DOMAIN` must be a domain available in your ngrok account. `NGROK_OAUTH_PROVIDER` defaults to `google` when omitted. `MINIO_HOST_PATH` defaults to `./minio-data` from the repository root when omitted. `MINIO_ENDPOINT_URL` defaults to `http://host.docker.internal:9000`, which is the Docker Desktop route from Kubernetes pods back to host-exposed Docker services. Keep the existing Saxo, xAI, Slack, and OpenFIGI values in `.env`; the deploy script creates the Kubernetes secret from that file.
+
+Deploy to Docker Desktop:
+
+```bash
+make k8s-deploy
+```
+
+Useful Kubernetes targets:
+
+```bash
+make docker-build
+make k8s-status
+make k8s-db-status
+make k8s-stop
+```
+
+`make k8s-deploy` builds timestamped local images, starts or replaces the Docker MinIO container with `MINIO_HOST_PATH` bind-mounted to `/data`, creates the `daytrader-cnpg` bucket, installs or upgrades the CloudNativePG and ngrok operators via Helm, applies the database and app resources, migrates `/data/ledger.db` into PostgreSQL if present, renders the ngrok OAuth ingress, and seeds `.secrets/saxo_session.json` into the dedicated session PVC when the local session file exists.
+
+The Kubernetes manifests use `imagePullPolicy: IfNotPresent`. This is intentional for Docker Desktop: the deploy script builds local images into the Docker Desktop image store and then updates deployments to those concrete image tags.
+
+MinIO is intentionally run outside Kubernetes because Docker Desktop Kubernetes `hostPath` volumes are node-local and did not reliably mirror object files into the macOS project folder. The Docker-managed MinIO container uses a normal Docker bind mount, so backup objects should be visible under `./minio-data/daytrader-cnpg`.
+
+CloudNativePG currently reports the built-in `barmanObjectStore` backup stanza as deprecated for a future CNPG release. It works for this local deployment, but the longer-term replacement is CNPG's Barman Cloud Plugin.
+
+PostgreSQL backup strategy:
+
+- Kubernetes runs `daytrader-postgres-backup-schedule` at `15` minutes past each hour from `09:15` through `23:15`, Monday through Friday, in `Europe/Copenhagen` local time.
+- Weekend backups are intentionally skipped while markets are closed. The last scheduled backup before the weekend is Friday `23:15` Copenhagen time; the cycle resumes Monday `09:15` Copenhagen time.
+- The backup CronJob creates CloudNativePG `Backup` resources for `daytrader-postgres` using the `barmanObjectStore` method.
+- The old CNPG `ScheduledBackup` resource is not used because the installed CNPG CRD does not expose a Kubernetes-style timezone field; using a Kubernetes CronJob keeps the schedule aligned with Copenhagen local time and DST.
+- `daytrader-postgres-backup-retention` runs at `30` minutes past each hour on the same weekday backup window, after the scheduled backup should have completed.
+- The retention job also purges weekend backups once at least one weekday backup exists, so old weekend backups from a previous schedule are kept only as a temporary safety net until the Monday cycle resumes.
+- Retention keeps the latest `24` hourly backups.
+- Older backups are compacted into one backup per day for `7` days.
+- Older backups are compacted into one backup per ISO week for `4` weeks.
+- Older backups are compacted into one backup per month for `12` months.
+- Older backups are compacted into one backup per year for `10` years.
+- The retention job deletes pruned CNPG `Backup` resources, invalid CNPG `Backup` resources whose base backup object is missing, and matching MinIO base-backup prefixes under `daytrader-cnpg/daytrader-postgres/base/`.
+- WAL retention is kept conservative at `3650d` in CNPG so long-term retained base backups remain recoverable. This uses more storage, but avoids deleting WAL segments that a retained backup may need.
+
 ## Config Reference
 
 The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml). Values written as `ENV:NAME` are loaded from `.env`.
@@ -147,6 +231,7 @@ The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml
 - `base_currency`: reporting currency. The project assumes `DKK`.
 - `source_csv`: Saxo export used for the latest imported holdings baseline.
 - `database_path`: SQLite database path, usually `ledger.db`.
+- `database_url`: optional PostgreSQL DSN. In Kubernetes this is set to `ENV:DATABASE_URL` and takes precedence over `database_path`.
 - `initial_cash_dkk`: starting cash balance used for cash-aware portfolio value and buy-side limits. Buys reduce it, sells increase it through recorded `net_amount_dkk`.
 
 ### `market_data`
@@ -178,7 +263,7 @@ The price monitor stores latest portfolio quotes in SQLite, appends portfolio-va
 - `calendar_lookback_days`: how much recent session history is cached.
 - `calendar_lookahead_days`: how far future holiday/session data is cached.
 
-Example: with `offset_minutes_after_open: 60` and `duration_minutes: 45`, a market that opens at `09:00` local will have an analysis window from `10:00` to `10:45` local.
+Example: with `offset_minutes_after_open: 30` and `duration_minutes: 0`, a market that opens at `09:00` local will have an analysis window from `09:30` until 15 minutes before the exchange-specific tradable close.
 
 ### `scheduler`
 
@@ -354,7 +439,7 @@ Each scheduler cycle does the following in order:
 The scheduler process also runs a separate quote-refresh job for portfolio prices. By default:
 
 - the main decision cycle runs every `10` minutes
-- the quote-refresh cycle runs every `5` minutes
+- the quote-refresh cycle runs every `1` minute
 
 That means price colors and daily P/L can update more frequently than decision generation.
 

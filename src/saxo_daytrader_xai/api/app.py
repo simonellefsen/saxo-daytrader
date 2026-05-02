@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 import json
+import secrets
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -24,7 +27,19 @@ from saxo_daytrader_xai.execution_engine import (
     sync_broker_order_statuses,
 )
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
-from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token, get_chart_samples, lookup_instrument
+from saxo_daytrader_xai.saxo_openapi import (
+    SaxoSessionError,
+    build_authorize_url,
+    build_pkce_pair,
+    build_session_payload,
+    ensure_access_token,
+    exchange_authorization_code,
+    fetch_initial_session_context,
+    get_auth_status,
+    get_chart_samples,
+    lookup_instrument,
+    save_session,
+)
 from saxo_daytrader_xai.portfolio import (
     fetch_goal_tracking,
     fetch_portfolio_integrity_status,
@@ -33,6 +48,12 @@ from saxo_daytrader_xai.portfolio import (
     fetch_portfolio_value_history,
     fetch_trade_ledger,
     fetch_unrealised_after_tax_summary,
+    record_portfolio_value_snapshot,
+)
+from saxo_daytrader_xai.runtime_settings import (
+    apply_runtime_settings,
+    fetch_cash_buffer_settings,
+    update_cash_buffer_settings,
 )
 from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
 from saxo_daytrader_xai.xai_decision import (
@@ -51,6 +72,10 @@ class LiveOrderActionRequest(BaseModel):
     action: Literal["replace", "cancel"]
     quantity: float | None = None
     price: float | None = None
+
+
+class CashBufferSettingsRequest(BaseModel):
+    min_cash_buffer_pct: float
 
 
 def _config_path(config_path: str | None = None) -> str:
@@ -77,11 +102,20 @@ def _daily_order_capacity(connection, config: dict[str, Any]) -> dict[str, int]:
         connection.execute(
             """
             SELECT COUNT(*) AS count_orders
-            FROM execution_orders
-            WHERE substr(created_at, 1, 10) = ?
-              AND status NOT IN ('error', 'cancelled')
+            FROM (
+                SELECT id AS execution_order_id
+                FROM execution_orders
+                WHERE substr(created_at, 1, 10) = ?
+                  AND status = 'executed'
+                  AND ledger_id IS NOT NULL
+                UNION
+                SELECT execution_order_id
+                FROM execution_fills
+                WHERE substr(created_at, 1, 10) = ?
+                  AND ledger_id IS NOT NULL
+            ) successful_orders
             """,
-            (today,),
+            (today, today),
         ).fetchone()["count_orders"]
     )
     remaining = max(limit - used, 0)
@@ -116,6 +150,93 @@ def _parse_json_text(value: Any) -> Any:
         return None
 
 
+def _saxo_auth_mode(config: dict[str, Any]) -> str:
+    configured = str(config.get("saxo", {}).get("auth_mode") or "").strip().lower()
+    if configured in {"pkce", "secret"}:
+        return configured
+    environment = str(config.get("saxo", {}).get("environment") or "sim").lower()
+    return "secret" if environment == "live" else "pkce"
+
+
+def _public_base_url(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_host = request.headers.get("x-forwarded-host")
+    if forwarded_host:
+        proto = (forwarded_proto or "https").split(",")[0].strip()
+        host = forwarded_host.split(",")[0].strip()
+        return f"{proto}://{host}".rstrip("/")
+    origin = request.headers.get("origin")
+    if origin:
+        return origin.rstrip("/")
+    referer = request.headers.get("referer")
+    if referer:
+        return str(referer).split("/api/", 1)[0].rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+def _oauth_state_path(config: dict[str, Any], state: str) -> Path:
+    session_path = Path(config.get("saxo", {}).get("session_path") or "")
+    if not session_path:
+        session_path = Path(config["_meta"]["config_dir"]) / ".secrets" / "saxo_session.json"
+    if not session_path.is_absolute():
+        session_path = Path(config["_meta"]["config_dir"]) / session_path
+    return session_path.parent / f"saxo_oauth_state_{state}.json"
+
+
+def _write_oauth_state(config: dict[str, Any], state: str, payload: dict[str, Any]) -> None:
+    path = _oauth_state_path(config, state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _pop_oauth_state(config: dict[str, Any], state: str) -> dict[str, Any]:
+    path = _oauth_state_path(config, state)
+    if not path.exists():
+        raise SaxoSessionError("Saxo OAuth state was not found or has expired. Start re-authentication again.")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    created_at = datetime.fromisoformat(str(payload.get("created_at")).replace("Z", "+00:00"))
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    if created_at < datetime.now(UTC) - timedelta(minutes=10):
+        raise SaxoSessionError("Saxo OAuth state has expired. Start re-authentication again.")
+    return payload
+
+
+def _oauth_callback_html(*, ok: bool, title: str, message: str, return_to: str = "/") -> str:
+    color = "#0a7f39" if ok else "#b42318"
+    safe_title = title.replace("<", "&lt;").replace(">", "&gt;")
+    safe_message = message.replace("<", "&lt;").replace(">", "&gt;")
+    safe_return_to = quote(return_to or "/", safe="/:?&=#%")
+    return f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="2; url={safe_return_to}" />
+    <title>{safe_title}</title>
+    <style>
+      body {{ font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 4rem; color: #111827; }}
+      main {{ max-width: 44rem; padding: 2rem; border: 1px solid #d8e0ea; border-radius: 1rem; box-shadow: 0 18px 60px rgba(15, 23, 42, 0.08); }}
+      h1 {{ color: {color}; margin-top: 0; }}
+      a {{ color: #2563eb; }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>{safe_title}</h1>
+      <p>{safe_message}</p>
+      <p>Returning to the dashboard...</p>
+      <p><a href="{safe_return_to}">Continue now</a></p>
+    </main>
+    <script>window.setTimeout(() => {{ window.location.href = "{safe_return_to}"; }}, 1200);</script>
+  </body>
+</html>"""
+
+
 def create_app(config_path: str | None = None) -> FastAPI:
     resolved_config_path = _config_path(config_path)
     app = FastAPI(
@@ -141,6 +262,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         config = load_config(app.state.config_path)
         connection = connect(config["portfolio"]["database_path"])
         init_db(connection)
+        config = apply_runtime_settings(config, connection)
         try:
             yield config, connection
         finally:
@@ -638,12 +760,145 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 },
                 "scheduler_status": scheduler_status,
                 "scheduler_health": scheduler_health,
+                "saxo_auth": get_auth_status(config, config.get("saxo", {}).get("session_path"), auto_refresh=True),
+                "settings": {
+                    "cash_buffer": fetch_cash_buffer_settings(config, connection),
+                },
                 "refresh": {
                     "price_poll_interval_minutes": int(config.get("price_monitor", {}).get("poll_interval_minutes", 1)),
                     "scheduler_poll_interval_minutes": int(config.get("scheduler", {}).get("poll_interval_minutes", 10)),
                     "decision_interval_minutes": int(config.get("strategy", {}).get("selection_interval_minutes", 15)),
                 },
             }
+
+    @app.get("/api/settings/cash-buffer")
+    def cash_buffer_settings() -> dict[str, Any]:
+        with runtime() as (config, connection):
+            return fetch_cash_buffer_settings(config, connection)
+
+    @app.post("/api/settings/cash-buffer")
+    def update_cash_buffer(request: CashBufferSettingsRequest) -> dict[str, Any]:
+        with runtime() as (config, connection):
+            try:
+                return update_cash_buffer_settings(
+                    config,
+                    connection,
+                    min_cash_buffer_pct=float(request.min_cash_buffer_pct),
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/saxo/auth/status")
+    def saxo_auth_status() -> dict[str, Any]:
+        with runtime() as (config, _):
+            return get_auth_status(config, config.get("saxo", {}).get("session_path"), auto_refresh=True)
+
+    @app.post("/api/saxo/auth/start")
+    def saxo_auth_start(request: Request) -> dict[str, Any]:
+        with runtime() as (config, _):
+            environment = str(config.get("saxo", {}).get("environment") or "sim").lower()
+            auth_mode = _saxo_auth_mode(config)
+            client_id = str(config.get("saxo", {}).get("client_id") or "")
+            if not client_id:
+                raise HTTPException(status_code=400, detail="SAXO_CLIENT_ID is missing.")
+            code_verifier = None
+            code_challenge = None
+            if auth_mode == "pkce":
+                code_verifier, code_challenge = build_pkce_pair()
+            state = secrets.token_urlsafe(32)
+            public_base_url = _public_base_url(request)
+            redirect_uri = f"{public_base_url}/api/saxo/auth/callback"
+            return_to = request.headers.get("referer") or "/"
+            authorize_url = build_authorize_url(
+                environment=environment,
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                state=state,
+                auth_mode=auth_mode,
+                code_challenge=code_challenge,
+            )
+            _write_oauth_state(
+                config,
+                state,
+                {
+                    "state": state,
+                    "environment": environment,
+                    "auth_mode": auth_mode,
+                    "client_id": client_id,
+                    "redirect_uri": redirect_uri,
+                    "code_verifier": code_verifier,
+                    "return_to": return_to,
+                    "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                },
+            )
+            return {
+                "status": "redirect",
+                "environment": environment,
+                "auth_mode": auth_mode,
+                "authorize_url": authorize_url,
+                "redirect_uri": redirect_uri,
+                "message": "Redirecting to Saxo authorization.",
+            }
+
+    @app.get("/api/saxo/auth/callback", response_class=HTMLResponse)
+    def saxo_auth_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None) -> HTMLResponse:
+        with runtime() as (config, _):
+            return_to = "/"
+            try:
+                if error:
+                    raise SaxoSessionError(f"Saxo returned an authorization error: {error}")
+                if not state or not code:
+                    raise SaxoSessionError("Saxo OAuth callback did not include both code and state.")
+                oauth_state = _pop_oauth_state(config, state)
+                return_to = str(oauth_state.get("return_to") or "/")
+                if str(oauth_state.get("state")) != state:
+                    raise SaxoSessionError("Saxo OAuth state mismatch.")
+                environment = str(oauth_state["environment"]).lower()
+                auth_mode = str(oauth_state["auth_mode"]).lower()
+                client_id = str(oauth_state["client_id"])
+                token_response = exchange_authorization_code(
+                    environment=environment,
+                    auth_mode=auth_mode,
+                    client_id=client_id,
+                    client_secret=str(config.get("saxo", {}).get("client_secret") or ""),
+                    redirect_uri=str(oauth_state["redirect_uri"]),
+                    code=code,
+                    code_verifier=oauth_state.get("code_verifier"),
+                    timeout_seconds=30,
+                )
+                session_context = fetch_initial_session_context(
+                    environment=environment,
+                    access_token=str(token_response["access_token"]),
+                    timeout_seconds=30,
+                )
+                session_payload = build_session_payload(
+                    environment=environment,
+                    auth_mode=auth_mode,
+                    client_id=client_id,
+                    redirect_uri=str(oauth_state["redirect_uri"]),
+                    code_verifier=oauth_state.get("code_verifier"),
+                    token_response=token_response,
+                    session_context=session_context,
+                )
+                session_path = Path(config.get("saxo", {}).get("session_path") or "")
+                if not session_path.is_absolute():
+                    session_path = Path(config["_meta"]["config_dir"]) / session_path
+                save_session(session_path, session_payload)
+                html = _oauth_callback_html(
+                    ok=True,
+                    title="Saxo authorization complete",
+                    message="The Saxo session has been renewed and stored for the backend.",
+                    return_to=return_to,
+                )
+                return HTMLResponse(html, status_code=200)
+            except Exception as exc:  # noqa: BLE001
+                html = _oauth_callback_html(
+                    ok=False,
+                    title="Saxo authorization failed",
+                    message=str(exc),
+                    return_to=return_to,
+                )
+                return HTMLResponse(html, status_code=400)
 
     @app.get("/api/portfolio/positions")
     def portfolio_positions(limit: int = Query(default=25, ge=1, le=250)) -> dict[str, Any]:
@@ -691,6 +946,22 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 end_at=end_dt.isoformat(timespec="seconds"),
                 limit=5000,
             )
+            if not history:
+                record_portfolio_value_snapshot(
+                    connection,
+                    recorded_at=end_dt.isoformat(timespec="seconds"),
+                    snapshot_type="api_current",
+                    initial_cash_dkk=_initial_cash_dkk(config),
+                    prefer_broker_cash=_prefer_broker_state(config),
+                    source="performance_api",
+                    extra_payload={"reason": "seed_empty_performance_history"},
+                )
+                history = fetch_portfolio_value_history(
+                    connection,
+                    start_at=effective_start_at,
+                    end_at=end_dt.isoformat(timespec="seconds"),
+                    limit=5000,
+                )
             return {
                 "range_key": range_key,
                 "history": history,

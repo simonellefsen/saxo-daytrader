@@ -1,16 +1,17 @@
 app:
   project_name: saxo-daytrader-xai
-  environment: local
+  environment: kubernetes
   dry_run: false
   simulation_mode: true
-  launch_scheduler_with_ui: true
-  scheduler_restart_on_failure: true
-  scheduler_max_restarts: 3
+  launch_scheduler_with_ui: false
+  scheduler_restart_on_failure: false
+  scheduler_max_restarts: 0
   scheduler_restart_delay_seconds: 2.0
 
 portfolio:
   base_currency: DKK
   source_csv: ""
+  database_url: ENV:DATABASE_URL
   database_path: ledger.db
   initial_cash_dkk: 250000.0
   virtual_cap_dkk: 250000.0
@@ -76,8 +77,6 @@ strategy:
     rung_count: 5
     min_rung_value_dkk: 5000
     submit_bracket_with_entry: false
-    submit_stop_loss_after_fill: false
-    submit_take_profit_after_fill: false
     atr_spacing_min: 0.15
     atr_spacing_factor: 0.25
     atr_spacing_max: 0.4
@@ -90,17 +89,12 @@ strategy:
     trail_stop_atr_multiple: 1.25
 
 execution:
-  #mode: simulation
   mode: live
   adapter: saxo
   auto_execute_simulation: true
-  #require_approval_live: true
   require_approval_live: false
   min_trade_value_dkk: 500
   max_daily_orders: 50
-  price_tick_overrides:
-    MATAS:xcse: 0.5
-    NKT:xcse: 0.5
 
 risk:
   excluded_symbols: []
@@ -155,7 +149,7 @@ saxo:
   client_secret: ENV:SAXO_CLIENT_SECRET
   client_key: ENV:SAXO_CLIENT_KEY
   account_key: ENV:SAXO_ACCOUNT_KEY
-  session_path: .secrets/saxo_session.json
+  session_path: /session/saxo_session.json
 
 tradingview:
   username: ENV:TRADINGVIEW_USERNAME

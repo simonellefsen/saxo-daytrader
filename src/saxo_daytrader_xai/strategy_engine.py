@@ -13,6 +13,8 @@ from saxo_daytrader_xai.saxo_openapi import (
     ensure_access_token,
     get_chart_samples,
     lookup_instrument,
+    normalize_order_price,
+    price_tick_size_for_symbol,
 )
 
 
@@ -352,6 +354,11 @@ def _round_price(price: float, decimals: int) -> float:
     return round(float(price), max(int(decimals), 0))
 
 
+def _round_order_price(symbol: str, price: float, config: dict[str, Any], *, side: str, decimals: int) -> float:
+    normalized = normalize_order_price(symbol, price, config, side=side, fallback_decimals=decimals)
+    return float(normalized if normalized is not None else _round_price(price, decimals))
+
+
 def _evaluate_candidate(
     *,
     candidate: dict[str, Any],
@@ -440,36 +447,68 @@ def _build_entry_ladder_orders(
     portfolio_value_dkk: float,
     remaining_cash_dkk: float,
     remaining_capacity: int,
-) -> tuple[list[dict[str, Any]], float, int]:
+) -> tuple[list[dict[str, Any]], float, int, list[str]]:
+    notes: list[str] = []
     if remaining_capacity <= 0 or remaining_cash_dkk <= 0:
-        return [], remaining_cash_dkk, remaining_capacity
+        return [], remaining_cash_dkk, remaining_capacity, notes
     ladder_cfg = config.get("strategy", {}).get("ladder", {})
-    rung_count = int(ladder_cfg.get("rung_count", 5) or 5)
+    configured_rung_count = max(1, int(ladder_cfg.get("rung_count", 5) or 5))
     fx_rate = fx_rate_to_dkk(metrics.currency, fetch_ecb_fx_rates())
     target_capital_dkk = min(target_weight_pct * max(float(portfolio_value_dkk or 0.0), remaining_cash_dkk), remaining_cash_dkk)
     total_quantity = int(target_capital_dkk / max(metrics.current_price_local * fx_rate, 1e-9))
+    default_min_rung_value_dkk = max(float(config.get("execution", {}).get("min_trade_value_dkk", 500) or 500), 5000.0)
+    min_rung_value_dkk = max(float(ladder_cfg.get("min_rung_value_dkk", default_min_rung_value_dkk) or default_min_rung_value_dkk), 1.0)
+    affordable_rung_count = max(1, int(target_capital_dkk // min_rung_value_dkk))
+    rung_count = max(1, min(configured_rung_count, affordable_rung_count, remaining_capacity))
+    if rung_count < configured_rung_count:
+        notes.append(
+            f"{symbol}: reduced entry ladder from {configured_rung_count} to {rung_count} rung(s) "
+            f"because target capital {target_capital_dkk:.2f} DKK is too small for {configured_rung_count} cost-efficient rungs."
+        )
     rung_quantities = _distribute_quantity(total_quantity, rung_count)
     if not rung_quantities:
-        return [], remaining_cash_dkk, remaining_capacity
+        notes.append(
+            f"{symbol}: skipped entry ladder because target capital {target_capital_dkk:.2f} DKK "
+            f"cannot buy one whole share at {metrics.current_price_local:.4f} {metrics.currency}."
+        )
+        return [], remaining_cash_dkk, remaining_capacity, notes
     stop_multiple = float(ladder_cfg.get("stop_loss_atr_multiple", 2.0) or 2.0)
     profit_multiple = float(ladder_cfg.get("take_profit_rung_multiple", 2.0) or 2.0)
+    max_profit_atr_multiple = float(ladder_cfg.get("max_take_profit_atr_multiple", 8.0) or 8.0)
     min_profit_multiple = float(config.get("strategy", {}).get("cost_guard_multiple", 1.5) or 1.5)
     slippage_bps = float(config.get("strategy", {}).get("estimated_slippage_bps", 8.0) or 8.0)
     orders: list[dict[str, Any]] = []
     for rung_index, quantity in enumerate(rung_quantities):
         if remaining_capacity <= 0:
             break
-        entry_price = _round_price(
+        entry_price = _round_order_price(
+            symbol,
             metrics.current_price_local - metrics.rung_spacing_local * float(rung_index + 1),
-            metrics.decimals,
+            config,
+            side="buy_limit",
+            decimals=metrics.decimals,
         )
-        take_profit_price = _round_price(
+        take_profit_price = _round_order_price(
+            symbol,
             entry_price + metrics.rung_spacing_local * max(profit_multiple, float(rung_index + 1)),
-            metrics.decimals,
+            config,
+            side="sell_limit",
+            decimals=metrics.decimals,
         )
-        stop_price = _round_price(
+        stop_price = _round_order_price(
+            symbol,
             max(entry_price - metrics.atr_1m * stop_multiple, entry_price - metrics.rung_spacing_local * 2.0, 10 ** (-metrics.decimals)),
-            metrics.decimals,
+            config,
+            side="sell_stop",
+            decimals=metrics.decimals,
+        )
+        price_tick = price_tick_size_for_symbol(symbol, config, fallback_decimals=metrics.decimals)
+        stop_limit_price = _round_order_price(
+            symbol,
+            max(stop_price - price_tick, 10 ** (-metrics.decimals)),
+            config,
+            side="sell_stop_limit",
+            decimals=metrics.decimals,
         )
         gross_dkk = float(quantity) * entry_price * fx_rate
         round_trip_cost_dkk = _estimate_round_trip_cost_dkk(
@@ -483,11 +522,37 @@ def _build_entry_ladder_orders(
         expected_profit_dkk = max(take_profit_price - entry_price, 0.0) * float(quantity) * fx_rate
         slippage_dkk = gross_dkk * (slippage_bps / 10_000.0)
         if expected_profit_dkk <= 0:
+            notes.append(f"{symbol} rung {rung_index + 1}: skipped because take-profit was not above entry.")
             continue
-        if expected_profit_dkk - slippage_dkk <= round_trip_cost_dkk * min_profit_multiple:
-            continue
+        required_profit_dkk = (round_trip_cost_dkk * min_profit_multiple) + slippage_dkk
+        if expected_profit_dkk <= required_profit_dkk:
+            required_delta_local = required_profit_dkk / max(float(quantity) * fx_rate, 1e-9)
+            max_delta_local = max(metrics.atr_1m * max_profit_atr_multiple, metrics.rung_spacing_local * profit_multiple)
+            if required_delta_local <= max_delta_local:
+                take_profit_price = _round_order_price(
+                    symbol,
+                    entry_price + required_delta_local + price_tick,
+                    config,
+                    side="sell_limit",
+                    decimals=metrics.decimals,
+                )
+                expected_profit_dkk = max(take_profit_price - entry_price, 0.0) * float(quantity) * fx_rate
+                notes.append(
+                    f"{symbol} rung {rung_index + 1}: widened take-profit to cover estimated round-trip "
+                    f"cost/slippage ({expected_profit_dkk:.2f} DKK expected vs {required_profit_dkk:.2f} DKK required)."
+                )
+            else:
+                notes.append(
+                    f"{symbol} rung {rung_index + 1}: skipped because a cost-efficient take-profit would need "
+                    f"{required_delta_local:.4f} {metrics.currency}, above the configured {max_profit_atr_multiple:.1f} ATR cap."
+                )
+                continue
         total_cash_lock_dkk = gross_dkk + (round_trip_cost_dkk / 2.0)
         if total_cash_lock_dkk > remaining_cash_dkk + 1e-9:
+            notes.append(
+                f"{symbol} rung {rung_index + 1}: skipped because it needs {total_cash_lock_dkk:.2f} DKK "
+                f"but only {remaining_cash_dkk:.2f} DKK remains after cash guardrails."
+            )
             continue
         strategy_key = f"{session_tag}:{symbol}:entry:{rung_index}"
         orders.append(
@@ -516,7 +581,8 @@ def _build_entry_ladder_orders(
                     },
                     {
                         "action": "SELL",
-                        "order_type": "Stop",
+                        "order_type": "StopLimit",
+                        "limit_price": stop_limit_price,
                         "stop_price": stop_price,
                         "quantity": quantity,
                         "duration_type": "GoodTillCancel",
@@ -530,14 +596,22 @@ def _build_entry_ladder_orders(
                     "take_profit_price_local": take_profit_price,
                     "stop_price_local": stop_price,
                     "decimals": metrics.decimals,
-                    "trail_activation_price_local": _round_price(entry_price + metrics.rung_spacing_local, metrics.decimals),
+                    "stop_limit_price_local": stop_limit_price,
+                    "price_tick_local": price_tick,
+                    "trail_activation_price_local": _round_order_price(
+                        symbol,
+                        entry_price + metrics.rung_spacing_local,
+                        config,
+                        side="sell_limit",
+                        decimals=metrics.decimals,
+                    ),
                     "trail_stop_atr_multiple": float(ladder_cfg.get("trail_stop_atr_multiple", 1.25) or 1.25),
                 },
             }
         )
         remaining_cash_dkk -= total_cash_lock_dkk
         remaining_capacity -= 1
-    return orders, remaining_cash_dkk, remaining_capacity
+    return orders, remaining_cash_dkk, remaining_capacity, notes
 
 
 def build_strategy_plan(
@@ -668,7 +742,7 @@ def build_strategy_plan(
             continue
         if current_position is not None and _safe_float(current_position.get("allocation_pct"), 0.0) >= target_weight_pct * 100.0:
             continue
-        built_orders, remaining_cash_dkk, remaining_capacity = _build_entry_ladder_orders(
+        built_orders, remaining_cash_dkk, remaining_capacity, order_notes = _build_entry_ladder_orders(
             symbol=item["symbol"],
             session_tag=metrics.session_tag,
             target_weight_pct=target_weight_pct,
@@ -678,6 +752,7 @@ def build_strategy_plan(
             remaining_cash_dkk=remaining_cash_dkk,
             remaining_capacity=remaining_capacity,
         )
+        metrics.notes.extend(order_notes)
         orders.extend(built_orders)
 
     status = "ok" if orders else "selected_without_orders"
@@ -694,6 +769,8 @@ def build_strategy_plan(
         notes.append("Portfolio value was non-positive; sizing fell back to available cash only.")
     if capital_limits["spendable_cash_dkk"] <= 0:
         notes.append("No new ladder cash was available after applying the deployment cap and next-session cash buffer.")
+    if selected and not orders and capital_limits["spendable_cash_dkk"] > 0:
+        notes.append("Selected BUY candidates produced no ladder orders after whole-share sizing and cost-guard checks.")
     return {
         "status": status,
         "selected_assets": selected_rows,

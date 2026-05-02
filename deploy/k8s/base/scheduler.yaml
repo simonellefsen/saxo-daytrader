@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: daytrader-scheduler
+  labels:
+    app: daytrader-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: daytrader-scheduler
+  template:
+    metadata:
+      labels:
+        app: daytrader-scheduler
+    spec:
+      containers:
+        - name: scheduler
+          image: daytrader-api:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - scripts/run_scheduler.py
+            - --config
+            - /app/config/config.yaml
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: daytrader-postgres-app
+                  key: database-url
+                  optional: true
+          envFrom:
+            - secretRef:
+                name: daytrader-env
+                optional: true
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: session
+              mountPath: /session
+      volumes:
+        - name: config
+          configMap:
+            name: daytrader-config
+        - name: session
+          persistentVolumeClaim:
+            claimName: daytrader-session

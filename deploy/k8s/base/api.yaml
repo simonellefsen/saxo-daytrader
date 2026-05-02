@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: daytrader-api
+  labels:
+    app: daytrader-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: daytrader-api
+  template:
+    metadata:
+      labels:
+        app: daytrader-api
+    spec:
+      containers:
+        - name: api
+          image: daytrader-api:local
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - -m
+            - uvicorn
+            - saxo_daytrader_xai.api.app:create_app
+            - --factory
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+          env:
+            - name: DAYTRADER_CONFIG
+              value: /app/config/config.yaml
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: daytrader-postgres-app
+                  key: database-url
+                  optional: true
+          envFrom:
+            - secretRef:
+                name: daytrader-env
+                optional: true
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: session
+              mountPath: /session
+      volumes:
+        - name: config
+          configMap:
+            name: daytrader-config
+        - name: session
+          persistentVolumeClaim:
+            claimName: daytrader-session
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: daytrader-api
+spec:
+  selector:
+    app: daytrader-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

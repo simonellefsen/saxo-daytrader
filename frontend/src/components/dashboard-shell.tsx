@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 
 import useSWR, { mutate } from "swr";
 
@@ -15,6 +15,7 @@ import type {
   OverviewResponse,
   PerformanceResponse,
   PositionsResponse,
+  SaxoAuthStatus,
   SchedulerResponse,
 } from "@/lib/types";
 import { LadderVisualizer } from "@/components/ladder-visualizer";
@@ -22,6 +23,14 @@ import { LineChart } from "@/components/line-chart";
 import { Sparkline } from "@/components/sparkline";
 
 type TabKey = "portfolio" | "performance" | "market" | "decision" | "execution";
+
+type AuthSession = {
+  authenticated: boolean;
+  user: {
+    email: string;
+    name: string;
+  } | null;
+};
 
 const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
   { key: "portfolio", label: "Portfolio" },
@@ -66,6 +75,9 @@ function PortfolioRow({
   );
   const sparkValues = (sparkline.data?.chart?.points ?? []).map((point) => Number(point.close ?? 0)).filter((value) => Number.isFinite(value) && value > 0);
   const positive = sparkValues.length > 1 ? sparkValues[sparkValues.length - 1] >= sparkValues[0] : Number(row.daily_pnl_dkk ?? 0) >= 0;
+  const filledRungs = Number(row.ladder_status?.filled_entry_rungs ?? 0);
+  const totalRungs = Number(row.ladder_status?.total_entry_rungs ?? 0);
+  const rungProgressText = totalRungs > 0 ? `${formatNumber(filledRungs, 0)}/${formatNumber(totalRungs, 0)} rungs filled` : null;
 
   return (
     <tr className="clickable-row" key={symbol} onClick={() => onOpen(symbol)}>
@@ -85,6 +97,7 @@ function PortfolioRow({
           <span className={`status-chip ${row.ladder_status?.trailing ? "good" : "neutral"}`}>
             {String(row.ladder_status?.text ?? "idle")}
           </span>
+          {rungProgressText ? <small className="ladder-rung-text">{rungProgressText}</small> : null}
           {Number(row.ladder_status?.progress_pct ?? 0) > 0 ? (
             <div className="ladder-progress">
               <div className="ladder-progress-bar" style={{ width: `${Math.max(6, Math.round(Number(row.ladder_status?.progress_pct ?? 0) * 100))}%` }} />
@@ -135,6 +148,150 @@ function metricSubvalue(value: unknown, formatter: (value: unknown) => string) {
   return formatter(value);
 }
 
+function userInitials(session: AuthSession | undefined): string {
+  const source = session?.user?.name || session?.user?.email || "?";
+  const words = source
+    .replace(/@.*/, "")
+    .split(/[\s._-]+/)
+    .filter(Boolean);
+  return `${words[0]?.[0] ?? "?"}${words[1]?.[0] ?? ""}`.toUpperCase();
+}
+
+function timeAgo(value: string | null, nowMs: number): string {
+  if (!value) {
+    return "n/a";
+  }
+  const parsed = new Date(value).getTime();
+  if (!Number.isFinite(parsed)) {
+    return formatTimestampPrecise(value);
+  }
+  const seconds = Math.max(Math.floor((nowMs - parsed) / 1000), 0);
+  if (seconds < 5) {
+    return "just now";
+  }
+  if (seconds < 60) {
+    return `${seconds} seconds ago`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  }
+  return formatTimestampPrecise(value);
+}
+
+function saxoTone(status: SaxoAuthStatus | undefined): "good" | "warn" | "bad" {
+  if (!status || status.needs_reauth || status.status === "missing_session" || status.status === "session_error") {
+    return "bad";
+  }
+  if (status.status === "expiring_soon" || status.status === "refresh_available" || !status.connected) {
+    return "warn";
+  }
+  return "good";
+}
+
+function saxoStatusTitle(status: SaxoAuthStatus | undefined): string {
+  if (!status) {
+    return "Saxo status is loading.";
+  }
+  const expires = status.expires_in_minutes === null || status.expires_in_minutes === undefined ? "n/a" : `${status.expires_in_minutes} min`;
+  const refreshExpires =
+    status.refresh_expires_in_minutes === null || status.refresh_expires_in_minutes === undefined
+      ? "n/a"
+      : `${status.refresh_expires_in_minutes} min`;
+  return [
+    status.status_text ?? status.status,
+    `Environment: ${String(status.environment ?? "n/a").toUpperCase()}`,
+    `Access token valid: ${status.token_valid ? "yes" : "no"}`,
+    `Expires in: ${expires}`,
+    `Refresh token valid: ${status.refresh_token_valid ? "yes" : "no"}`,
+    `Refresh expires in: ${refreshExpires}`,
+    `Last refreshed: ${formatTimestamp(status.last_refreshed_at)}`,
+  ].join("\n");
+}
+
+function SaxoStatusPill({
+  status,
+  onReauth,
+  pending,
+}: {
+  status: SaxoAuthStatus | undefined;
+  onReauth: () => void;
+  pending: boolean;
+}) {
+  const tone = saxoTone(status);
+  const env = String(status?.environment ?? "n/a").toUpperCase();
+  const expires = status?.expires_in_minutes === null || status?.expires_in_minutes === undefined ? "n/a" : `${status.expires_in_minutes} min`;
+  const statusCopy =
+    status?.connected
+      ? `Connected, token expires in ${expires}`
+      : status?.needs_reauth
+        ? "Saxo re-auth needed"
+        : `Saxo token refreshable, expires in ${expires}`;
+  return (
+    <div className={`saxo-status-pill ${tone}`} title={saxoStatusTitle(status)}>
+      <span className="status-dot" aria-hidden="true" />
+      <span className={`env-badge ${env.toLowerCase()}`}>{env}</span>
+      <span className="status-copy">{statusCopy}</span>
+      {status?.needs_reauth ? (
+        <button className="inline-action" type="button" onClick={onReauth} disabled={pending}>
+          {pending ? <span className="button-spinner" aria-hidden="true" /> : null}
+          Re-authenticate
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function ActionButton({
+  className,
+  disabled,
+  loading,
+  onClick,
+  children,
+}: {
+  className: string;
+  disabled: boolean;
+  loading: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button className={className} type="button" disabled={disabled} onClick={onClick}>
+      {loading ? <span className="button-spinner" aria-hidden="true" /> : null}
+      {children}
+    </button>
+  );
+}
+
+function decisionFriendlyMessage(decision: Record<string, any> | null, saxoAuthStatus: SaxoAuthStatus | undefined): string | null {
+  const status = String(decision?.status ?? "");
+  const strategyStatus = String(decision?.report_json?.strategy_plan?.status ?? "");
+  if (status === "failed") {
+    const saxoCopy = saxoAuthStatus?.connected
+      ? "Current Saxo status is connected; inspect the report error/logs for the original failure."
+      : "Saxo is not currently connected; renew the session before relying on the next automatic cycle.";
+    return `xAI decision report failed. ${saxoCopy}`;
+  }
+  if (status === "no_scored_candidates" || strategyStatus === "no_scored_candidates") {
+    return "No tradable candidates were found. The system will wait for the next analysis window and current cash/market constraints.";
+  }
+  if (strategyStatus === "saxo_session_error") {
+    return "This report was generated while Saxo session data was unavailable. The top-bar Saxo indicator shows the current connection state.";
+  }
+  return null;
+}
+
+function isTodayTimestamp(value: unknown): boolean {
+  if (!value || typeof value !== "string") {
+    return false;
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return false;
+  }
+  return parsed.toLocaleDateString("da-DK") === new Date().toLocaleDateString("da-DK");
+}
+
 function actionLabel(path: string): string {
   if (path.includes("/queue-process")) return "Queue processor";
   if (path.includes("/sync-broker")) return "Broker sync";
@@ -142,6 +299,7 @@ function actionLabel(path: string): string {
   if (path.includes("/reconcile-broker")) return "Portfolio reconciliation";
   if (path.includes("/scheduler-cycle")) return "Scheduler cycle";
   if (path.includes("/decision-report")) return "Decision report";
+  if (path.includes("/saxo/auth/start")) return "Saxo re-authentication";
   if (path.includes("/manage")) return "Order action";
   return "Action";
 }
@@ -173,6 +331,12 @@ function summarizeActionResult(path: string, result: Record<string, unknown>): s
     const status = String((result.report as Record<string, unknown> | undefined)?.status ?? result.status ?? "ok");
     return `${label} completed with status ${status}.`;
   }
+  if (path.includes("/saxo/auth/start")) {
+    if (typeof result.authorize_url === "string") {
+      return "Redirecting to Saxo authorization.";
+    }
+    return String(result.message ?? result.command ?? "Run the Saxo OAuth helper locally to renew the session.");
+  }
   if (path.includes("/manage")) {
     const status = String(result.status ?? "ok");
     return `${label} completed with status ${status}.`;
@@ -190,6 +354,16 @@ export function DashboardShell() {
   const [statusTone, setStatusTone] = useState<"info" | "warn" | "good">("info");
   const [lastUpdatedAt, setLastUpdatedAt] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [portfolioSort, setPortfolioSort] = useState<"unrealised" | "allocation">("allocation");
+  const [cashModalOpen, setCashModalOpen] = useState<"add" | "reduce" | null>(null);
+  const [cashAdjustmentPct, setCashAdjustmentPct] = useState(5);
+  const [cashBufferTargetPct, setCashBufferTargetPct] = useState(25);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("daytrader-active-tab") as TabKey | null;
@@ -268,12 +442,26 @@ export function DashboardShell() {
     getFetcher,
     { refreshInterval: 30_000 },
   );
+  const authSession = useSWR<AuthSession>("/auth/session", getFetcher, {
+    refreshInterval: 300_000,
+  });
+  const saxoAuth = useSWR<SaxoAuthStatus>("/api/saxo/auth/status", getFetcher, {
+    refreshInterval: 10_000,
+    fallbackData: overview.data?.saxo_auth,
+  });
 
   async function runAction(path: string, body?: unknown) {
     setPendingAction(path);
     try {
       const result = await postAction<Record<string, unknown>>(path, body);
-      setStatusTone("good");
+      if (path.includes("/saxo/auth/start") && typeof result.authorize_url === "string") {
+        setStatusTone("info");
+        setStatusMessage(summarizeActionResult(path, result));
+        setStatusDetails("");
+        window.location.assign(result.authorize_url);
+        return;
+      }
+      setStatusTone(result.status === "manual_required" ? "warn" : "good");
       setStatusMessage(summarizeActionResult(path, result));
       setStatusDetails(JSON.stringify(result, null, 2));
       await Promise.all([
@@ -284,6 +472,7 @@ export function DashboardShell() {
         mutate("/api/decision/latest"),
         mutate("/api/decision/reports?limit=20"),
         mutate("/api/scheduler?limit=10"),
+        mutate("/api/saxo/auth/status"),
       ]);
     } catch (error) {
       setStatusTone("warn");
@@ -294,13 +483,59 @@ export function DashboardShell() {
     }
   }
 
+  async function saveCashBufferSettings() {
+    const actionPath = "/api/settings/cash-buffer";
+    setPendingAction(actionPath);
+    try {
+      const result = await postAction<Record<string, unknown>>(actionPath, {
+        min_cash_buffer_pct: cashBufferTargetPct / 100,
+      });
+      setStatusTone("good");
+      setStatusMessage(`Cash buffer target updated to ${formatNumber(cashBufferTargetPct, 0)}%.`);
+      setStatusDetails(JSON.stringify(result, null, 2));
+      setCashModalOpen(null);
+      await Promise.all([
+        mutate("/api/overview"),
+        mutate("/api/decision/latest"),
+        mutate("/api/decision/reports?limit=20"),
+        mutate("/api/execution?limit=150"),
+      ]);
+    } catch (error) {
+      setStatusTone("warn");
+      setStatusMessage(error instanceof Error ? error.message : "Cash buffer update failed.");
+      setStatusDetails("");
+    } finally {
+      setPendingAction(null);
+    }
+  }
+
   const summary = overview.data?.portfolio_summary ?? {};
   const afterTaxSummary = overview.data?.after_tax_summary ?? {};
+  const cashBufferSettings = overview.data?.settings?.cash_buffer;
+  const effectiveCashBufferPct = Number(cashBufferSettings?.min_cash_buffer_pct ?? 0.25) * 100;
   const integrityWarnings = overview.data?.integrity?.warnings ?? [];
   const analysisSummary = overview.data?.analysis_summary;
+  const backendError = [
+    overview.error,
+    activeTab === "portfolio" ? positions.error : null,
+    activeTab === "performance" ? performance.error : null,
+    activeTab === "market" ? market.error : null,
+    activeTab === "decision" ? decision.error || decisionHistory.error : null,
+    activeTab === "execution" ? execution.error || scheduler.error : null,
+  ].find(Boolean);
+  const backendErrorMessage =
+    backendError instanceof Error
+      ? backendError.message
+      : backendError
+        ? "Backend data is temporarily unavailable."
+        : "";
 
   const performanceSeries = useMemo(() => {
-    return (performance.data?.history ?? []).map((row) => Number(row.total_market_value_dkk ?? 0));
+    return (performance.data?.history ?? []).map((row) => ({
+      recordedAt: String(row.recorded_at ?? ""),
+      portfolioValueDkk: Number(row.total_market_value_dkk ?? 0),
+      cashDkk: Number(row.cash_balance_dkk ?? 0),
+    }));
   }, [performance.data?.history]);
 
   const browserTimeZone = useMemo(() => Intl.DateTimeFormat().resolvedOptions().timeZone || "local time", []);
@@ -347,6 +582,25 @@ export function DashboardShell() {
     : [];
   const strategyPlan = (displayedDecision?.report_json?.strategy_plan ?? {}) as Record<string, unknown>;
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
+  const friendlyDecisionMessage = decisionFriendlyMessage(displayedDecision ?? null, saxoAuth.data);
+  const sortedPositions = useMemo(() => {
+    const rows = [...(positions.data?.items ?? [])];
+    const key = portfolioSort === "unrealised" ? "unrealised_pnl_dkk" : "allocation_pct";
+    return rows.sort((left, right) => Number(right[key] ?? 0) - Number(left[key] ?? 0));
+  }, [portfolioSort, positions.data?.items]);
+  const dailyOrderCapacityPct =
+    dailyOrderCapacity && dailyOrderCapacity.max > 0
+      ? Math.min(Math.max((dailyOrderCapacity.used / dailyOrderCapacity.max) * 100, 0), 100)
+      : 0;
+  const cashDeploymentPct =
+    Number(summary.total_market_value_dkk ?? 0) > 0
+      ? (Number(summary.invested_market_value_dkk ?? 0) / Number(summary.total_market_value_dkk ?? 1)) * 100
+      : 0;
+
+  function openCashBufferModal(mode: "add" | "reduce") {
+    setCashBufferTargetPct(Math.round(effectiveCashBufferPct));
+    setCashModalOpen(mode);
+  }
 
   useEffect(() => {
     if (!decisionHistoryItems.length && !latestDecision) {
@@ -409,14 +663,42 @@ export function DashboardShell() {
             Modern web frontend over the existing Python trading runtime. Targeted polling keeps the active
             view fresh without re-running the whole page.
           </p>
-          <p className="muted">Last updated {formatTimestampPrecise(lastUpdatedAt)} · Shortcut: R runs one scheduler cycle</p>
+          <p className="muted">Last updated {timeAgo(lastUpdatedAt, nowMs)} · Shortcut: R runs one scheduler cycle</p>
         </div>
-        <div className="pill-row">
-          <span className="pill">Execution: {String(overview.data?.execution?.mode ?? "n/a").toUpperCase()}</span>
-          <span className="pill">Adapter: {overview.data?.execution?.adapter ?? "n/a"}</span>
-          <span className="pill">Environment: {overview.data?.app?.environment ?? "n/a"}</span>
+        <div className="header-actions">
+          <div className="pill-row">
+            <span className="pill">Execution: {String(overview.data?.execution?.mode ?? "n/a").toUpperCase()}</span>
+            <span className="pill">Adapter: {overview.data?.execution?.adapter ?? "n/a"}</span>
+            <span className="pill">Environment: {overview.data?.app?.environment ?? "n/a"}</span>
+            <SaxoStatusPill
+              status={saxoAuth.data}
+              pending={pendingAction === "/api/saxo/auth/start"}
+              onReauth={() => runAction("/api/saxo/auth/start")}
+            />
+          </div>
+          <div className="user-menu" title={authSession.data?.user?.email ?? "Local session"}>
+            <div className="avatar" aria-hidden="true">
+              {userInitials(authSession.data)}
+            </div>
+            <div className="user-copy">
+              <span>{authSession.data?.user?.name ?? "Local user"}</span>
+              <small>{authSession.data?.user?.email ?? "Not behind ngrok OAuth"}</small>
+            </div>
+            {authSession.data?.authenticated ? (
+              <a className="logout-link" href="/ngrok/logout">
+                Logout
+              </a>
+            ) : null}
+          </div>
         </div>
       </header>
+
+      {backendErrorMessage ? (
+        <section className="banner warn">
+          Backend data is temporarily unavailable. Showing the latest data the frontend still has; polling will retry automatically.
+          <span className="banner-inline-detail">{backendErrorMessage}</span>
+        </section>
+      ) : null}
 
       {integrityWarnings.map((warning) => (
         <section className="banner warn" key={warning}>
@@ -425,8 +707,16 @@ export function DashboardShell() {
       ))}
 
       {Number(cashManagement.cash_buffer_shortfall_dkk ?? 0) > 0 ? (
-        <section className="banner warn">
-          Cash buffer is below target by {formatDkk(cashManagement.cash_buffer_shortfall_dkk)}. Add cash or reduce exposure.
+        <section className="banner warn banner-with-actions">
+          <span>Cash buffer is below target by {formatDkk(cashManagement.cash_buffer_shortfall_dkk)}. Add cash or reduce exposure.</span>
+          <span className="banner-action-row">
+            <button className="ghost-button small" type="button" onClick={() => openCashBufferModal("add")}>
+              Add cash
+            </button>
+            <button className="ghost-button small" type="button" onClick={() => openCashBufferModal("reduce")}>
+              Reduce exposure
+            </button>
+          </span>
         </section>
       ) : null}
 
@@ -454,6 +744,9 @@ export function DashboardShell() {
           <div className="subvalue">
             Initial {formatDkk(summary.initial_cash_dkk)} · Trades {formatDkk(summary.cash_from_trades_dkk)}
           </div>
+          <button className="ghost-button small metric-inline-action" type="button" onClick={() => openCashBufferModal("add")}>
+            Cash buffer {formatNumber(effectiveCashBufferPct, 0)}%
+          </button>
         </article>
         <article className="metric-card">
           <div className="label">Unrealised P/L</div>
@@ -468,6 +761,10 @@ export function DashboardShell() {
           <div className="label">Daily P/L Since 06:00</div>
           <div className={`value ${signedClass(summary.total_daily_pnl_dkk)}`}>
             {formatDkk(summary.total_daily_pnl_dkk)}
+          </div>
+          <div className="subvalue">
+            Open {formatDkk(summary.total_open_daily_pnl_dkk ?? summary.total_daily_pnl_dkk)} · Realised{" "}
+            {formatDkk(summary.total_realised_daily_pnl_dkk ?? 0)}
           </div>
           <div className="subvalue">{formatNumber(summary.position_count, 0)} positions</div>
         </article>
@@ -505,6 +802,15 @@ export function DashboardShell() {
               <h2>Portfolio Snapshot</h2>
               <p>Broker-aligned live holdings with a capped local budget model for new buys.</p>
             </div>
+            <div className="sort-controls" aria-label="Portfolio sorting">
+              <span className="muted">Sort by</span>
+              <button className={`range-button ${portfolioSort === "allocation" ? "active" : ""}`} type="button" onClick={() => setPortfolioSort("allocation")}>
+                Allocation
+              </button>
+              <button className={`range-button ${portfolioSort === "unrealised" ? "active" : ""}`} type="button" onClick={() => setPortfolioSort("unrealised")}>
+                Unrealised P/L
+              </button>
+            </div>
           </div>
           <div className="table-wrap">
             <table>
@@ -520,9 +826,23 @@ export function DashboardShell() {
                 </tr>
               </thead>
               <tbody>
-                {(positions.data?.items ?? []).map((row) => (
-                  <PortfolioRow key={String(row.symbol ?? "")} row={row} onOpen={setSelectedSymbol} />
-                ))}
+                {sortedPositions.length > 0 ? (
+                  sortedPositions.map((row) => (
+                    <PortfolioRow key={String(row.symbol ?? "")} row={row} onOpen={setSelectedSymbol} />
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={portfolioColumns.length}>
+                      <div className="empty-state">
+                        <strong>No open broker positions right now.</strong>
+                        <span>
+                          The portfolio is currently cash-only. If this follows the session-close flatten window, the
+                          executed sell orders are listed in the Execution tab.
+                        </span>
+                      </div>
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -549,9 +869,19 @@ export function DashboardShell() {
               ))}
             </div>
           </div>
+          <div className="legend-row compact">
+            <span className="legend-item">
+              <span className="legend-dot" style={{ background: "#0f8a4b" }} />
+              Portfolio value
+            </span>
+            <span className="legend-item">
+              <span className="legend-dot" style={{ background: "#2563eb" }} />
+              Cash balance
+            </span>
+          </div>
           <LineChart
-            values={performanceSeries}
-            positive={(performanceSeries.at(-1) ?? 0) >= (performanceSeries[0] ?? 0)}
+            points={performanceSeries}
+            positive={(performanceSeries.at(-1)?.portfolioValueDkk ?? 0) >= (performanceSeries[0]?.portfolioValueDkk ?? 0)}
           />
           <div className="mini-grid">
             {["day", "week", "month", "year", "all_time"].map((periodKey) => {
@@ -595,7 +925,7 @@ export function DashboardShell() {
               </thead>
               <tbody>
                 {(market.data?.items ?? []).map((row) => (
-                  <tr key={String(row.code)}>
+                  <tr key={String(row.code)} className={isTodayTimestamp(row.session_open_at_utc) ? "today-row" : ""}>
                     <td>{String(row.market ?? row.code)}</td>
                     <td>{String(row.status_reason ?? "")}</td>
                     <td>{row.is_tradable ? "Yes" : "No"}</td>
@@ -621,11 +951,22 @@ export function DashboardShell() {
               <p>Latest xAI report plus deterministic strategy selection output.</p>
             </div>
             <div className="action-row">
-              <button className="button" type="button" onClick={() => runAction("/api/actions/decision-report")}>
+              <ActionButton
+                className="button"
+                disabled={pendingAction !== null}
+                loading={pendingAction === "/api/actions/decision-report"}
+                onClick={() => runAction("/api/actions/decision-report")}
+              >
                 Generate Report
-              </button>
+              </ActionButton>
             </div>
           </div>
+          {friendlyDecisionMessage ? (
+            <section className="friendly-status warn">
+              <strong>{friendlyDecisionMessage}</strong>
+              <span>Suggested next action: review the report details, cash buffer, and active market windows before manually forcing execution.</span>
+            </section>
+          ) : null}
           <div className="mini-grid">
             <article className="mini-card">
               <div className="label">Created</div>
@@ -763,7 +1104,7 @@ export function DashboardShell() {
                 </table>
               </div>
             </div>
-            <details className="json-details" open>
+            <details className="json-details">
               <summary>Report JSON</summary>
               <pre className="code-block">{JSON.stringify(displayedDecision?.report_json ?? {}, null, 2)}</pre>
             </details>
@@ -779,7 +1120,7 @@ export function DashboardShell() {
               <p>Queue control, broker sync, and live order management without page-wide reruns.</p>
               {dailyOrderCapacity ? (
                 <p className="muted">
-                  Daily order cap: {formatNumber(dailyOrderCapacity.used, 0)} / {formatNumber(dailyOrderCapacity.max, 0)} used
+                  Daily executed-trade cap: {formatNumber(dailyOrderCapacity.used, 0)} / {formatNumber(dailyOrderCapacity.max, 0)} used
                   {" · "}
                   {formatNumber(dailyOrderCapacity.remaining, 0)} remaining
                 </p>
@@ -791,23 +1132,68 @@ export function DashboardShell() {
               <span className="pill">Failed {formatNumber(overview.data?.execution?.counts?.failed ?? 0, 0)}</span>
             </div>
           </div>
+          <section className={`broker-status-card ${saxoTone(saxoAuth.data)}`}>
+            <div>
+              <div className="label">Saxo Broker Status</div>
+              <h3>
+                <span className="status-dot" aria-hidden="true" />
+                {saxoAuth.data?.connected ? "Connected" : saxoAuth.data?.needs_reauth ? "Re-authentication required" : "Token refresh available"}
+              </h3>
+              <p>{saxoAuth.data?.status_text ?? "Loading Saxo session status."}</p>
+            </div>
+            <div className="broker-status-grid">
+              <span>
+                Environment <strong>{String(saxoAuth.data?.environment ?? "n/a").toUpperCase()}</strong>
+              </span>
+              <span>
+                Access token <strong>{saxoAuth.data?.token_valid ? "valid" : "not valid"}</strong>
+              </span>
+              <span>
+                Expires <strong>{saxoAuth.data?.expires_in_minutes ?? "n/a"} min</strong>
+              </span>
+              <span>
+                Refresh token <strong>{saxoAuth.data?.refresh_token_valid ? "valid" : "not valid"}</strong>
+              </span>
+              <span>
+                Last refresh <strong>{formatTimestamp(saxoAuth.data?.last_refreshed_at)}</strong>
+              </span>
+            </div>
+            <ActionButton
+              className="ghost-button"
+              disabled={pendingAction !== null}
+              loading={pendingAction === "/api/saxo/auth/start"}
+              onClick={() => runAction("/api/saxo/auth/start")}
+            >
+              Re-authenticate
+            </ActionButton>
+          </section>
           <div className="action-row">
-            <button className="button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/queue-process")}>
-              {pendingAction === "/api/actions/queue-process" ? "Running…" : "▶ Run Queue Processor"}
-            </button>
-            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/sync-broker")}>
-              {pendingAction === "/api/actions/sync-broker" ? "Syncing…" : "↻ Sync Broker Status"}
-            </button>
-            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/retry-failed")}>
-              {pendingAction === "/api/actions/retry-failed" ? "Retrying…" : "↺ Retry Failed Orders"}
-            </button>
-            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/reconcile-broker")}>
-              {pendingAction === "/api/actions/reconcile-broker" ? "Reconciling…" : "≋ Reconcile Portfolio To Saxo"}
-            </button>
-            <button className="ghost-button" type="button" disabled={pendingAction !== null} onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
-              {pendingAction === "/api/actions/scheduler-cycle" ? "Running…" : "⟳ Run Scheduler Cycle"}
-            </button>
+            <ActionButton className="button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/queue-process"} onClick={() => runAction("/api/actions/queue-process")}>
+              ▶ Run Queue Processor
+            </ActionButton>
+            <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/sync-broker"} onClick={() => runAction("/api/actions/sync-broker")}>
+              ↻ Sync Broker Status
+            </ActionButton>
+            <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/retry-failed"} onClick={() => runAction("/api/actions/retry-failed")}>
+              ↺ Retry Failed Orders
+            </ActionButton>
+            <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/reconcile-broker"} onClick={() => runAction("/api/actions/reconcile-broker")}>
+              ≋ Reconcile Portfolio To Saxo
+            </ActionButton>
+            <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/scheduler-cycle"} onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
+              ⟳ Run Scheduler Cycle
+            </ActionButton>
           </div>
+          {dailyOrderCapacity ? (
+            <div className="cap-progress-block">
+              <div className="muted">
+                Daily executed-trade cap: {formatNumber(dailyOrderCapacity.used, 0)} / {formatNumber(dailyOrderCapacity.max, 0)}
+              </div>
+              <div className="cap-progress" aria-label="Daily executed trade cap progress">
+                <div className="cap-progress-fill" style={{ width: `${dailyOrderCapacityPct}%` }} />
+              </div>
+            </div>
+          ) : null}
           <div className="mini-grid">
             <article className="mini-card">
               <div className="label">Active Ladders</div>
@@ -818,9 +1204,9 @@ export function DashboardShell() {
               <div className="value">{formatNumber(ladderSummary.filledRungs, 0)}</div>
             </article>
             <article className="mini-card">
-              <div className="label">Daily Orders Left</div>
+              <div className="label">Executed Trades Left</div>
               <div className="value">{formatNumber(dailyOrderCapacity?.remaining ?? 0, 0)}</div>
-              <div className="muted">Cap {formatNumber(dailyOrderCapacity?.max ?? 0, 0)}</div>
+              <div className="muted">Daily cap {formatNumber(dailyOrderCapacity?.max ?? 0, 0)}</div>
             </article>
           </div>
           <div className="table-wrap">
@@ -887,7 +1273,10 @@ export function DashboardShell() {
               <div className="mini-grid">
                 {(scheduler.data?.cycles ?? []).slice(0, 4).map((cycle) => (
                   <article className="mini-card" key={String(cycle.id)}>
-                    <div className="label">Cycle #{String(cycle.id)}</div>
+                    <div className="label cycle-label">
+                      <span className={`cycle-dot ${String(cycle.status ?? "") === "ok" ? "good" : "bad"}`} aria-hidden="true" />
+                      Cycle #{String(cycle.id)}
+                    </div>
                     <div className="value">{String(cycle.status ?? "n/a")}</div>
                     <div className="muted">{formatTimestamp(cycle.started_at)}</div>
                   </article>
@@ -897,6 +1286,69 @@ export function DashboardShell() {
             <pre className="code-block">{JSON.stringify(scheduler.data?.status ?? {}, null, 2)}</pre>
           </div>
         </section>
+      ) : null}
+
+      {cashModalOpen ? (
+        <div className="modal-backdrop" role="presentation" onClick={() => setCashModalOpen(null)}>
+          <section className="modal-card" role="dialog" aria-modal="true" aria-label="Cash buffer action" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-header">
+              <div>
+                <h2>Cash Buffer Settings</h2>
+                <p>
+                  Current deployment is {formatNumber(cashDeploymentPct, 1)}% with cash {formatDkk(summary.cash_balance_dkk)}.
+                  The target controls how much portfolio value the strategy reserves as cash before placing new buys.
+                </p>
+              </div>
+              <button className="ghost-button small" type="button" onClick={() => setCashModalOpen(null)}>
+                Close
+              </button>
+            </div>
+            <label className="slider-label">
+              Cash buffer target: {formatNumber(cashBufferTargetPct, 0)}%
+              <input
+                type="range"
+                min="1"
+                max="50"
+                value={cashBufferTargetPct}
+                onChange={(event) => setCashBufferTargetPct(Number(event.target.value))}
+              />
+            </label>
+            <label className="slider-label">
+              Planning shortcut: {formatNumber(cashAdjustmentPct, 0)}%
+              <input
+                type="range"
+                min="1"
+                max="25"
+                value={cashAdjustmentPct}
+                onChange={(event) => setCashAdjustmentPct(Number(event.target.value))}
+              />
+            </label>
+            <div className="mini-grid">
+              <article className="mini-card">
+                <div className="label">{cashModalOpen === "add" ? "Estimated Cash To Add" : "Estimated Exposure To Reduce"}</div>
+                <div className="value">{formatDkk((Number(summary.total_market_value_dkk ?? 0) * cashAdjustmentPct) / 100)}</div>
+              </article>
+              <article className="mini-card">
+                <div className="label">New Strategy Guardrail</div>
+                <div className="value">{formatNumber(cashBufferTargetPct, 0)}% cash</div>
+                <div className="muted">Deployment cap becomes {formatNumber(100 - cashBufferTargetPct, 0)}%.</div>
+              </article>
+            </div>
+            <div className="button-row">
+              <ActionButton
+                className="button"
+                disabled={pendingAction !== null}
+                loading={pendingAction === "/api/settings/cash-buffer"}
+                onClick={() => void saveCashBufferSettings()}
+              >
+                Save Cash Buffer
+              </ActionButton>
+              <button className="ghost-button" type="button" onClick={() => setCashModalOpen(null)}>
+                Cancel
+              </button>
+            </div>
+          </section>
+        </div>
       ) : null}
 
       <LadderVisualizer

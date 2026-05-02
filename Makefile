@@ -3,8 +3,9 @@ PIP := .venv/bin/pip
 PNPM := pnpm
 API_PORT ?= 8000
 WEB_PORT ?= 3000
+KUBE_CONTEXT ?= docker-desktop
 
-.PHONY: help install frontend-install install-web run run-web restart-web api frontend stop restart scheduler scheduler-once sync validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 validate-phase25 validate-phase26 validate-phase27 validate-phase28 validate-phase29 validate-phase30 validate-phase31 validate-phase32 validate-phase33 validate-phase34 validate-phase35 validate-phase36 validate-phase37 validate-phase38 validate-phase39 validate-phase40 validate-phase41 validate-phase42 render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
+.PHONY: help install frontend-install install-web run run-web restart-web api frontend stop restart scheduler scheduler-once sync docker-build k8s-deploy k8s-seed-saxo-session k8s-status k8s-db-status k8s-stop validate validate-phase1 validate-phase2 validate-phase3 validate-phase4 validate-phase4-live validate-phase5 validate-phase6 validate-phase7 validate-phase8 validate-phase9 validate-phase10 validate-phase11 validate-phase12 validate-phase13 validate-phase14 validate-phase15 validate-phase16 validate-phase17 validate-phase18 validate-phase19 validate-phase20 validate-phase21 validate-phase22 validate-phase23 validate-phase24 validate-phase25 validate-phase26 validate-phase27 validate-phase28 validate-phase29 validate-phase30 validate-phase31 validate-phase32 validate-phase33 validate-phase34 validate-phase35 validate-phase36 validate-phase37 validate-phase38 validate-phase39 validate-phase40 validate-phase41 validate-phase42 validate-execution-regressions render-services saxo-sim saxo-live saxo-sim-session saxo-live-session
 
 help:
 	@printf "%s\n" \
@@ -22,7 +23,14 @@ help:
 		"  make scheduler          Run the APScheduler worker continuously" \
 		"  make scheduler-once     Run one scheduler cycle in mock-decision mode" \
 		"  make sync               Import the CSV into ledger.db without starting the web stack" \
-		"  make validate           Run the latest phase validation (Phase 42)" \
+		"  make docker-build       Build local Docker Desktop images" \
+		"  make k8s-deploy         Deploy to Kubernetes context $(KUBE_CONTEXT), namespace saxo" \
+		"  make k8s-seed-saxo-session Copy local .secrets/saxo_session.json into the k8s session PVC" \
+		"  make k8s-status         Show Kubernetes resources in namespace saxo" \
+		"  make k8s-db-status      Show CNPG, Docker MinIO, and backup resources" \
+		"  make k8s-stop           Remove app resources from namespace saxo" \
+		"  make validate           Run the latest phase validation plus execution regressions" \
+		"  make validate-execution-regressions Run Saxo order execution regression checks" \
 		"  make validate-phase1    Run Phase 1 validation" \
 		"  make validate-phase2    Run Phase 2 validation" \
 		"  make validate-phase3    Run Phase 3 validation" \
@@ -111,7 +119,40 @@ scheduler-once:
 sync:
 	$(PYTHON) main.py --sync-only
 
-validate: validate-phase42
+docker-build:
+	docker build -f Dockerfile.api -t daytrader-api:local .
+	docker build -f frontend/Dockerfile -t daytrader-frontend:local frontend
+
+k8s-deploy:
+	KUBE_CONTEXT=$(KUBE_CONTEXT) bash scripts/deploy_k8s_docker_desktop.sh
+
+k8s-seed-saxo-session:
+	@test -f .secrets/saxo_session.json || (echo "Missing .secrets/saxo_session.json. Run make saxo-sim-session first." >&2; exit 1)
+	@kubectl --context $(KUBE_CONTEXT) -n saxo wait --for=condition=Ready pod -l app=daytrader-api --timeout=120s >/dev/null
+	@pod=$$(kubectl --context $(KUBE_CONTEXT) -n saxo get pod -l app=daytrader-api --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}'); \
+		kubectl --context $(KUBE_CONTEXT) -n saxo exec "$$pod" -- mkdir -p /session; \
+		kubectl --context $(KUBE_CONTEXT) -n saxo cp .secrets/saxo_session.json "$$pod:/session/saxo_session.json"; \
+		kubectl --context $(KUBE_CONTEXT) -n saxo exec "$$pod" -- chmod 600 /session/saxo_session.json; \
+		echo "Seeded .secrets/saxo_session.json into k8s session PVC via $$pod."
+
+k8s-status:
+	kubectl --context $(KUBE_CONTEXT) -n saxo get pods,svc,agentendpoint,ngroktrafficpolicy,pvc,cluster,scheduledbackup,backup
+
+k8s-db-status:
+	kubectl --context $(KUBE_CONTEXT) -n saxo get cluster,scheduledbackup,backup,pvc
+	kubectl --context $(KUBE_CONTEXT) -n saxo get pods -l cnpg.io/cluster=daytrader-postgres
+	docker ps --filter name=daytrader-minio --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+k8s-stop:
+	-kubectl --context $(KUBE_CONTEXT) -n saxo delete ingress daytrader-frontend --ignore-not-found
+	-kubectl --context $(KUBE_CONTEXT) -n saxo delete agentendpoint daytrader-frontend --ignore-not-found --wait=false
+	-kubectl --context $(KUBE_CONTEXT) -n saxo patch domain --all --type merge -p '{"metadata":{"finalizers":[]}}'
+	-kubectl --context $(KUBE_CONTEXT) -n saxo delete domain --all --ignore-not-found --wait=false
+	-kubectl --context $(KUBE_CONTEXT) -n saxo delete ngroktrafficpolicy daytrader-oauth --ignore-not-found
+	-kubectl --context $(KUBE_CONTEXT) -n saxo delete deployment daytrader-api daytrader-scheduler daytrader-frontend --ignore-not-found
+	-kubectl --context $(KUBE_CONTEXT) -n saxo delete service daytrader-api daytrader-frontend --ignore-not-found
+
+validate: validate-phase42 validate-execution-regressions
 
 validate-phase1:
 	$(PYTHON) scripts/validate_phase1.py
@@ -241,6 +282,9 @@ validate-phase41:
 
 validate-phase42:
 	PYTHONPATH=src $(PYTHON) scripts/validate_phase42.py
+
+validate-execution-regressions:
+	PYTHONPATH=src $(PYTHON) scripts/validate_execution_regressions.py
 
 render-services:
 	$(PYTHON) scripts/render_service_templates.py
