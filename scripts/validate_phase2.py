@@ -30,15 +30,32 @@ def main() -> int:
     symbols = fetch_portfolio_symbols(connection, batch_id=result.batch_id)
     excluded_symbols = set(config["risk"]["excluded_symbols"])
 
-    assert result.source_positions == 20, f"Expected 20 source positions, got {result.source_positions}"
-    assert result.excluded_positions == 2, f"Expected 2 excluded positions, got {result.excluded_positions}"
-    assert summary["position_count"] == 18, f"Expected 18 active DB positions, got {summary['position_count']}"
+    if config["portfolio"].get("source_csv"):
+        assert result.source_positions == 20, f"Expected 20 source positions, got {result.source_positions}"
+        assert result.excluded_positions == 2, f"Expected 2 excluded positions, got {result.excluded_positions}"
+        assert summary["position_count"] == 18, f"Expected 18 active DB positions, got {summary['position_count']}"
+    else:
+        assert result.source_positions == 0, f"Expected empty source import, got {result.source_positions}"
+        assert summary["position_count"] == 0, f"Expected empty post-reset portfolio, got {summary['position_count']}"
     assert set(symbols).isdisjoint(excluded_symbols), "Excluded symbols leaked into the active portfolio"
 
     watchlists = build_watchlists(config)
-    assert len(watchlists["nordic"]) == 50, f"Expected 50 Nordic names, got {len(watchlists['nordic'])}"
-    assert len(watchlists["global"]) == 100, f"Expected 100 global names, got {len(watchlists['global'])}"
-    assert all(row["symbol"] not in excluded_symbols for row in watchlists["nordic"] + watchlists["global"])
+    category_by_key = {row["key"]: row for row in watchlists["categories"]}
+    assert "uk" in category_by_key, "Missing UK watchlist category"
+    assert "us" in category_by_key, "Missing US watchlist category"
+    assert "eu" in category_by_key, "Missing EU watchlist category"
+    assert len(watchlists["nordic"]) == min(
+        config["market_data"]["watchlists"]["nordic_limit"],
+        category_by_key["nordic"]["total_universe"],
+    ), f"Unexpected Nordic watchlist size: {len(watchlists['nordic'])}"
+    assert 0 < len(watchlists["global"]) <= config["market_data"]["watchlists"]["global_limit"], (
+        f"Unexpected global watchlist size: {len(watchlists['global'])}"
+    )
+    assert all(
+        row["symbol"] not in excluded_symbols
+        for category in watchlists["categories"]
+        for row in category["items"]
+    )
 
     sample_quotes = fetch_live_prices(symbols[:3], timeout_seconds=config["market_data"]["request_timeout_seconds"])
     assert len(sample_quotes) == min(3, len(symbols))

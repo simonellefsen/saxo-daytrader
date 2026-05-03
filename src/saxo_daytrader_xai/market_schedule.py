@@ -36,6 +36,7 @@ DEFAULT_EXCHANGES: list[ExchangeSchedule] = [
     ExchangeSchedule("XCSE", "Copenhagen", "Europe/Copenhagen", time(9, 0), time(17, 0)),
     ExchangeSchedule("XLON", "London", "Europe/London", time(8, 0), time(16, 30)),
     ExchangeSchedule("XETR", "Frankfurt / Xetra", "Europe/Berlin", time(9, 0), time(17, 30)),
+    ExchangeSchedule("XAMS", "Amsterdam / Euronext", "Europe/Amsterdam", time(9, 0), time(17, 30)),
     ExchangeSchedule("XNAS", "Nasdaq US", "America/New_York", time(9, 30), time(16, 0)),
     ExchangeSchedule("XNYS", "NYSE", "America/New_York", time(9, 30), time(16, 0)),
     ExchangeSchedule("XSTO", "Stockholm", "Europe/Stockholm", time(9, 0), time(17, 30)),
@@ -83,6 +84,13 @@ HOLIDAY_LABEL_OVERRIDES: dict[str, dict[date, str]] = {
         date(2026, 12, 24): "Christmas Eve",
         date(2026, 12, 25): "Christmas Day",
         date(2026, 12, 31): "New Year's Eve",
+    },
+    "XAMS": {
+        date(2026, 1, 1): "New Year's Day",
+        date(2026, 4, 3): "Good Friday",
+        date(2026, 4, 6): "Easter Monday",
+        date(2026, 5, 1): "Labour Day",
+        date(2026, 12, 25): "Christmas Day",
     },
     "XNAS": {
         date(2026, 1, 1): "New Year's Day",

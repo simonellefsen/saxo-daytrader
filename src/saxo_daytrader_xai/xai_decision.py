@@ -7,8 +7,9 @@ from typing import Any
 
 import requests
 
+from saxo_daytrader_xai.analysis_pulses import analysis_pulse_status
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import append_audit_log, connect, init_db
+from saxo_daytrader_xai.db import append_audit_log, connect, init_db, record_analysis_pulse, record_swing_plan_snapshot
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_news import fetch_market_intelligence
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
@@ -25,7 +26,11 @@ from saxo_daytrader_xai.strategy_engine import (
     strategy_capital_limits,
     strategy_selection_interval_minutes,
 )
+from saxo_daytrader_xai.strategy_journal import fetch_recent_journal_learnings
 from saxo_daytrader_xai.watchlists import build_watchlists
+
+
+US_EXCHANGES = {"xnas", "xnys"}
 
 
 def _load_default_config() -> dict[str, Any]:
@@ -46,6 +51,19 @@ DECISION_REPORT_SCHEMA: dict[str, Any] = {
         "report_title": {"type": "string"},
         "analysis_window_active": {"type": "boolean"},
         "goal": {"type": "string"},
+        "analysis_pulse_summary": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "label": {"type": "string"},
+                "macro_summary": {"type": "string"},
+                "asia_summary": {"type": "string"},
+                "us_setup_summary": {"type": "string"},
+                "last_analysis_at": {"type": "string"},
+            },
+            "required": ["kind", "label", "macro_summary", "asia_summary", "us_setup_summary", "last_analysis_at"],
+            "additionalProperties": False,
+        },
         "market_regime": {
             "type": "object",
             "properties": {
@@ -99,17 +117,33 @@ DECISION_REPORT_SCHEMA: dict[str, Any] = {
                 "additionalProperties": False,
             },
         },
+        "symbol_sentiment": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string"},
+                    "sentiment": {"type": "string", "enum": ["SELL", "UNDERWEIGHT", "HOLD", "OVERWEIGHT", "BUY"]},
+                    "confidence": {"type": "number"},
+                    "rationale": {"type": "string"},
+                    "catalysts": {"type": "array", "items": {"type": "string"}},
+                    "risk_notes": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["symbol", "sentiment", "confidence", "rationale", "catalysts", "risk_notes"],
+                "additionalProperties": False,
+            },
+        },
         "suggested_trades": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD", "NO_ACTION"]},
+                    "action": {"type": "string", "enum": ["BUY", "SELL", "FLATTEN"]},
                     "symbol": {"type": "string"},
                     "target_weight_pct": {"type": "number"},
                     "quantity_hint": {"type": "string"},
                     "confidence": {"type": "number"},
-                    "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "priority": {"type": "string", "enum": ["high", "medium"]},
                     "rationale": {"type": "string"},
                     "risk_notes": {"type": "array", "items": {"type": "string"}},
                 },
@@ -133,11 +167,13 @@ DECISION_REPORT_SCHEMA: dict[str, Any] = {
         "report_title",
         "analysis_window_active",
         "goal",
+        "analysis_pulse_summary",
         "market_regime",
         "portfolio_assessment",
         "reasoning_steps",
         "risk_rules_check",
         "watchlist_focus",
+        "symbol_sentiment",
         "suggested_trades",
         "execution_notes",
         "daily_target_assessment",
@@ -187,6 +223,78 @@ def _summarize_market_regime(
     }
 
 
+def _exchange_holiday_codes(market_status_rows: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(row.get("code") or "").upper()
+        for row in market_status_rows
+        if row.get("holiday_name")
+    }
+
+
+def _pulse_category_keys(active_pulse: dict[str, Any] | None) -> set[str]:
+    kind = str((active_pulse or {}).get("kind") or "")
+    if kind == "morning_macro":
+        return {"nordic", "uk", "eu"}
+    if kind in {"pre_eu_close", "pre_us_close"}:
+        return {"us"}
+    return {"nordic", "uk", "us", "eu"}
+
+
+def _filter_watchlists_for_pulse(
+    watchlists: dict[str, Any],
+    market_status_rows: list[dict[str, Any]],
+    active_pulse: dict[str, Any] | None,
+) -> dict[str, Any]:
+    allowed_categories = _pulse_category_keys(active_pulse)
+    holiday_codes = _exchange_holiday_codes(market_status_rows)
+    categories: list[dict[str, Any]] = []
+    output: dict[str, Any] = {"categories": categories}
+    for category in watchlists.get("categories", []) or []:
+        key = str(category.get("key") or "")
+        items = [
+            row
+            for row in category.get("items", []) or []
+            if key in allowed_categories and str(row.get("exchange") or "").upper() not in holiday_codes
+        ]
+        output[key] = items
+        categories.append(
+            {
+                **category,
+                "items": items,
+                "pulse_included": key in allowed_categories,
+                "holiday_excluded_exchange_codes": sorted(holiday_codes),
+            }
+        )
+    for key in ("nordic", "uk", "us", "eu"):
+        output.setdefault(key, [])
+    output["global"] = [
+        row
+        for row in watchlists.get("global", []) or []
+        if str(row.get("exchange") or "").upper() not in holiday_codes
+        and (
+            not allowed_categories
+            or (
+                key_for_region := str(row.get("region") or "").lower()
+            ) in allowed_categories
+            or (key_for_region == "europe" and "eu" in allowed_categories)
+        )
+    ]
+    return output
+
+
+def _filter_positions_for_pulse(
+    positions: list[dict[str, Any]],
+    active_pulse: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if str((active_pulse or {}).get("kind") or "") != "morning_macro":
+        return positions
+    return [
+        row for row in positions
+        if ":" not in str(row.get("symbol") or "")
+        or str(row["symbol"]).split(":", 1)[1].lower() not in US_EXCHANGES
+    ]
+
+
 def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     batch_id = fetch_latest_batch_id(connection)
     initial_cash_dkk = float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0)
@@ -209,15 +317,36 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     portfolio_symbols = fetch_portfolio_symbols(connection, batch_id=batch_id)
     goal_tracking = fetch_goal_tracking(connection, config)
     watchlists = build_watchlists(config)
-    watchlist_symbols = [row["symbol"] for row in watchlists["nordic"][:5]] + [row["symbol"] for row in watchlists["global"][:10]]
-    market_news = fetch_market_intelligence(config, portfolio_symbols[:8], watchlist_symbols[:8])
     market_status_rows = get_market_status(config)
+    analysis_pulses = analysis_pulse_status(config, market_status_rows)
+    active_pulse = analysis_pulses["active_pulses"][0] if analysis_pulses["active_pulses"] else None
+    scoped_watchlists = _filter_watchlists_for_pulse(watchlists, market_status_rows, active_pulse)
+    watchlist_symbols: list[str] = []
+    for category in scoped_watchlists.get("categories", []):
+        for row in category.get("items", []):
+            symbol = str(row.get("symbol") or "")
+            if symbol and symbol not in watchlist_symbols:
+                watchlist_symbols.append(symbol)
+    for row in scoped_watchlists.get("global", []):
+        symbol = str(row.get("symbol") or "")
+        if symbol and symbol not in watchlist_symbols:
+            watchlist_symbols.append(symbol)
+    market_news = fetch_market_intelligence(config, portfolio_symbols[:8], watchlist_symbols[:12])
     analysis_summary = summarize_analysis_window(market_status_rows)
+    analysis_summary = {
+        **analysis_summary,
+        "analysis_window_active": bool(analysis_summary["analysis_window_active"] or analysis_pulses["due"]),
+        "analysis_pulses_due": bool(analysis_pulses["due"]),
+        "active_pulses": analysis_pulses["active_pulses"],
+        "next_pulse_at": analysis_pulses["next_pulse_at"],
+        "next_pulse_label": analysis_pulses["next_pulse_label"],
+    }
     market_status_by_code = {
         str(row.get("code") or "").lower(): row
         for row in market_status_rows
     }
     broker_account = fetch_broker_account_summary(connection)
+    journal_learnings = fetch_recent_journal_learnings(connection, limit=6)
     live_quotes = fetch_live_prices(
         portfolio_symbols[:10],
         timeout_seconds=config["market_data"]["request_timeout_seconds"],
@@ -250,6 +379,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
             }
         )
 
+    analysis_positions = _filter_positions_for_pulse(enriched_positions, active_pulse)
     market_regime = _summarize_market_regime(watchlists, live_quotes, market_news, market_status_rows)
     capital_limits = strategy_capital_limits(
         config=config,
@@ -295,44 +425,62 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
     return {
         "batch_id": batch_id,
         "portfolio_summary": portfolio_summary,
-        "portfolio_positions": enriched_positions,
+        "portfolio_positions": analysis_positions,
+        "all_portfolio_positions": enriched_positions,
         "watchlists": {
-            "nordic": watchlists["nordic"][:10],
-            "global": watchlists["global"][:15],
+            "categories": scoped_watchlists.get("categories", []),
+            "nordic": scoped_watchlists["nordic"][: int(config["market_data"]["watchlists"].get("nordic_limit", 100))],
+            "uk": scoped_watchlists.get("uk", [])[: int(config["market_data"]["watchlists"].get("uk_limit", 25))],
+            "us": scoped_watchlists.get("us", [])[: int(config["market_data"]["watchlists"].get("us_limit", 100))],
+            "eu": scoped_watchlists.get("eu", [])[: int(config["market_data"]["watchlists"].get("eu_limit", 75))],
+            "global": scoped_watchlists["global"][: int(config["market_data"]["watchlists"].get("global_limit", 100))],
+        },
+        "analysis_universe": {
+            "pulse_kind": str((active_pulse or {}).get("kind") or "manual"),
+            "included_categories": sorted(_pulse_category_keys(active_pulse)),
+            "holiday_excluded_exchange_codes": sorted(_exchange_holiday_codes(market_status_rows)),
+            "portfolio_scope": "exclude_us" if str((active_pulse or {}).get("kind") or "") == "morning_macro" else "all",
         },
         "goal_tracking": goal_tracking,
         "broker_account": broker_account,
         "market_news": market_news,
         "market_status": market_status_rows,
         "analysis_summary": analysis_summary,
+        "analysis_pulses": analysis_pulses,
+        "analysis_pulse": active_pulse,
         "market_regime": market_regime,
         "cash_management": cash_management,
+        "journal_learnings": journal_learnings,
     }
 
 
 def build_trading_prompt(context: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
-    excluded_symbols = config["risk"]["excluded_symbols"]
-    excluded_symbols_text = ", ".join(excluded_symbols) if excluded_symbols else "none configured"
+    swing_cfg = config.get("strategy", {}).get("swing", {})
+    excluded_symbols = list(config["risk"]["excluded_symbols"]) + list(swing_cfg.get("never_trade_symbols", []) or [])
+    excluded_symbols_text = ", ".join(dict.fromkeys(excluded_symbols)) if excluded_symbols else "none configured"
     system_prompt = f"""
-You are the portfolio decision engine for a Danish SaxoInvestor day-trading system.
+You are the portfolio decision engine for a Danish SaxoInvestor disciplined swing/day-trading system.
 
 Core goal for every decision:
 {config['xai']['goal']}
 
 Hard rules:
-- Never trade or recommend trading these excluded symbols: {excluded_symbols_text}.
-- Never recommend a BUY or SELL for a symbol whose market is not currently tradable in the supplied market status context. Use HOLD or NO_ACTION instead.
+- Use exactly this per-symbol sentiment scale: SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
+- Never trade or recommend trading these symbols under any circumstances, even if already held: {excluded_symbols_text}.
+- Only recommend symbols present in the supplied current Watchlist context.
 - Never short. Long-only portfolio.
-- No single position may exceed 15%% of portfolio value after the proposed trade.
-- Respect the configured intraday cash buffer and deployment cap. If cash is below the required buffer, prefer SELL / trim recommendations in currently tradable positions over new BUY recommendations.
+- Total holdings must stay between {int(swing_cfg.get('min_holdings', 10))} and {int(swing_cfg.get('max_holdings', 25))}; every target holding must be between {float(swing_cfg.get('min_holding_weight_pct', 0.05)) * 100:.0f}% and {float(swing_cfg.get('max_holding_weight_pct', 0.25)) * 100:.0f}% of total equity.
+- Respect the {float(swing_cfg.get('cash_buffer_pct', 0.10)) * 100:.0f}% cash buffer. If cash is below buffer, prefer SELL / FLATTEN recommendations over new BUY recommendations.
 - Treat all pnl, commission, and taxation impacts in DKK.
-- Prefer liquid, high-conviction trades with limited execution complexity.
-- If the best action is to do nothing, say so clearly.
+- Prefer liquid, news-catalyst-driven names in Nordic, EU/Euronext, UK, and US markets.
+- Only propose holdings you would actually want to own tomorrow morning.
+- Respect the supplied analysis_universe constraints: morning macro excludes US watchlist/US portfolio exposure, US-focused pulses use the US watchlist, and holiday exchange codes are out of scope.
 
 Output requirements:
 - Return only structured data conforming to the provided schema.
 - Provide explicit step-by-step rationale in the reasoning_steps field.
-- Suggested trades must be practical, risk-aware, and consistent with the supplied context.
+- Fill symbol_sentiment for the most relevant Watchlist and Portfolio symbols using the exact sentiment scale.
+- Suggested trades must use only BUY, SELL, or FLATTEN with confidence as a 0-100 number and priority high/medium.
 """.strip()
 
     user_prompt = f"""
@@ -342,11 +490,17 @@ Current portfolio snapshot JSON:
 Market regime summary JSON:
 {json.dumps(context['market_regime'], ensure_ascii=False, indent=2)}
 
+Analysis pulse JSON:
+{json.dumps({'current_pulse': context['analysis_pulse'], 'pulse_status': context['analysis_pulses']}, ensure_ascii=False, indent=2)}
+
 Watchlist opportunities JSON:
 {json.dumps(context['watchlists'], ensure_ascii=False, indent=2)}
 
+Analysis universe constraints JSON:
+{json.dumps(context['analysis_universe'], ensure_ascii=False, indent=2)}
+
 News and macro context JSON:
-{json.dumps({'market_news': context['market_news']['market_news'][:8], 'macro_events': context['market_news']['macro_events'][:6], 'earnings_calendar': context['market_news']['earnings_calendar'][:8]}, ensure_ascii=False, indent=2)}
+{json.dumps({'market_news': context['market_news']['market_news'][:8], 'macro_events': context['market_news']['macro_events'][:6], 'crypto_news': context['market_news'].get('crypto_news', [])[:6], 'earnings_calendar': context['market_news']['earnings_calendar'][:8]}, ensure_ascii=False, indent=2)}
 
 Market status JSON:
 {json.dumps({'analysis_summary': context['analysis_summary'], 'markets': context['market_status']}, ensure_ascii=False, indent=2)}
@@ -360,16 +514,18 @@ Broker account JSON:
 Cash management JSON:
 {json.dumps(context['cash_management'], ensure_ascii=False, indent=2)}
 
+Recent strategy journal learnings JSON:
+{json.dumps(context['journal_learnings'], ensure_ascii=False, indent=2)}
+
 Task:
-1. Assess the current market regime for a day-trading horizon.
-2. Evaluate the existing portfolio, including concentration and downside risks.
-3. Evaluate whether the portfolio is currently on track versus the DKK 500/day and DKK 3,500/week goals using the provided day/week/month/year/all-time performance data.
-4. Explicitly assess whether current cash is below the required next-session buffer. If it is, prefer actionable SELL/trim recommendations in currently tradable positions and explain the required cash raise clearly.
-5. Return a candidate asset pool of 5-20 symbols in candidate_assets, driven primarily by news and sentiment. candidate_assets is the upstream idea list, not the final execution list.
-6. Identify the highest-priority trade adjustments for today, if any.
-7. Respect Danish tax drag, commission drag, the cash-buffer constraints, and the long-only / exclusion constraints.
-8. If a market is not currently tradable, use WATCH or HOLD rather than a live trade recommendation and explain that the action must wait until the next tradable window.
-9. Produce a concise but concrete decision report for the operator.
+1. Identify whether this is the morning macro pulse, pre-EU close pulse, pre-US close pulse, or a manual analysis.
+2. Synthesize Asia, macro, geopolitical, earnings, commodities, crypto, and US setup into one actionable market view.
+3. Apply that view to the current Watchlist and current Portfolio using symbol_sentiment with exactly SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
+4. Return a candidate asset pool of high-conviction liquid names only; candidate_assets is the upstream idea list, not final execution.
+5. Suggest only practical BUY, SELL, or FLATTEN actions that respect watchlist-only, blacklist, 10-25 holdings, 5-25% weights, long-only, cash buffer, Danish tax drag, and commission drag.
+6. For each suggested trade, include a concise news/macro-driven rationale and concrete risk notes for swing holding.
+7. If no high-conviction trade exists, keep suggested_trades empty and explain the constraint in execution_notes.
+8. Produce a concise but concrete Decision Report for the operator.
 """.strip()
 
     return {
@@ -385,6 +541,14 @@ def _mock_decision_report(context: dict[str, Any], config: dict[str, Any]) -> di
         "report_title": "Mock Decision Report",
         "analysis_window_active": bool(context["analysis_summary"]["analysis_window_active"]),
         "goal": config["xai"]["goal"],
+        "analysis_pulse_summary": {
+            "kind": str((context.get("analysis_pulse") or {}).get("kind") or "manual"),
+            "label": str((context.get("analysis_pulse") or {}).get("label") or "Manual analysis"),
+            "macro_summary": "Mock mode: macro synthesis was not requested from xAI.",
+            "asia_summary": "Mock mode: Asia pulse inputs were assembled but not interpreted by xAI.",
+            "us_setup_summary": "Mock mode: US setup requires live model synthesis.",
+            "last_analysis_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        },
         "market_regime": context["market_regime"],
         "portfolio_assessment": {
             "summary": "Mock mode: conservative stance because no live xAI call was made.",
@@ -399,7 +563,8 @@ def _mock_decision_report(context: dict[str, Any], config: dict[str, Any]) -> di
         "risk_rules_check": [
             "Excluded symbols remain blocked.",
             "No shorting allowed.",
-            "Target weights must stay at or below 15 percent.",
+            "Target holdings must stay between 5 and 25 percent.",
+            "Portfolio must keep a 10 percent cash buffer.",
         ],
         "watchlist_focus": [
             {
@@ -420,18 +585,17 @@ def _mock_decision_report(context: dict[str, Any], config: dict[str, Any]) -> di
                 "risks": ["Requires live xAI confirmation before deployment"],
             }
         ],
-        "suggested_trades": [
+        "symbol_sentiment": [
             {
-                "action": "HOLD",
-                "symbol": top_position,
-                "target_weight_pct": 0.0,
-                "quantity_hint": "No trade in mock mode",
-                "confidence": 0.25,
-                "priority": "low",
-                "rationale": "Mock mode avoids generating real trade changes.",
-                "risk_notes": ["Use a live xAI API key to obtain real suggestions."],
+                "symbol": top_watch,
+                "sentiment": "HOLD",
+                "confidence": 50.0,
+                "rationale": "Mock mode does not assign actionable sentiment.",
+                "catalysts": ["Watchlist presence"],
+                "risk_notes": ["Requires live xAI confirmation before deployment"],
             }
         ],
+        "suggested_trades": [],
         "execution_notes": ["Mock mode only. No live model response was requested."],
         "daily_target_assessment": (
             "Mock mode only. "
@@ -524,6 +688,19 @@ def _latest_report_time(connection) -> datetime | None:
     return datetime.fromisoformat(str(latest["created_at"])).astimezone(UTC)
 
 
+def _has_report_for_pulse(connection, pulse_key: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT id
+        FROM decision_reports
+        WHERE analysis_pulse_key = ?
+        LIMIT 1
+        """,
+        (pulse_key,),
+    ).fetchone()
+    return row is not None
+
+
 def fetch_latest_decision_report(connection) -> dict[str, Any] | None:
     row = _latest_report_row(connection)
     if not row:
@@ -558,6 +735,13 @@ def estimate_next_decision_report(connection, config: dict[str, Any], reference_
     now = (reference_time or datetime.now(UTC)).astimezone(UTC)
     status_rows = get_market_status(config, reference_time=now)
     analysis_summary = summarize_analysis_window(status_rows)
+    pulse_summary = analysis_pulse_status(config, status_rows, reference_time=now)
+    for pulse in pulse_summary["active_pulses"]:
+        if not _has_report_for_pulse(connection, str(pulse["key"])):
+            return {
+                "next_report_at": pulse["target_at_utc"],
+                "reason": f"{pulse['label']} is due now",
+            }
     interval = _slot_interval(config)
     latest_time = _latest_report_time(connection)
 
@@ -592,7 +776,14 @@ def estimate_next_decision_report(connection, config: dict[str, Any], reference_
                 "reason": "Next fixed cadence slot inside active analysis window",
             }
 
-    if future_window_starts:
+    if future_window_starts or pulse_summary.get("next_pulse_at"):
+        if pulse_summary.get("next_pulse_at"):
+            future_window_starts.append(
+                (
+                    datetime.fromisoformat(str(pulse_summary["next_pulse_at"])).astimezone(UTC),
+                    str(pulse_summary.get("next_pulse_label") or "analysis pulse"),
+                )
+            )
         next_start_at, label = min(future_window_starts, key=lambda item: item[0])
         return {
             "next_report_at": next_start_at.isoformat(timespec="seconds"),
@@ -606,10 +797,15 @@ def estimate_next_decision_report(connection, config: dict[str, Any], reference_
 
 
 def should_auto_run_decision_report(connection, config: dict[str, Any], analysis_window_active: bool) -> bool:
+    now = datetime.now(UTC)
+    status_rows = get_market_status(config, reference_time=now)
+    pulse_summary = analysis_pulse_status(config, status_rows, reference_time=now)
+    for pulse in pulse_summary["active_pulses"]:
+        if not _has_report_for_pulse(connection, str(pulse["key"])):
+            return True
     if not analysis_window_active:
         return False
     interval = _slot_interval(config)
-    now = datetime.now(UTC)
     current_slot = _floor_to_slot(now, interval)
     latest_time = _latest_report_time(connection)
     if latest_time is None:
@@ -659,6 +855,8 @@ def generate_decision_report(
                 config=resolved_config,
             )
             report_json["strategy_plan"] = strategy_plan
+            if strategy_plan.get("mode") == "swing":
+                report_json["suggested_trades"] = list(strategy_plan.get("suggested_trades") or [])
         except Exception as exc:  # noqa: BLE001
             report_json["strategy_plan"] = {
                 "status": "failed",
@@ -666,8 +864,12 @@ def generate_decision_report(
                 "ladder_orders": [],
                 "notes": [f"Strategy plan generation failed: {exc}"],
             }
+        report_json["created_at"] = created_at
         report_json["analysis_summary"] = context["analysis_summary"]
+        report_json["analysis_pulse"] = context.get("analysis_pulse")
+        report_json["analysis_pulses"] = context.get("analysis_pulses")
         report_json["cash_management"] = context["cash_management"]
+        active_pulse = context.get("analysis_pulse") or {}
 
         cursor = resolved_connection.execute(
             """
@@ -683,8 +885,10 @@ def generate_decision_report(
                 request_json,
                 response_json,
                 report_json,
-                error_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                error_text,
+                analysis_pulse_key,
+                analysis_pulse_label
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 created_at,
@@ -699,10 +903,23 @@ def generate_decision_report(
                 json.dumps(response_json, ensure_ascii=False, sort_keys=True) if response_json is not None else None,
                 json.dumps(report_json, ensure_ascii=False, sort_keys=True),
                 error_text,
+                active_pulse.get("key"),
+                active_pulse.get("label"),
             ),
         )
         report_id = int(cursor.lastrowid)
         resolved_connection.commit()
+        record_analysis_pulse(
+            resolved_connection,
+            pulse=context.get("analysis_pulse"),
+            report_id=report_id,
+            status=status,
+        )
+        record_swing_plan_snapshot(
+            resolved_connection,
+            report_id=report_id,
+            report_json=report_json,
+        )
 
         append_audit_log(
             resolved_connection,
@@ -713,6 +930,7 @@ def generate_decision_report(
                 "status": status,
                 "response_id": response_id,
                 "analysis_window_active": context["analysis_summary"]["analysis_window_active"],
+                "analysis_pulse_key": active_pulse.get("key"),
             },
         )
         return {

@@ -112,6 +112,25 @@ export interface MarketResponse {
   summary: Record<string, any>;
 }
 
+export interface WatchlistCategory {
+  key: string;
+  label: string;
+  target_limit: number;
+  total_universe: number;
+  items: Array<Record<string, any>>;
+}
+
+export interface WatchlistsResponse {
+  generated_at: string;
+  cache_ttl_seconds?: number;
+  categories: WatchlistCategory[];
+  nordic: Array<Record<string, any>>;
+  uk: Array<Record<string, any>>;
+  us: Array<Record<string, any>>;
+  eu: Array<Record<string, any>>;
+  global: Array<Record<string, any>>;
+}
+
 export interface DecisionResponse {
   report: Record<string, any> | null;
   next_report?: Record<string, any> | null;

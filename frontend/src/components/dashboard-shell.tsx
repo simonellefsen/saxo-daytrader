@@ -17,12 +17,14 @@ import type {
   PositionsResponse,
   SaxoAuthStatus,
   SchedulerResponse,
+  WatchlistCategory,
+  WatchlistsResponse,
 } from "@/lib/types";
 import { LadderVisualizer } from "@/components/ladder-visualizer";
 import { LineChart } from "@/components/line-chart";
 import { Sparkline } from "@/components/sparkline";
 
-type TabKey = "portfolio" | "performance" | "market" | "decision" | "execution";
+type TabKey = "portfolio" | "performance" | "market" | "watchlist" | "decision" | "execution";
 
 type AuthSession = {
   authenticated: boolean;
@@ -36,6 +38,7 @@ const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
   { key: "portfolio", label: "Portfolio" },
   { key: "performance", label: "Performance" },
   { key: "market", label: "Market Status" },
+  { key: "watchlist", label: "Watchlist" },
   { key: "decision", label: "Decision Report" },
   { key: "execution", label: "Execution" },
 ];
@@ -225,7 +228,7 @@ function SaxoStatusPill({
     status?.connected
       ? `Connected, token expires in ${expires}`
       : status?.needs_reauth
-        ? "Saxo re-auth needed"
+        ? "Saxo disconnected"
         : `Saxo token refreshable, expires in ${expires}`;
   return (
     <div className={`saxo-status-pill ${tone}`} title={saxoStatusTitle(status)}>
@@ -235,7 +238,7 @@ function SaxoStatusPill({
       {status?.needs_reauth ? (
         <button className="inline-action" type="button" onClick={onReauth} disabled={pending}>
           {pending ? <span className="button-spinner" aria-hidden="true" /> : null}
-          Re-authenticate
+          Re-auth
         </button>
       ) : null}
     </div>
@@ -344,6 +347,90 @@ function summarizeActionResult(path: string, result: Record<string, unknown>): s
   return `${label} completed.`;
 }
 
+function WatchlistCategoryPanel({ category }: { category: WatchlistCategory }) {
+  const rows = category.items ?? [];
+  const quotedRows = rows.filter((row) => row.change_pct !== null && row.change_pct !== undefined);
+  const leader = quotedRows[0] ?? null;
+  const laggard = quotedRows.at(-1) ?? null;
+  const coveragePct = category.target_limit > 0 ? rows.length / category.target_limit : 0;
+
+  return (
+    <section className="watchlist-category">
+      <div className="watchlist-category-header">
+        <div>
+          <h3>{category.label}</h3>
+          <p>
+            Showing {formatNumber(rows.length, 0)} of target {formatNumber(category.target_limit, 0)}
+            {" · "}
+            universe {formatNumber(category.total_universe, 0)}
+          </p>
+        </div>
+        <span className="status-chip neutral">{formatPercent(coveragePct)} target coverage</span>
+      </div>
+      <div className="mini-grid">
+        <article className="mini-card">
+          <div className="label">Daily Leader</div>
+          <div className={`value ${signedClass(leader?.change_pct)}`}>{leader ? String(leader.symbol ?? "") : "n/a"}</div>
+          <div className="subvalue">{leader ? `${formatPercent(leader.change_pct)} · ${formatLocalMoney(leader.current_price, leader.currency)}` : "No quote yet"}</div>
+        </article>
+        <article className="mini-card">
+          <div className="label">Daily Laggard</div>
+          <div className={`value ${signedClass(laggard?.change_pct)}`}>{laggard ? String(laggard.symbol ?? "") : "n/a"}</div>
+          <div className="subvalue">{laggard ? `${formatPercent(laggard.change_pct)} · ${formatLocalMoney(laggard.current_price, laggard.currency)}` : "No quote yet"}</div>
+        </article>
+        <article className="mini-card">
+          <div className="label">Quoted Names</div>
+          <div className="value">{formatNumber(quotedRows.length, 0)}</div>
+          <div className="subvalue">{formatNumber(rows.length - quotedRows.length, 0)} missing quotes</div>
+        </article>
+      </div>
+      <div className="table-wrap watchlist-table">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Name</th>
+              <th>Exchange</th>
+              <th>Currency</th>
+              <th>Price</th>
+              <th>Daily Change</th>
+              <th>Quote Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length > 0 ? (
+              rows.map((row) => (
+                <tr key={String(row.symbol ?? "")}>
+                  <td>
+                    <a href={toYahooFinanceUrl(String(row.symbol ?? ""))} target="_blank" rel="noreferrer">
+                      {String(row.symbol ?? "")}
+                    </a>
+                  </td>
+                  <td className="wrap-cell">{String(row.name ?? "")}</td>
+                  <td>{String(row.exchange ?? "")}</td>
+                  <td>{String(row.currency ?? "")}</td>
+                  <td>{row.current_price === null || row.current_price === undefined ? "n/a" : formatLocalMoney(row.current_price, row.currency)}</td>
+                  <td className={signedClass(row.change_pct)}>{row.change_pct === null || row.change_pct === undefined ? "n/a" : formatPercent(row.change_pct)}</td>
+                  <td className="wrap-cell">{String(row.quote_status ?? row.quote_source ?? "")}</td>
+                </tr>
+              ))
+            ) : (
+              <tr>
+                <td colSpan={7}>
+                  <div className="empty-state">
+                    <strong>No watchlist rows available.</strong>
+                    <span>Quotes may still be loading, or all symbols in this category are excluded by risk settings.</span>
+                  </div>
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 export function DashboardShell() {
   const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
   const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
@@ -422,6 +509,11 @@ export function DashboardShell() {
     getFetcher,
     { refreshInterval: 60_000 },
   );
+  const watchlists = useSWR<WatchlistsResponse>(
+    activeTab === "watchlist" ? "/api/market/watchlists" : null,
+    getFetcher,
+    { refreshInterval: priceRefreshMs },
+  );
   const decision = useSWR<DecisionResponse>(
     activeTab === "decision" ? "/api/decision/latest" : null,
     getFetcher,
@@ -468,6 +560,7 @@ export function DashboardShell() {
         mutate("/api/overview"),
         mutate("/api/portfolio/positions?limit=25"),
         mutate(`/api/performance?range_key=${performanceRange}`),
+        mutate("/api/market/watchlists"),
         mutate("/api/execution?limit=150"),
         mutate("/api/decision/latest"),
         mutate("/api/decision/reports?limit=20"),
@@ -520,6 +613,7 @@ export function DashboardShell() {
     activeTab === "portfolio" ? positions.error : null,
     activeTab === "performance" ? performance.error : null,
     activeTab === "market" ? market.error : null,
+    activeTab === "watchlist" ? watchlists.error : null,
     activeTab === "decision" ? decision.error || decisionHistory.error : null,
     activeTab === "execution" ? execution.error || scheduler.error : null,
   ].find(Boolean);
@@ -581,6 +675,9 @@ export function DashboardShell() {
     ? (displayedDecision?.report_json?.strategy_plan?.selected_assets as Array<Record<string, unknown>>)
     : [];
   const strategyPlan = (displayedDecision?.report_json?.strategy_plan ?? {}) as Record<string, unknown>;
+  const strategyFlow = (strategyPlan.flow_counts ?? {}) as Record<string, unknown>;
+  const swingOrders = Array.isArray(strategyPlan.swing_orders) ? (strategyPlan.swing_orders as Array<Record<string, unknown>>) : [];
+  const ladderOrders = Array.isArray(strategyPlan.ladder_orders) ? (strategyPlan.ladder_orders as Array<Record<string, unknown>>) : [];
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
   const friendlyDecisionMessage = decisionFriendlyMessage(displayedDecision ?? null, saxoAuth.data);
   const sortedPositions = useMemo(() => {
@@ -943,6 +1040,39 @@ export function DashboardShell() {
         </section>
       ) : null}
 
+      {activeTab === "watchlist" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>Daily Watchlist Analysis</h2>
+              <p>
+                Quote-ranked stocks of interest for Nordic, UK, US, and EU/Euronext universes. Refreshed{" "}
+                {formatTimestamp(watchlists.data?.generated_at)}.
+              </p>
+            </div>
+            <div className="pill-row">
+              {(watchlists.data?.categories ?? []).map((category) => (
+                <span className="pill" key={category.key}>
+                  {category.label}: {formatNumber(category.items.length, 0)} / {formatNumber(category.target_limit, 0)}
+                </span>
+              ))}
+            </div>
+          </div>
+          <div className="watchlist-layout">
+            {(watchlists.data?.categories ?? []).length > 0 ? (
+              (watchlists.data?.categories ?? []).map((category) => (
+                <WatchlistCategoryPanel category={category} key={category.key} />
+              ))
+            ) : (
+              <div className="empty-state">
+                <strong>Watchlist analysis is loading.</strong>
+                <span>Quote collection can take a few seconds because the backend refreshes all category universes.</span>
+              </div>
+            )}
+          </div>
+        </section>
+      ) : null}
+
       {activeTab === "decision" ? (
         <section className="panel stack">
           <div className="panel-header">
@@ -1009,9 +1139,9 @@ export function DashboardShell() {
               <div className="mini-card">
                 <div className="label">Strategy Flow</div>
                 <div className="value">
-                  {formatNumber(Array.isArray(displayedDecision?.report_json?.candidate_assets) ? displayedDecision?.report_json?.candidate_assets.length : 0, 0)} → {formatNumber(selectedAssets.length, 0)} → {formatNumber(Array.isArray(strategyPlan.ladder_orders) ? strategyPlan.ladder_orders.length : 0, 0)}
+                  {formatNumber(strategyFlow.macro_inputs ?? 0, 0)} → {formatNumber(strategyFlow.sentiment_symbols ?? 0, 0)} → {formatNumber(strategyFlow.constraint_checked ?? selectedAssets.length, 0)} → {formatNumber(strategyFlow.trade_count ?? swingOrders.length + ladderOrders.length, 0)}
                 </div>
-                <div className="subvalue">xAI candidates → technically selected → ladder orders</div>
+                <div className="subvalue">macro → sentiment → constraints → trades</div>
               </div>
               <div className="mini-card">
                 <div className="label">Strategy Status</div>
@@ -1037,7 +1167,7 @@ export function DashboardShell() {
                         <td>{String(row.symbol ?? "")}</td>
                         <td>{String(row.action ?? "")}</td>
                         <td>{String(row.priority ?? "")}</td>
-                        <td>{formatNumber(row.confidence, 2)}</td>
+                        <td>{formatNumber(row.confidence, 0)}</td>
                         <td>{String(row.rationale ?? "")}</td>
                       </tr>
                     ))}

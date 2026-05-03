@@ -72,12 +72,16 @@ export function toYahooFinanceUrl(symbol: string): string {
   const upperTicker = ticker.toUpperCase();
   const suffixMap: Record<string, string> = {
     xcse: ".CO",
+    xsto: ".ST",
     xosl: ".OL",
+    xhel: ".HE",
     xams: ".AS",
     xbru: ".BR",
     xlse: ".LS",
     xpar: ".PA",
     xmil: ".MI",
+    xlon: ".L",
+    xetr: ".DE",
     xnas: "",
     xnys: "",
   };

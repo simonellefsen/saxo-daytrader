@@ -573,6 +573,49 @@ th {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+.watchlist-layout {
+  display: grid;
+  gap: 1rem;
+}
+
+.watchlist-category {
+  display: grid;
+  gap: 0.85rem;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 0.9rem;
+  background:
+    linear-gradient(135deg, rgba(15, 92, 115, 0.06), transparent 42%),
+    rgba(255, 255, 255, 0.72);
+}
+
+.watchlist-category-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.watchlist-category-header h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.watchlist-category-header p {
+  margin: 0.3rem 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.watchlist-table table {
+  min-width: 760px;
+}
+
+.wrap-cell {
+  white-space: normal;
+  min-width: 160px;
+}
+
 .status-chip {
   display: inline-flex;
   align-items: center;

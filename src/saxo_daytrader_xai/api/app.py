@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import os
 import json
+import logging
+import os
 import secrets
+import threading
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -56,6 +58,7 @@ from saxo_daytrader_xai.runtime_settings import (
     update_cash_buffer_settings,
 )
 from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
+from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import (
     estimate_next_decision_report,
     fetch_latest_decision_report,
@@ -76,6 +79,9 @@ class LiveOrderActionRequest(BaseModel):
 
 class CashBufferSettingsRequest(BaseModel):
     min_cash_buffer_pct: float
+
+
+logger = logging.getLogger(__name__)
 
 
 def _config_path(config_path: str | None = None) -> str:
@@ -267,6 +273,18 @@ def create_app(config_path: str | None = None) -> FastAPI:
             yield config, connection
         finally:
             connection.close()
+
+    def prewarm_watchlists() -> None:
+        try:
+            with runtime() as (config, _):
+                build_watchlists(config, force_refresh=True)
+            logger.info("Watchlist cache prewarmed")
+        except Exception:  # noqa: BLE001
+            logger.exception("Watchlist cache prewarm failed")
+
+    @app.on_event("startup")
+    def start_background_tasks() -> None:
+        threading.Thread(target=prewarm_watchlists, name="watchlist-cache-prewarm", daemon=True).start()
 
     def portfolio_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -976,6 +994,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 "items": rows,
                 "summary": summarize_analysis_window(rows),
             }
+
+    @app.get("/api/market/watchlists")
+    def market_watchlists() -> dict[str, Any]:
+        with runtime() as (config, _):
+            return build_watchlists(config)
 
     @app.get("/api/decision/latest")
     def decision_latest() -> dict[str, Any]:

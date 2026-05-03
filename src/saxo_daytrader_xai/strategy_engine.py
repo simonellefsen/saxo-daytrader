@@ -16,6 +16,7 @@ from saxo_daytrader_xai.saxo_openapi import (
     normalize_order_price,
     price_tick_size_for_symbol,
 )
+from saxo_daytrader_xai.swing_strategy import build_swing_strategy_plan, swing_strategy_enabled
 
 
 EU_EXCHANGES = {"xcse", "xsto", "xosl", "xhel", "xlon", "xetr", "xfra", "xmil", "xpar", "xams", "xbru", "xlse"}
@@ -622,6 +623,8 @@ def build_strategy_plan(
 ) -> dict[str, Any]:
     if not strategy_enabled(config):
         return {"status": "disabled", "selected_assets": [], "ladder_orders": [], "notes": ["Strategy engine disabled."]}
+    if swing_strategy_enabled(config):
+        return build_swing_strategy_plan(report_json=report_json, context=context, config=config)
     market_status_by_code = _market_status_by_code(config)
     candidates = _extract_candidate_pool(report_json)
     if not candidates:

@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import connect, init_db
 from saxo_daytrader_xai.execution_engine import _create_or_fetch_orders, _evaluate_virtual_buy_budget_gate
@@ -47,6 +55,9 @@ def _seed_report_db():
 
 def main() -> int:
     config = load_config("config.yaml")
+    # Phase 42 validates the legacy ladder/budget guardrail path. The app now
+    # defaults to swing mode, so force ladder mode for this regression check.
+    config["strategy"]["mode"] = "ladder"
 
     import saxo_daytrader_xai.execution_engine as execution_engine
     import saxo_daytrader_xai.strategy_engine as strategy_engine
@@ -119,7 +130,7 @@ def main() -> int:
                 "symbol": "PG:xnys",
                 "currency": "USD",
                 "price_local": 150.0,
-                "quantity": 220.0,
+                "quantity": 300.0,
             },
             config,
             connection,
@@ -150,8 +161,9 @@ def main() -> int:
             },
             config=config,
         )
-        assert plan["capital_limits"]["spendable_cash_dkk"] == 0.0, plan
-        assert plan["ladder_orders"] == [], plan
+        assert plan["capital_limits"]["min_cash_buffer_pct"] == 0.1, plan
+        assert plan["capital_limits"]["spendable_cash_dkk"] > 0.0, plan
+        assert plan["ladder_orders"], plan
 
         print("Phase 42 validation passed.")
         print(f"Fallback buy orders created: {len(orders)}")

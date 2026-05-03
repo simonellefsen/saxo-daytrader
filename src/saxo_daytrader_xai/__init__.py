@@ -1,5 +1,6 @@
 __all__ = [
     "api",
+    "analysis_pulses",
     "config",
     "db",
     "execution_engine",
@@ -13,6 +14,9 @@ __all__ = [
     "portfolio",
     "saxo_openapi",
     "scheduler_service",
+    "strategy_journal",
+    "swing_indicators",
+    "swing_strategy",
     "tax_engine",
     "watchlists",
     "xai_decision",

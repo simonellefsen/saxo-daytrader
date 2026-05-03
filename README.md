@@ -238,10 +238,14 @@ The project is driven by [config.yaml](/Users/lindau/codex/daytrader/config.yaml
 
 - `refresh_interval_seconds`: general UI/data refresh cadence for quote-oriented functions.
 - `request_timeout_seconds`: timeout for market-data HTTP calls.
-- `watchlists.nordic_limit`: number of Nordic names shown in the watchlist.
-- `watchlists.global_limit`: number of US/Europe names shown in the watchlist.
+- `watchlists.nordic_limit`: target number of Nordic names shown in the watchlist.
+- `watchlists.uk_limit`: target number of UK names shown in the watchlist.
+- `watchlists.us_limit`: target number of US names shown in the watchlist.
+- `watchlists.eu_limit`: target number of continental Europe / Euronext names shown in the watchlist.
+- `watchlists.global_limit`: number of combined US/Europe names supplied to decision-report context.
 - `rss.market_feeds`: RSS feeds for company/market headlines.
 - `rss.macro_feeds`: RSS feeds for macro and central-bank headlines.
+- `rss.crypto_feeds`: RSS feeds included in macro pulse context for crypto/risk-appetite signals.
 
 ### `price_monitor`
 
@@ -275,15 +279,20 @@ Example: with `offset_minutes_after_open: 30` and `duration_minutes: 0`, a marke
 
 ### `strategy`
 
-- `enabled`: enables the ladder-strategy overlay on top of xAI candidates.
+- `enabled`: enables the deterministic strategy overlay on top of xAI sentiment.
+- `mode`: `swing` is the default disciplined swing/day strategy. Set `ladder` only to use the legacy intraday ladder engine.
 - `selection_interval_minutes`: minimum spacing between strategy-driven re-selection passes.
 - `max_candidates`, `min_selected_assets`, `max_selected_assets`: selection funnel sizing.
 - `max_assets_per_sector`: optional diversification cap when sector labels are available.
-- `estimated_slippage_bps`: assumed slippage used when screening ladder profitability.
-- `cost_guard_multiple`: required expected edge relative to estimated round-trip cost.
-- `capital.max_deployment_pct`: hard ceiling on deployed capital during the session. Default `0.75`.
-- `capital.min_cash_buffer_pct`: cash reserve kept out of new ladders for the next trading day. Default `0.25`.
-- `ladder.*`: rung count, ATR spacing, stop/take-profit multiples, per-position weights, flatten timing, and trailing-stop behavior.
+- `capital.max_deployment_pct`: hard ceiling on deployed capital. Default `0.90` to preserve a 10% cash buffer.
+- `capital.min_cash_buffer_pct`: cash reserve kept out of new swing entries. Default `0.10`.
+- `swing.min_holdings` / `swing.max_holdings`: hard portfolio count guardrails, default `10` to `25`.
+- `swing.min_holding_weight_pct` / `swing.max_holding_weight_pct`: hard target weight guardrails, default `5%` to `25%`.
+- `swing.never_trade_symbols`: hard blacklist. Defaults include `NOVOb:xcse` and `TSLA:xnas`.
+- `swing.daily_indicators`: daily-chart MA/MACD/RSI/Bollinger/Stochastic/Volume confluence settings used to filter swing entries.
+- `swing.journal`: daily/weekly/monthly learning journal cadence used to feed recent lessons back into decision prompts.
+- `swing.analysis_pulses`: timezone-aware daily analysis triggers for morning macro, pre-EU close, and pre-US close.
+- `ladder.*`: legacy rung count, ATR spacing, stop/take-profit multiples, per-position weights, flatten timing, and trailing-stop behavior used only when `mode: ladder`.
 
 ### `execution`
 
@@ -293,6 +302,7 @@ Example: with `offset_minutes_after_open: 30` and `duration_minutes: 0`, a marke
 - `require_approval_live`: when `true`, live orders stay in approval state until manually approved.
 - `min_trade_value_dkk`: ignores tiny orders below this estimated DKK size.
 - `max_daily_orders`: daily cap on created execution orders.
+- `delayed_price_limit_orders`: converts swing entries/exits to protective limit orders when prices may be delayed and lets the price monitor replace stale live swing limits.
 
 ### `risk`
 

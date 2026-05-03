@@ -9,6 +9,7 @@ from typing import Any
 
 AUTOINCREMENT_TABLES = {
     "audit_log",
+    "analysis_pulses",
     "decision_reports",
     "execution_fills",
     "execution_order_events",
@@ -19,6 +20,9 @@ AUTOINCREMENT_TABLES = {
     "portfolio_value_history",
     "position_snapshots",
     "scheduler_cycle_history",
+    "strategy_journal_entries",
+    "swing_position_targets",
+    "swing_sentiment_snapshots",
     "trade_ledger",
 }
 
@@ -562,6 +566,84 @@ def init_db(connection: sqlite3.Connection) -> None:
             event_type TEXT NOT NULL,
             event_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS analysis_pulses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            pulse_key TEXT NOT NULL,
+            pulse_kind TEXT NOT NULL,
+            pulse_label TEXT NOT NULL,
+            target_at_utc TEXT NOT NULL,
+            report_id INTEGER,
+            status TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            FOREIGN KEY(report_id) REFERENCES decision_reports(id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_pulses_key_report
+        ON analysis_pulses(pulse_key, report_id);
+
+        CREATE INDEX IF NOT EXISTS idx_analysis_pulses_created
+        ON analysis_pulses(created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS swing_sentiment_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            report_id INTEGER NOT NULL,
+            pulse_key TEXT,
+            symbol TEXT NOT NULL,
+            sentiment TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            macro_bias TEXT,
+            rationale TEXT NOT NULL,
+            catalysts_json TEXT NOT NULL,
+            risk_notes_json TEXT NOT NULL,
+            source_json TEXT NOT NULL,
+            FOREIGN KEY(report_id) REFERENCES decision_reports(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_swing_sentiment_report
+        ON swing_sentiment_snapshots(report_id, symbol);
+
+        CREATE TABLE IF NOT EXISTS swing_position_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            report_id INTEGER NOT NULL,
+            pulse_key TEXT,
+            symbol TEXT NOT NULL,
+            sentiment TEXT NOT NULL,
+            action TEXT NOT NULL,
+            current_weight_pct REAL NOT NULL,
+            target_weight_pct REAL NOT NULL,
+            current_quantity REAL NOT NULL,
+            target_quantity REAL,
+            estimated_delta_quantity REAL,
+            estimated_value_dkk REAL,
+            priority TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            rationale TEXT NOT NULL,
+            risk_json TEXT NOT NULL,
+            FOREIGN KEY(report_id) REFERENCES decision_reports(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_swing_targets_report
+        ON swing_position_targets(report_id, action, symbol);
+
+        CREATE TABLE IF NOT EXISTS strategy_journal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            journal_date TEXT NOT NULL,
+            cadence TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            learnings_json TEXT NOT NULL,
+            source_report_id INTEGER,
+            FOREIGN KEY(source_report_id) REFERENCES decision_reports(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_strategy_journal_date
+        ON strategy_journal_entries(journal_date DESC, cadence);
         """
     connection.executescript(schema_sql)
     _init_platform_access_tables(connection)
@@ -589,6 +671,8 @@ def init_db(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "execution_orders", "strategy_session", "TEXT")
     _ensure_column(connection, "execution_orders", "strategy_key", "TEXT")
     _ensure_column(connection, "execution_orders", "strategy_role", "TEXT")
+    _ensure_column(connection, "decision_reports", "analysis_pulse_key", "TEXT")
+    _ensure_column(connection, "decision_reports", "analysis_pulse_label", "TEXT")
     for table_name in (
         "import_batches",
         "position_snapshots",
@@ -888,3 +972,123 @@ def prune_scheduler_cycles(
         deleted_rows += int(cursor.rowcount or 0)
     connection.commit()
     return deleted_rows
+
+
+def record_analysis_pulse(
+    connection: sqlite3.Connection,
+    *,
+    pulse: dict[str, Any] | None,
+    report_id: int | None,
+    status: str,
+) -> int | None:
+    if not pulse:
+        return None
+    cursor = connection.execute(
+        """
+        INSERT INTO analysis_pulses (
+            created_at, pulse_key, pulse_kind, pulse_label, target_at_utc,
+            report_id, status, metadata_json
+        ) VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(pulse_key, report_id) DO NOTHING
+        """,
+        (
+            str(pulse["key"]),
+            str(pulse["kind"]),
+            str(pulse["label"]),
+            str(pulse["target_at_utc"]),
+            report_id,
+            status,
+            json.dumps(pulse, ensure_ascii=False, sort_keys=True),
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid) if cursor.lastrowid else None
+
+
+def record_swing_plan_snapshot(
+    connection: sqlite3.Connection,
+    *,
+    report_id: int,
+    report_json: dict[str, Any],
+) -> None:
+    strategy_plan = dict(report_json.get("strategy_plan") or {})
+    pulse = dict(report_json.get("analysis_pulse") or {})
+    pulse_key = pulse.get("key")
+    created_at = str(report_json.get("created_at") or datetime_now_iso())
+    sentiment_rows = []
+    for row in strategy_plan.get("sentiment_universe", []) or []:
+        sentiment_rows.append(
+            (
+                created_at,
+                report_id,
+                pulse_key,
+                str(row.get("symbol") or ""),
+                str(row.get("sentiment") or "HOLD"),
+                float(row.get("confidence") or 0.0),
+                str(row.get("macro_bias") or ""),
+                str(row.get("rationale") or ""),
+                json.dumps(row.get("catalysts") or [], ensure_ascii=False, sort_keys=True),
+                json.dumps(row.get("risk_notes") or [], ensure_ascii=False, sort_keys=True),
+                json.dumps(row, ensure_ascii=False, sort_keys=True),
+            )
+        )
+    target_rows = []
+    for row in strategy_plan.get("position_targets", []) or []:
+        target_rows.append(
+            (
+                created_at,
+                report_id,
+                pulse_key,
+                str(row.get("symbol") or ""),
+                str(row.get("sentiment") or "HOLD"),
+                str(row.get("action") or "HOLD"),
+                float(row.get("current_weight_pct") or 0.0),
+                float(row.get("target_weight_pct") or 0.0),
+                float(row.get("current_quantity") or 0.0),
+                _optional_float(row.get("target_quantity")),
+                _optional_float(row.get("estimated_delta_quantity")),
+                _optional_float(row.get("estimated_value_dkk")),
+                str(row.get("priority") or "medium"),
+                float(row.get("confidence") or 0.0),
+                str(row.get("rationale") or ""),
+                json.dumps(row.get("risk") or {}, ensure_ascii=False, sort_keys=True),
+            )
+        )
+    if sentiment_rows:
+        connection.executemany(
+            """
+            INSERT INTO swing_sentiment_snapshots (
+                created_at, report_id, pulse_key, symbol, sentiment, confidence,
+                macro_bias, rationale, catalysts_json, risk_notes_json, source_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            sentiment_rows,
+        )
+    if target_rows:
+        connection.executemany(
+            """
+            INSERT INTO swing_position_targets (
+                created_at, report_id, pulse_key, symbol, sentiment, action,
+                current_weight_pct, target_weight_pct, current_quantity, target_quantity,
+                estimated_delta_quantity, estimated_value_dkk, priority, confidence,
+                rationale, risk_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            target_rows,
+        )
+    connection.commit()
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def datetime_now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat(timespec="seconds")

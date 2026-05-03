@@ -94,10 +94,12 @@ def fetch_market_intelligence(
 ) -> dict[str, Any]:
     market_feeds = config["market_data"]["rss"]["market_feeds"]
     macro_feeds = config["market_data"]["rss"]["macro_feeds"]
+    crypto_feeds = config["market_data"]["rss"].get("crypto_feeds", [])
     focus_symbols = list(dict.fromkeys((portfolio_symbols + watchlist_symbols)[:10]))
     return {
         "market_news": fetch_rss_items(market_feeds, limit=18),
         "macro_events": fetch_rss_items(macro_feeds, limit=12),
+        "crypto_news": fetch_rss_items(crypto_feeds, limit=8) if crypto_feeds else [],
         "earnings_calendar": fetch_earnings_calendar(focus_symbols, days_ahead=14),
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }

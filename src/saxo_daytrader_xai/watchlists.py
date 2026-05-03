@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import copy
+import threading
 from datetime import UTC, datetime
 from typing import Any
 
 from saxo_daytrader_xai.market_data import fetch_live_prices
 from saxo_daytrader_xai.market_symbols import SymbolSpec
+
+
+US_EXCHANGES = {"xnas", "xnys"}
+UK_EXCHANGES = {"xlon"}
+EU_EXCHANGES = {"xetr", "xfra", "xmil", "xpar", "xams", "xbru", "xlse"}
+_WATCHLIST_CACHE_LOCK = threading.Lock()
+_WATCHLIST_CACHE: dict[str, Any] = {}
 
 
 NORDIC_UNIVERSE: list[SymbolSpec] = [
@@ -255,12 +264,149 @@ def _build_watchlist_rows(
     return _rank_watchlist_rows(rows)
 
 
-def build_watchlists(config: dict[str, Any]) -> dict[str, Any]:
+def _category_payload(
+    *,
+    key: str,
+    label: str,
+    target_limit: int,
+    total_universe: int,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "target_limit": target_limit,
+        "total_universe": total_universe,
+        "items": rows[:target_limit],
+    }
+
+
+def _cache_key(config: dict[str, Any]) -> tuple[Any, ...]:
+    watchlist_cfg = config["market_data"]["watchlists"]
+    excluded_symbols = tuple(sorted(config.get("risk", {}).get("excluded_symbols", [])))
+    return (
+        excluded_symbols,
+        int(watchlist_cfg.get("nordic_limit", 100)),
+        int(watchlist_cfg.get("uk_limit", 25)),
+        int(watchlist_cfg.get("us_limit", 100)),
+        int(watchlist_cfg.get("eu_limit", 75)),
+        int(watchlist_cfg.get("global_limit", 100)),
+    )
+
+
+def _cache_ttl_seconds(config: dict[str, Any]) -> int:
+    return max(int(config.get("market_data", {}).get("refresh_interval_seconds", 300) or 300), 30)
+
+
+def _cached_payload(payload: dict[str, Any], *, stale: bool, refreshing: bool) -> dict[str, Any]:
+    output = copy.deepcopy(payload)
+    output["cache_stale"] = stale
+    output["cache_refreshing"] = refreshing
+    return output
+
+
+def _refresh_cache_in_background(config: dict[str, Any]) -> None:
+    refresh_config = copy.deepcopy(config)
+
+    def refresh() -> None:
+        try:
+            build_watchlists(refresh_config, force_refresh=True)
+        finally:
+            with _WATCHLIST_CACHE_LOCK:
+                _WATCHLIST_CACHE["refreshing"] = False
+
+    thread = threading.Thread(target=refresh, name="watchlist-cache-refresh", daemon=True)
+    thread.start()
+
+
+def build_watchlists(config: dict[str, Any], *, force_refresh: bool = False) -> dict[str, Any]:
+    cache_key = _cache_key(config)
+    now = datetime.now(UTC)
+    ttl_seconds = _cache_ttl_seconds(config)
+    start_background_refresh = False
+    with _WATCHLIST_CACHE_LOCK:
+        cached = _WATCHLIST_CACHE.get("payload")
+        cached_key = _WATCHLIST_CACHE.get("key")
+        cached_at = _WATCHLIST_CACHE.get("cached_at")
+        if not force_refresh and cached is not None and cached_key == cache_key and isinstance(cached_at, datetime):
+            stale = (now - cached_at).total_seconds() >= ttl_seconds
+            if stale and not bool(_WATCHLIST_CACHE.get("refreshing")):
+                _WATCHLIST_CACHE["refreshing"] = True
+                start_background_refresh = True
+            payload = _cached_payload(cached, stale=stale, refreshing=start_background_refresh)
+            if start_background_refresh:
+                _refresh_cache_in_background(config)
+            return payload
+
     excluded_symbols = set(config.get("risk", {}).get("excluded_symbols", []))
+    watchlist_cfg = config["market_data"]["watchlists"]
     nordic_rows = _build_watchlist_rows(NORDIC_UNIVERSE, config, excluded_symbols)
     global_rows = _build_watchlist_rows(GLOBAL_UNIVERSE, config, excluded_symbols)
-    return {
+    uk_rows = [row for row in global_rows if str(row["exchange"]).lower() in UK_EXCHANGES]
+    us_rows = [row for row in global_rows if str(row["exchange"]).lower() in US_EXCHANGES]
+    eu_rows = [row for row in global_rows if str(row["exchange"]).lower() in EU_EXCHANGES]
+    categories = [
+        _category_payload(
+            key="nordic",
+            label="Nordics",
+            target_limit=int(watchlist_cfg.get("nordic_limit", 100)),
+            total_universe=len([entry for entry in NORDIC_UNIVERSE if entry.symbol not in excluded_symbols]),
+            rows=nordic_rows,
+        ),
+        _category_payload(
+            key="uk",
+            label="UK",
+            target_limit=int(watchlist_cfg.get("uk_limit", 25)),
+            total_universe=len(
+                [
+                    entry
+                    for entry in GLOBAL_UNIVERSE
+                    if entry.symbol not in excluded_symbols and entry.exchange_code in UK_EXCHANGES
+                ]
+            ),
+            rows=uk_rows,
+        ),
+        _category_payload(
+            key="us",
+            label="US",
+            target_limit=int(watchlist_cfg.get("us_limit", 100)),
+            total_universe=len(
+                [
+                    entry
+                    for entry in GLOBAL_UNIVERSE
+                    if entry.symbol not in excluded_symbols and entry.exchange_code in US_EXCHANGES
+                ]
+            ),
+            rows=us_rows,
+        ),
+        _category_payload(
+            key="eu",
+            label="EU / Euronext",
+            target_limit=int(watchlist_cfg.get("eu_limit", 75)),
+            total_universe=len(
+                [
+                    entry
+                    for entry in GLOBAL_UNIVERSE
+                    if entry.symbol not in excluded_symbols and entry.exchange_code in EU_EXCHANGES
+                ]
+            ),
+            rows=eu_rows,
+        ),
+    ]
+    payload = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "nordic": nordic_rows[: config["market_data"]["watchlists"]["nordic_limit"]],
-        "global": global_rows[: config["market_data"]["watchlists"]["global_limit"]],
+        "cache_ttl_seconds": ttl_seconds,
+        "cache_stale": False,
+        "cache_refreshing": False,
+        "categories": categories,
+        "nordic": categories[0]["items"],
+        "uk": categories[1]["items"],
+        "us": categories[2]["items"],
+        "eu": categories[3]["items"],
+        "global": global_rows[: int(watchlist_cfg.get("global_limit", 100))],
     }
+    with _WATCHLIST_CACHE_LOCK:
+        _WATCHLIST_CACHE["key"] = cache_key
+        _WATCHLIST_CACHE["cached_at"] = now
+        _WATCHLIST_CACHE["payload"] = copy.deepcopy(payload)
+    return payload

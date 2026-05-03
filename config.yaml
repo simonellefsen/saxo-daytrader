@@ -19,7 +19,10 @@ market_data:
   refresh_interval_seconds: 300
   request_timeout_seconds: 10
   watchlists:
-    nordic_limit: 50
+    nordic_limit: 100
+    uk_limit: 25
+    us_limit: 100
+    eu_limit: 75
     global_limit: 100
   rss:
     market_feeds:
@@ -34,6 +37,11 @@ market_data:
         url: https://www.ecb.europa.eu/rss/press.html
       - name: Federal Reserve Press
         url: https://www.federalreserve.gov/feeds/press_all.xml
+    crypto_feeds:
+      - name: CoinDesk
+        url: https://www.coindesk.com/arc/outboundfeeds/rss/
+      - name: Cointelegraph
+        url: https://cointelegraph.com/rss
 
 price_monitor:
   enabled: true
@@ -62,6 +70,7 @@ scheduler:
 
 strategy:
   enabled: true
+  mode: swing
   selection_interval_minutes: 15
   max_candidates: 20
   min_selected_assets: 3
@@ -70,8 +79,46 @@ strategy:
   estimated_slippage_bps: 8
   cost_guard_multiple: 1.5
   capital:
-    max_deployment_pct: 0.75
-    min_cash_buffer_pct: 0.25
+    max_deployment_pct: 0.90
+    min_cash_buffer_pct: 0.10
+  swing:
+    min_holdings: 10
+    max_holdings: 25
+    min_holding_weight_pct: 0.05
+    max_holding_weight_pct: 0.25
+    cash_buffer_pct: 0.10
+    risk_per_trade_pct: 0.01
+    never_trade_symbols:
+      - NOVOb:xcse
+      - TSLA:xnas
+    daily_indicators:
+      enabled: true
+      max_symbols: 20
+      horizon_minutes: 1440
+      sample_count: 260
+      min_confluences: 3
+      min_reward_risk: 2.0
+    journal:
+      enabled: true
+      timezone: Europe/Copenhagen
+      daily_time: "22:30"
+      weekly_weekday: 6
+      weekly_time: "20:00"
+      monthly_time: "22:45"
+    analysis_pulses:
+      timezone: Europe/Copenhagen
+      due_window_minutes: 20
+      morning_macro:
+        enabled: true
+        time: "08:00"
+      pre_eu_close:
+        enabled: true
+        minutes_before_close: 120
+        exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XFRA, XMIL, XAMS]
+      pre_us_close:
+        enabled: true
+        minutes_before_close: 60
+        exchange_codes: [XNAS, XNYS]
   ladder:
     rung_count: 5
     min_rung_value_dkk: 5000
@@ -98,14 +145,23 @@ execution:
   require_approval_live: false
   min_trade_value_dkk: 500
   max_daily_orders: 50
+  delayed_price_limit_orders:
+    enabled: true
+    assumed_delay_minutes: 15
+    buy_limit_offset_bps: 20
+    sell_limit_offset_bps: 20
+    replace_threshold_bps: 10
+    max_replacements_per_cycle: 25
   price_tick_overrides:
     MATAS:xcse: 0.5
     NKT:xcse: 0.5
 
 risk:
-  excluded_symbols: []
+  excluded_symbols:
+    - NOVOb:xcse
+    - TSLA:xnas
   excluded_symbols_csv: ENV:RISK_EXCLUDED_SYMBOLS
-  max_position_weight: 0.15
+  max_position_weight: 0.25
   allow_shorting: false
 
 taxation:

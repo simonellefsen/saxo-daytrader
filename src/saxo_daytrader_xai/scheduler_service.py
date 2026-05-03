@@ -12,12 +12,13 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import append_audit_log, connect, init_db, prune_scheduler_cycles, record_scheduler_cycle, update_scheduler_status
-from saxo_daytrader_xai.execution_engine import enqueue_session_flatten_orders, maintain_ladder_orders, queue_and_maybe_execute_latest_report, sync_broker_order_statuses
+from saxo_daytrader_xai.execution_engine import enqueue_session_flatten_orders, maintain_ladder_orders, maintain_swing_limit_orders, queue_and_maybe_execute_latest_report, sync_broker_order_statuses
 from saxo_daytrader_xai.market_schedule import get_market_status, refresh_market_calendars, summarize_analysis_window
 from saxo_daytrader_xai.notifications import dispatch_broker_alerts_if_due, dispatch_summaries_if_due
 from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
 from saxo_daytrader_xai.runtime_settings import apply_runtime_settings
 from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token
+from saxo_daytrader_xai.strategy_journal import generate_due_strategy_journals
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
 
@@ -194,6 +195,10 @@ def run_scheduler_cycle(
                 resolved_connection,
                 resolved_config,
             )
+        journal_result = generate_due_strategy_journals(
+            resolved_connection,
+            resolved_config,
+        )
 
         outcome = {
             "status": "ok",
@@ -207,6 +212,7 @@ def run_scheduler_cycle(
             "queue": queue_result,
             "notifications": notification_result,
             "broker_alerts": broker_alert_result,
+            "journal": journal_result,
         }
         update_scheduler_status(
             resolved_connection,
@@ -332,6 +338,7 @@ def run_price_monitor_cycle(
     price_result = refresh_portfolio_price_state(config_path=config_path)
     flatten_result = enqueue_session_flatten_orders(config=resolved_config)
     ladder_maintenance = None
+    swing_maintenance = None
     if (
         str(resolved_config["execution"].get("mode")) == "live"
         and str(resolved_config["execution"].get("adapter")) == "saxo"
@@ -340,6 +347,10 @@ def run_price_monitor_cycle(
             ladder_maintenance = maintain_ladder_orders(config=resolved_config)
         except SaxoSessionError as exc:
             ladder_maintenance = {"status": "error", "error": str(exc)}
+        try:
+            swing_maintenance = maintain_swing_limit_orders(config=resolved_config)
+        except SaxoSessionError as exc:
+            swing_maintenance = {"status": "error", "error": str(exc)}
     return {
         "status": "ok",
         "analysis_window_active": analysis_summary["analysis_window_active"] if "analysis_summary" in locals() else False,
@@ -350,6 +361,7 @@ def run_price_monitor_cycle(
         "broker_sync": broker_sync,
         "flatten": flatten_result,
         "ladder_maintenance": ladder_maintenance,
+        "swing_maintenance": swing_maintenance,
     }
 
 

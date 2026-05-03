@@ -30,6 +30,7 @@ from saxo_daytrader_xai.saxo_openapi import (
     get_order_activity_last,
     get_positions_snapshot,
     lookup_instrument,
+    normalize_order_price,
     place_order,
     precheck_order,
 )
@@ -133,6 +134,39 @@ def _available_sell_quantity(
 def _get_live_price_map(symbols: list[str], config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     quotes = fetch_live_prices(symbols, timeout_seconds=config["market_data"]["request_timeout_seconds"])
     return {row["symbol"]: row for row in quotes}
+
+
+def _delayed_limit_order_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    return config.get("execution", {}).get("delayed_price_limit_orders", {})
+
+
+def _delayed_limit_price_for_order(
+    *,
+    symbol: str,
+    action: str,
+    reference_price: float,
+    config: dict[str, Any],
+) -> float | None:
+    cfg = _delayed_limit_order_cfg(config)
+    if not bool(cfg.get("enabled", True)) or reference_price <= 0:
+        return None
+    if action == "BUY":
+        offset_bps = float(cfg.get("buy_limit_offset_bps", 20.0) or 20.0)
+        raw_price = reference_price * (1.0 + (offset_bps / 10_000.0))
+        side = "buy_limit"
+    else:
+        offset_bps = float(cfg.get("sell_limit_offset_bps", 20.0) or 20.0)
+        raw_price = reference_price * max(0.0, 1.0 - (offset_bps / 10_000.0))
+        side = "sell_limit"
+    normalized = normalize_order_price(symbol, raw_price, config, side=side, fallback_decimals=2)
+    return float(normalized if normalized is not None else round(raw_price, 2))
+
+
+def _limit_replace_threshold_exceeded(old_price: float, new_price: float, config: dict[str, Any]) -> bool:
+    threshold_bps = float(_delayed_limit_order_cfg(config).get("replace_threshold_bps", 10.0) or 10.0)
+    if old_price <= 0:
+        return True
+    return abs(new_price - old_price) / old_price >= (threshold_bps / 10_000.0)
 
 
 def _symbol_exchange_code(symbol: str) -> str | None:
@@ -948,7 +982,10 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     remaining_cash_dkk = float(portfolio_summary["cash_balance_dkk"] or 0.0)
     sell_reservations = _active_sell_reservations(connection)
     approval_required = _approval_required_for_order(config)
-    desired_strategy_orders = list(strategy_plan.get("ladder_orders") or []) if strategy_enabled(config) else []
+    desired_strategy_orders: list[dict[str, Any]] = []
+    if strategy_enabled(config):
+        desired_strategy_orders.extend(list(strategy_plan.get("swing_orders") or []))
+        desired_strategy_orders.extend(list(strategy_plan.get("ladder_orders") or []))
     active_strategy_by_key: dict[str, dict[str, Any]] = {}
     if desired_strategy_orders:
         desired_keys = [str(item.get("strategy_key") or "") for item in desired_strategy_orders if item.get("strategy_key")]
@@ -1060,6 +1097,19 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
             break
         action = suggestion["action"]
         symbol = suggestion["symbol"]
+        if strategy_enabled(config) and str(strategy_plan.get("mode") or "").lower() == "swing":
+            append_audit_log(
+                connection,
+                "execution_order_skipped_strategy_swing_fallback",
+                {
+                    "report_id": report["id"],
+                    "symbol": symbol,
+                    "action": action,
+                    "strategy_status": strategy_plan.get("status"),
+                    "reason": "Swing strategy orders execute from strategy_plan.swing_orders; fallback suggestion queueing is disabled.",
+                },
+            )
+            continue
         if action not in {"BUY", "SELL"}:
             continue
         if strategy_enabled(config) and action == "BUY":
@@ -3244,6 +3294,96 @@ def manage_live_order(
             "broker_order_id": broker_order_id,
             "event_id": event_id,
         }
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
+def maintain_swing_limit_orders(*, config: dict[str, Any] | None = None, connection=None, limit: int | None = None) -> dict[str, Any]:
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        cfg = _delayed_limit_order_cfg(resolved_config)
+        if not bool(cfg.get("enabled", True)):
+            return {"status": "disabled", "updated": 0, "orders": []}
+        if str(resolved_config.get("execution", {}).get("mode")) != "live":
+            return {"status": "skipped", "updated": 0, "orders": []}
+        if str(resolved_config.get("execution", {}).get("adapter")) != "saxo":
+            return {"status": "skipped", "updated": 0, "orders": []}
+        max_rows = int(limit or cfg.get("max_replacements_per_cycle", 25) or 25)
+        rows = resolved_connection.execute(
+            """
+            SELECT *
+            FROM execution_orders
+            WHERE mode = 'live'
+              AND strategy_type = 'swing'
+              AND order_type = 'Limit'
+              AND status IN ('submitted_to_broker', 'broker_working', 'broker_amended', 'broker_replace_requested')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (max_rows,),
+        ).fetchall()
+        if not rows:
+            return {"status": "ok", "updated": 0, "orders": []}
+        orders = [dict(row) for row in rows]
+        price_map = _get_live_price_map([str(order["symbol"]) for order in orders], resolved_config)
+        updates: list[dict[str, Any]] = []
+        for order in orders:
+            quote = price_map.get(str(order["symbol"])) or {}
+            reference_price = _coerce_float(quote.get("current_price"))
+            if reference_price is None:
+                updates.append({"order_id": order["id"], "status": "no_quote", "symbol": order["symbol"]})
+                continue
+            proposed_limit = _delayed_limit_price_for_order(
+                symbol=str(order["symbol"]),
+                action=str(order["action"]),
+                reference_price=reference_price,
+                config=resolved_config,
+            )
+            current_limit = _coerce_float(order.get("limit_price_local")) or _coerce_float(order.get("price_local"))
+            if proposed_limit is None or current_limit is None:
+                continue
+            if not _limit_replace_threshold_exceeded(current_limit, proposed_limit, resolved_config):
+                updates.append(
+                    {
+                        "order_id": order["id"],
+                        "status": "unchanged",
+                        "symbol": order["symbol"],
+                        "current_limit": current_limit,
+                        "proposed_limit": proposed_limit,
+                    }
+                )
+                continue
+            result = manage_live_order(
+                int(order["id"]),
+                management_action="replace",
+                config=resolved_config,
+                connection=resolved_connection,
+                new_quantity=float(order["quantity"]),
+                new_price=proposed_limit,
+            )
+            if result["status"] in {"broker_replace_requested", "broker_amended"}:
+                resolved_connection.execute(
+                    """
+                    UPDATE execution_orders
+                    SET limit_price_local = ?, price_local = ?
+                    WHERE id = ?
+                    """,
+                    (proposed_limit, proposed_limit, int(order["id"])),
+                )
+                resolved_connection.commit()
+            updates.append(
+                {
+                    **result,
+                    "symbol": order["symbol"],
+                    "reference_price": reference_price,
+                    "old_limit": current_limit,
+                    "new_limit": proposed_limit,
+                    "quote_source": quote.get("source"),
+                    "assumed_delay_minutes": int(cfg.get("assumed_delay_minutes", 15) or 15),
+                }
+            )
+        return {"status": "ok", "updated": sum(1 for row in updates if row.get("status") in {"broker_replace_requested", "broker_amended"}), "orders": updates}
     finally:
         if should_close:
             resolved_connection.close()
