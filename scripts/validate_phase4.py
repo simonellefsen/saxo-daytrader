@@ -41,7 +41,7 @@ def main() -> int:
     assert report_json is not None, "Stored decision report payload is missing"
     assert "reasoning_steps" in report_json and report_json["reasoning_steps"], "Missing reasoning steps"
     assert "suggested_trades" in report_json, "Missing suggested trades"
-    assert stored_report["status"] in {"completed", "failed"}, f"Unexpected status {stored_report['status']}"
+    assert stored_report["status"] in {"completed", "failed", "xai_fallback"}, f"Unexpected status {stored_report['status']}"
 
     print("Phase 4 validation passed.")
     print(f"Imported source positions: {result.source_positions}")

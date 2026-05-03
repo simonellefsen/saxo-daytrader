@@ -657,7 +657,7 @@ def _latest_report_row(connection) -> dict[str, Any] | None:
         """
         SELECT *
         FROM decision_reports
-        ORDER BY id DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
         """
     ).fetchone()
@@ -716,7 +716,7 @@ def fetch_recent_decision_reports(connection, limit: int = 20) -> list[dict[str,
         """
         SELECT *
         FROM decision_reports
-        ORDER BY id DESC
+        ORDER BY created_at DESC, id DESC
         LIMIT ?
         """,
         (int(limit),),
@@ -948,7 +948,7 @@ def generate_decision_report(
                 report_json = response_bundle["parsed"]
                 response_id = response_json.get("id")
         except Exception as exc:  # noqa: BLE001
-            status = "failed"
+            status = "xai_fallback"
             error_text = str(exc)
             report_json = _mock_decision_report(context, resolved_config)
 

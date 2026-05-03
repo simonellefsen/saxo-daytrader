@@ -348,7 +348,14 @@ function ActionButton({
 function decisionFriendlyMessage(decision: Record<string, any> | null, saxoAuthStatus: SaxoAuthStatus | undefined): string | null {
   const status = String(decision?.status ?? "");
   const strategyStatus = String(decision?.report_json?.strategy_plan?.status ?? "");
+  if (status === "xai_fallback") {
+    const error = String(decision?.error_text ?? "").trim();
+    return `xAI request did not complete in time; using deterministic fallback strategy output.${error ? ` Original error: ${error}` : ""}`;
+  }
   if (status === "failed") {
+    if (strategyStatus === "ok") {
+      return "xAI request failed, but deterministic strategy output was generated. Treat the model narrative as fallback-quality and review the details before execution.";
+    }
     const saxoCopy = saxoAuthStatus?.connected
       ? "Current Saxo status is connected; inspect the report error/logs for the original failure."
       : "Saxo is not currently connected; renew the session before relying on the next automatic cycle.";
@@ -361,6 +368,15 @@ function decisionFriendlyMessage(decision: Record<string, any> | null, saxoAuthS
     return "This report was generated while Saxo session data was unavailable. The top-bar Saxo indicator shows the current connection state.";
   }
   return null;
+}
+
+function decisionStatusLabel(decision: Record<string, any> | null | undefined): string {
+  const status = String(decision?.status ?? "n/a");
+  const strategyStatus = String(decision?.report_json?.strategy_plan?.status ?? "");
+  if (status === "xai_fallback" || (status === "failed" && strategyStatus === "ok")) {
+    return "fallback";
+  }
+  return status;
 }
 
 function isTodayTimestamp(value: unknown): boolean {
@@ -423,6 +439,9 @@ function summarizeActionResult(path: string, result: Record<string, unknown>): s
   }
   if (path.includes("/decision-report")) {
     const status = String((result.report as Record<string, unknown> | undefined)?.status ?? result.status ?? "ok");
+    if (status === "xai_fallback") {
+      return `${label} completed with deterministic fallback because xAI timed out.`;
+    }
     return `${label} completed with status ${status}.`;
   }
   if (path.includes("/saxo/auth/start")) {
@@ -1242,7 +1261,7 @@ export function DashboardShell() {
             </article>
             <article className="mini-card">
               <div className="label">Status</div>
-              <div className="value">{String(displayedDecision?.status ?? "n/a")}</div>
+              <div className="value">{decisionStatusLabel(displayedDecision)}</div>
             </article>
             <article className="mini-card">
               <div className="label">Selected Assets</div>
@@ -1361,7 +1380,7 @@ export function DashboardShell() {
                           onClick={() => setSelectedDecisionId(Number(row.id))}
                         >
                           <td>{formatTimestamp(row.created_at)}</td>
-                          <td>{String(row.status ?? "")}</td>
+                          <td>{decisionStatusLabel(row)}</td>
                           <td>{String(historyStrategy.status ?? "n/a")}</td>
                           <td>{formatNumber(historySelected, 0)}</td>
                           <td>{formatNumber(historyTrades, 0)}</td>
