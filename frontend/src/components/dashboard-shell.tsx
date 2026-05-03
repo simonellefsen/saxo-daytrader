@@ -58,6 +58,7 @@ const PERFORMANCE_RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "ALL"] as const
 const PORTFOLIO_COLUMN_HELP: Record<string, string> = {
   Symbol: "Trading symbol. Click to open the instrument on Yahoo Finance.",
   Instrument: "Instrument or company name.",
+  Decision: "Latest per-symbol decision sentiment from the most recent xAI analysis report.",
   "Ladder Status": "Current ladder strategy state for the symbol.",
   Trend: "Short intraday sparkline from the recent chart window.",
   Qty: "Current broker-aligned quantity held.",
@@ -73,12 +74,77 @@ const PORTFOLIO_COLUMN_HELP: Record<string, string> = {
   "Quote Updated": "Timestamp of the latest stored quote used for this row.",
 };
 
+function decisionTone(sentiment: unknown): "good" | "warn" | "bad" | "neutral" {
+  const normalized = String(sentiment ?? "").toUpperCase();
+  if (normalized === "BUY" || normalized === "OVERWEIGHT") return "good";
+  if (normalized === "SELL") return "bad";
+  if (normalized === "UNDERWEIGHT") return "warn";
+  return "neutral";
+}
+
+function listPreview(value: unknown): string {
+  if (!Array.isArray(value) || value.length === 0) {
+    return "n/a";
+  }
+  return value.slice(0, 3).map((item) => String(item)).join("; ");
+}
+
+function decisionTooltipText(decision: Record<string, any>): string {
+  const lines = [
+    `Sentiment: ${String(decision.sentiment ?? "n/a")}`,
+    `Age: ${timeAgo(String(decision.created_at ?? ""), Date.now())}`,
+    `Report: #${String(decision.report_id ?? "n/a")} ${String(decision.pulse_label ?? "")}`.trim(),
+    `Action: ${String(decision.action ?? "none")}`,
+    `Priority: ${String(decision.priority ?? "n/a")}`,
+    `Confidence: ${formatNumber(decision.target_confidence ?? decision.confidence, 0)}`,
+    `Macro bias: ${String(decision.macro_bias ?? "n/a")}`,
+    `Target weight: ${decision.target_weight_pct === undefined ? "n/a" : formatPercent(Number(decision.target_weight_pct) / 100)}`,
+    `Rationale: ${String(decision.target_rationale ?? decision.rationale ?? "n/a")}`,
+    `Catalysts: ${listPreview(decision.catalysts)}`,
+    `Risks: ${listPreview(decision.risk_notes)}`,
+  ];
+  return lines.join("\n");
+}
+
+function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | null | undefined; nowMs: number }) {
+  if (!decision) {
+    return <span className="muted">n/a</span>;
+  }
+  const sentiment = String(decision.sentiment ?? "n/a").toUpperCase();
+  const age = timeAgo(String(decision.created_at ?? ""), nowMs);
+  const action = decision.action ? String(decision.action) : null;
+  const priority = decision.priority ? String(decision.priority) : null;
+
+  return (
+    <span className="decision-cell" title={decisionTooltipText(decision)}>
+      <span className={`decision-chip ${decisionTone(sentiment)}`}>{sentiment}</span>
+      <span className="decision-age">{age}</span>
+      <span className="decision-tooltip" role="tooltip">
+        <strong>
+          {sentiment}
+          {action ? ` · ${action}` : ""}
+        </strong>
+        <span>
+          {priority ? `Priority ${priority} · ` : ""}
+          Confidence {formatNumber(decision.target_confidence ?? decision.confidence, 0)}
+        </span>
+        <span>Report #{String(decision.report_id ?? "n/a")} · {age}</span>
+        <span>{String(decision.target_rationale ?? decision.rationale ?? "No rationale recorded.")}</span>
+        <span>Catalysts: {listPreview(decision.catalysts)}</span>
+        <span>Risks: {listPreview(decision.risk_notes)}</span>
+      </span>
+    </span>
+  );
+}
+
 function PortfolioRow({
   row,
   onOpen,
+  nowMs,
 }: {
   row: Record<string, any>;
   onOpen: (symbol: string) => void;
+  nowMs: number;
 }) {
   const symbol = String(row.symbol ?? "");
   const sparkline = useSWR<AssetLadderHistoryResponse>(
@@ -105,6 +171,9 @@ function PortfolioRow({
         </a>
       </td>
       <td>{String(row.instrument_name ?? symbol)}</td>
+      <td>
+        <DecisionCell decision={row.decision} nowMs={nowMs} />
+      </td>
       <td>
         <div className="ladder-status-cell">
           <span className={`status-chip ${row.ladder_status?.trailing ? "good" : "neutral"}`}>
@@ -369,7 +438,7 @@ function summarizeActionResult(path: string, result: Record<string, unknown>): s
   return `${label} completed.`;
 }
 
-function WatchlistCategoryPanel({ category }: { category: WatchlistCategory }) {
+function WatchlistCategoryPanel({ category, nowMs }: { category: WatchlistCategory; nowMs: number }) {
   const rows = category.items ?? [];
   const quotedRows = rows.filter((row) => row.change_pct !== null && row.change_pct !== undefined);
   const leader = quotedRows[0] ?? null;
@@ -412,6 +481,7 @@ function WatchlistCategoryPanel({ category }: { category: WatchlistCategory }) {
             <tr>
               <th>Symbol</th>
               <th>Name</th>
+              <th>Decision</th>
               <th>Exchange</th>
               <th>Currency</th>
               <th>Price</th>
@@ -429,6 +499,9 @@ function WatchlistCategoryPanel({ category }: { category: WatchlistCategory }) {
                     </a>
                   </td>
                   <td className="wrap-cell">{String(row.name ?? "")}</td>
+                  <td>
+                    <DecisionCell decision={row.decision} nowMs={nowMs} />
+                  </td>
                   <td>{String(row.exchange ?? "")}</td>
                   <td>{String(row.currency ?? "")}</td>
                   <td>{row.current_price === null || row.current_price === undefined ? "n/a" : formatLocalMoney(row.current_price, row.currency)}</td>
@@ -438,7 +511,7 @@ function WatchlistCategoryPanel({ category }: { category: WatchlistCategory }) {
               ))
             ) : (
               <tr>
-                <td colSpan={7}>
+                <td colSpan={8}>
                   <div className="empty-state">
                     <strong>No watchlist rows available.</strong>
                     <span>Quotes may still be loading, or all symbols in this category are excluded by risk settings.</span>
@@ -567,19 +640,23 @@ export function DashboardShell() {
 
   async function runAction(path: string, body?: unknown) {
     setPendingAction(path);
+    let actionResponded = false;
     try {
       const result = await postAction<Record<string, unknown>>(path, body);
+      actionResponded = true;
       if (path.includes("/saxo/auth/start") && typeof result.authorize_url === "string") {
         setStatusTone("info");
         setStatusMessage(summarizeActionResult(path, result));
         setStatusDetails("");
+        setPendingAction(null);
         window.location.assign(result.authorize_url);
         return;
       }
       setStatusTone(result.status === "manual_required" ? "warn" : "good");
       setStatusMessage(summarizeActionResult(path, result));
       setStatusDetails(JSON.stringify(result, null, 2));
-      await Promise.all([
+      setPendingAction(null);
+      void Promise.all([
         mutate("/api/overview"),
         mutate("/api/portfolio/positions?limit=25"),
         mutate(`/api/performance?range_key=${performanceRange}`),
@@ -589,13 +666,17 @@ export function DashboardShell() {
         mutate("/api/decision/reports?limit=20"),
         mutate("/api/scheduler?limit=10"),
         mutate("/api/saxo/auth/status"),
-      ]);
+      ]).catch((error) => {
+        console.warn("Background refresh after action failed", error);
+      });
     } catch (error) {
       setStatusTone("warn");
       setStatusMessage(error instanceof Error ? error.message : "Action failed.");
       setStatusDetails("");
     } finally {
-      setPendingAction(null);
+      if (!actionResponded) {
+        setPendingAction(null);
+      }
     }
   }
 
@@ -661,6 +742,7 @@ export function DashboardShell() {
     () => [
       "Symbol",
       "Instrument",
+      "Decision",
       "Ladder Status",
       "Trend",
       "Qty",
@@ -981,7 +1063,7 @@ export function DashboardShell() {
               <tbody>
                 {sortedPositions.length > 0 ? (
                   sortedPositions.map((row) => (
-                    <PortfolioRow key={String(row.symbol ?? "")} row={row} onOpen={setSelectedSymbol} />
+                    <PortfolioRow key={String(row.symbol ?? "")} row={row} onOpen={setSelectedSymbol} nowMs={nowMs} />
                   ))
                 ) : (
                   <tr>
@@ -1117,7 +1199,7 @@ export function DashboardShell() {
           <div className="watchlist-layout">
             {(watchlists.data?.categories ?? []).length > 0 ? (
               (watchlists.data?.categories ?? []).map((category) => (
-                <WatchlistCategoryPanel category={category} key={category.key} />
+                <WatchlistCategoryPanel category={category} key={category.key} nowMs={nowMs} />
               ))
             ) : (
               <div className="empty-state">

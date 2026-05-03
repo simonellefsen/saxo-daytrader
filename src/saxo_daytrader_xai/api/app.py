@@ -63,6 +63,7 @@ from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import (
     estimate_next_decision_report,
     fetch_latest_decision_report,
+    fetch_latest_symbol_decisions,
     fetch_recent_decision_reports,
     generate_decision_report,
 )
@@ -941,9 +942,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
             kwargs = portfolio_kwargs(config)
             positions = fetch_portfolio_positions(connection, **kwargs)
             ladder_status_map = ladder_status_by_symbol(connection)
+            decision_map = fetch_latest_symbol_decisions(connection)
             items = []
             for row in positions[:limit]:
                 enriched = dict(row)
+                enriched["decision"] = decision_map.get(str(row.get("symbol") or ""))
                 enriched["ladder_status"] = ladder_status_map.get(
                     str(row.get("symbol") or ""),
                     {"text": "idle", "active_orders": 0, "filled_entry_rungs": 0, "trailing": False},
@@ -1014,8 +1017,19 @@ def create_app(config_path: str | None = None) -> FastAPI:
 
     @app.get("/api/market/watchlists")
     def market_watchlists() -> dict[str, Any]:
-        with runtime() as (config, _):
-            return build_watchlists(config)
+        with runtime() as (config, connection):
+            payload = build_watchlists(config)
+            decision_map = fetch_latest_symbol_decisions(connection)
+
+            def attach_decisions(rows: list[dict[str, Any]]) -> None:
+                for row in rows:
+                    row["decision"] = decision_map.get(str(row.get("symbol") or ""))
+
+            for category in payload.get("categories", []) or []:
+                attach_decisions(category.get("items", []) or [])
+            for key in ("nordic", "uk", "us", "eu", "global"):
+                attach_decisions(payload.get(key, []) or [])
+            return payload
 
     @app.get("/api/decision/latest")
     def decision_latest() -> dict[str, Any]:

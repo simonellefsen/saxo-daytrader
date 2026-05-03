@@ -731,6 +731,110 @@ def fetch_recent_decision_reports(connection, limit: int = 20) -> list[dict[str,
     return output
 
 
+def _loads_json_field(value: Any, fallback: Any) -> Any:
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def fetch_latest_symbol_decisions(connection) -> dict[str, dict[str, Any]]:
+    report_row = connection.execute(
+        """
+        SELECT id, created_at, status, analysis_pulse_key, analysis_pulse_label
+        FROM decision_reports
+        WHERE report_json IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if not report_row:
+        return {}
+
+    report = dict(report_row)
+    report_id = int(report["id"])
+    decisions: dict[str, dict[str, Any]] = {}
+    sentiment_rows = connection.execute(
+        """
+        SELECT *
+        FROM swing_sentiment_snapshots
+        WHERE report_id = ?
+        ORDER BY symbol ASC, id DESC
+        """,
+        (report_id,),
+    ).fetchall()
+    for row in sentiment_rows:
+        item = dict(row)
+        source = _loads_json_field(item.get("source_json"), {})
+        symbol = str(item.get("symbol") or "")
+        if not symbol:
+            continue
+        decisions[symbol] = {
+            "symbol": symbol,
+            "report_id": report_id,
+            "created_at": report.get("created_at"),
+            "status": report.get("status"),
+            "pulse_key": report.get("analysis_pulse_key"),
+            "pulse_label": report.get("analysis_pulse_label"),
+            "sentiment": item.get("sentiment"),
+            "confidence": float(item.get("confidence") or 0.0),
+            "macro_bias": item.get("macro_bias"),
+            "rationale": item.get("rationale"),
+            "catalysts": _loads_json_field(item.get("catalysts_json"), []),
+            "risk_notes": _loads_json_field(item.get("risk_notes_json"), []),
+            "source": source.get("source"),
+            "blocked": bool(source.get("blocked", False)),
+            "in_watchlist": source.get("in_watchlist"),
+            "watchlist_region": source.get("watchlist_region"),
+            "technical": source.get("technical"),
+        }
+
+    target_rows = connection.execute(
+        """
+        SELECT *
+        FROM swing_position_targets
+        WHERE report_id = ?
+        ORDER BY symbol ASC, id DESC
+        """,
+        (report_id,),
+    ).fetchall()
+    for row in target_rows:
+        item = dict(row)
+        symbol = str(item.get("symbol") or "")
+        if not symbol:
+            continue
+        decision = decisions.setdefault(
+            symbol,
+            {
+                "symbol": symbol,
+                "report_id": report_id,
+                "created_at": report.get("created_at"),
+                "status": report.get("status"),
+                "pulse_key": report.get("analysis_pulse_key"),
+                "pulse_label": report.get("analysis_pulse_label"),
+                "sentiment": item.get("sentiment"),
+            },
+        )
+        decision.update(
+            {
+                "action": item.get("action"),
+                "priority": item.get("priority"),
+                "target_confidence": float(item.get("confidence") or 0.0),
+                "target_rationale": item.get("rationale"),
+                "current_weight_pct": float(item.get("current_weight_pct") or 0.0),
+                "target_weight_pct": float(item.get("target_weight_pct") or 0.0),
+                "current_quantity": float(item.get("current_quantity") or 0.0),
+                "target_quantity": item.get("target_quantity"),
+                "estimated_delta_quantity": item.get("estimated_delta_quantity"),
+                "estimated_value_dkk": item.get("estimated_value_dkk"),
+                "risk": _loads_json_field(item.get("risk_json"), {}),
+            }
+        )
+    return decisions
+
+
 def estimate_next_decision_report(connection, config: dict[str, Any], reference_time: datetime | None = None) -> dict[str, Any]:
     now = (reference_time or datetime.now(UTC)).astimezone(UTC)
     status_rows = get_market_status(config, reference_time=now)
