@@ -79,11 +79,11 @@ def main() -> int:
     )
 
     assert round(float(tracking["periods"]["day"]["pnl_dkk"]), 2) == 800.00, tracking
-    assert round(float(tracking["periods"]["day"]["target_dkk"]), 2) == 500.00, tracking
+    assert round(float(tracking["periods"]["day"]["target_dkk"]), 2) == 1000.00, tracking
     assert round(float(tracking["periods"]["week"]["pnl_dkk"]), 2) == 800.00, tracking
     assert round(float(tracking["periods"]["month"]["pnl_dkk"]), 2) == 1800.00, tracking
     assert int(tracking["periods"]["month"]["observed_session_days"]) == 3, tracking
-    assert round(float(tracking["periods"]["month"]["target_dkk"]), 2) == 1500.00, tracking
+    assert round(float(tracking["periods"]["month"]["target_dkk"]), 2) == 2727.27, tracking
     assert round(float(tracking["average_dkk_per_observed_day"]), 2) == 600.00, tracking
     assert round(float(tracking["projected_weekly_dkk_from_average"]), 2) == 3000.00, tracking
 

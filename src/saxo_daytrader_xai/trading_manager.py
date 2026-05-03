@@ -19,7 +19,7 @@ from saxo_daytrader_xai.db import (
 from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_report
 from saxo_daytrader_xai.market_schedule import get_market_status
 from saxo_daytrader_xai.market_symbols import parse_exchange_code
-from saxo_daytrader_xai.portfolio import fetch_latest_batch_id, fetch_portfolio_positions
+from saxo_daytrader_xai.portfolio import fetch_goal_tracking, fetch_latest_batch_id, fetch_portfolio_positions
 from saxo_daytrader_xai.swing_indicators import fetch_daily_swing_indicators
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report
@@ -286,6 +286,7 @@ def _request_ai_manager(
     report: dict[str, Any],
     candidate_orders: list[dict[str, Any]],
     technical_by_symbol: dict[str, dict[str, Any]],
+    goal_tracking: dict[str, Any],
 ) -> dict[str, Any]:
     api_key = config.get("xai", {}).get("api_key")
     if not api_key:
@@ -302,9 +303,12 @@ def _request_ai_manager(
         },
         "candidate_orders": candidate_orders,
         "daily_technicals": technical_by_symbol,
+        "goal_tracking": goal_tracking,
         "instruction": (
             "Approve only trades that satisfy the swing rules: open exchange, watchlist-only, long-only, "
             "MACD/RSI/Bollinger/Stochastic/OBV confluence, 1:2 reward-risk, and no blacklist symbols. "
+            "Account for progress versus the 5,000 DKK weekly and 20,000 DKK monthly pre-tax goals, "
+            "but do not approve low-confluence trades just to chase the target. "
             "Reject marginal BUYs. SELL/FLATTEN is allowed when technicals warn risk is deteriorating."
         ),
     }
@@ -512,6 +516,7 @@ def run_trading_manager_cycle(
                         report=report,
                         candidate_orders=candidate_orders,
                         technical_by_symbol=technical_by_symbol,
+                        goal_tracking=fetch_goal_tracking(resolved_connection, resolved_config),
                     )
                     ai_payload = ai_response["parsed"]
                 except Exception as exc:  # noqa: BLE001

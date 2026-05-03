@@ -523,8 +523,9 @@ Task:
 4. Return a candidate asset pool of high-conviction liquid names only; candidate_assets is the upstream idea list, not final execution.
 5. Suggest only practical BUY, SELL, or FLATTEN actions that respect watchlist-only, blacklist, 10-25 holdings, 5-25% weights, long-only, cash buffer, Danish tax drag, and commission drag.
 6. For each suggested trade, include a concise news/macro-driven rationale and concrete risk notes for swing holding.
-7. If no high-conviction trade exists, keep suggested_trades empty and explain the constraint in execution_notes.
-8. Produce a concise but concrete Decision Report for the operator.
+7. Explicitly assess progress versus the DKK 5,000 weekly and DKK 20,000 monthly pre-tax goals using the supplied goal_tracking JSON.
+8. If no high-conviction trade exists, keep suggested_trades empty and explain the constraint in execution_notes.
+9. Produce a concise but concrete Decision Report for the operator.
 """.strip()
 
     return {
@@ -599,7 +600,11 @@ def _mock_decision_report(context: dict[str, Any], config: dict[str, Any]) -> di
         "daily_target_assessment": (
             "Mock mode only. "
             f"Observed day pnl is {context['goal_tracking']['periods']['day']['pnl_dkk']:.2f} DKK "
-            f"versus target {context['goal_tracking']['periods']['day']['target_dkk']:.2f} DKK."
+            f"versus target {context['goal_tracking']['periods']['day']['target_dkk']:.2f} DKK. "
+            f"Week is {context['goal_tracking']['periods']['week']['pnl_dkk']:.2f} DKK versus "
+            f"{context['goal_tracking']['periods']['week']['target_dkk']:.2f} DKK target-to-date; "
+            f"month is {context['goal_tracking']['periods']['month']['pnl_dkk']:.2f} DKK versus "
+            f"{context['goal_tracking']['periods']['month']['target_dkk']:.2f} DKK target-to-date."
         ),
     }
 

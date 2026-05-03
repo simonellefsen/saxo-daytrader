@@ -60,6 +60,7 @@ from saxo_daytrader_xai.runtime_settings import (
     update_cash_buffer_settings,
 )
 from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
+from saxo_daytrader_xai.strategy_journal import fetch_strategy_journal_entries
 from saxo_daytrader_xai.trading_manager import trading_manager_status
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import (
@@ -792,6 +793,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 },
                 "portfolio_summary": summary,
                 "after_tax_summary": after_tax,
+                "goal_tracking": fetch_goal_tracking(connection, config),
                 "integrity": integrity,
                 "analysis_summary": analysis_summary,
                 "latest_decision": {
@@ -1055,6 +1057,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
     def decision_reports(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
         with runtime() as (_, connection):
             return {"items": fetch_recent_decision_reports(connection, limit=limit)}
+
+    @app.get("/api/strategy-journal")
+    def strategy_journal(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
+        with runtime() as (_, connection):
+            return {"items": fetch_strategy_journal_entries(connection, limit=limit)}
 
     @app.get("/api/execution")
     def execution(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:

@@ -6,6 +6,9 @@ from datetime import UTC, datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from saxo_daytrader_xai.market_benchmarks import fetch_benchmark_index_snapshot
+from saxo_daytrader_xai.portfolio import fetch_goal_tracking
+
 
 def _journal_cfg(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("strategy", {}).get("swing", {}).get("journal", {})
@@ -54,7 +57,26 @@ def fetch_recent_journal_learnings(connection, limit: int = 6) -> list[dict[str,
     return output
 
 
-def _decision_metrics(connection, *, since_date: str) -> dict[str, Any]:
+def fetch_strategy_journal_entries(connection, limit: int = 20) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM strategy_journal_entries
+        ORDER BY journal_date DESC, id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["metrics_json"] = json.loads(item["metrics_json"]) if item.get("metrics_json") else {}
+        item["learnings_json"] = json.loads(item["learnings_json"]) if item.get("learnings_json") else []
+        output.append(item)
+    return output
+
+
+def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, reference_time: datetime | None = None) -> dict[str, Any]:
     report_rows = connection.execute(
         """
         SELECT id, report_json
@@ -96,6 +118,11 @@ def _decision_metrics(connection, *, since_date: str) -> dict[str, Any]:
         """,
         (since_date,),
     ).fetchone()
+    goal_tracking = fetch_goal_tracking(connection, config, reference_time=reference_time)
+    benchmark_indices = fetch_benchmark_index_snapshot(
+        config,
+        timeout_seconds=int(config.get("market_data", {}).get("request_timeout_seconds", 10) or 10),
+    )
     return {
         "report_count": len(report_rows),
         "suggested_trade_count": suggested_trades,
@@ -104,6 +131,8 @@ def _decision_metrics(connection, *, since_date: str) -> dict[str, Any]:
         "execution_status_counts": {str(row["status"]): int(row["count"]) for row in execution_rows},
         "trade_count": int(ledger_row["trade_count"] if ledger_row else 0),
         "realised_gain_dkk": float(ledger_row["realised_gain_dkk"] if ledger_row else 0.0),
+        "goal_tracking": goal_tracking,
+        "benchmark_indices": benchmark_indices,
         "source_report_id": source_report_id,
     }
 
@@ -122,6 +151,28 @@ def _learning_points(metrics: dict[str, Any]) -> list[str]:
         learnings.append("Closed trades were net negative; inspect whether stop discipline or entry confluence failed.")
     else:
         learnings.append("Closed trades were non-negative; preserve the setup tags that worked.")
+    goal_week = (metrics.get("goal_tracking") or {}).get("periods", {}).get("week", {})
+    if goal_week:
+        learnings.append(
+            f"Weekly goal progress is {float(goal_week.get('pnl_dkk') or 0.0):.0f} DKK "
+            f"versus {float(goal_week.get('target_dkk') or 0.0):.0f} DKK target-to-date."
+        )
+    benchmarks = (metrics.get("benchmark_indices") or {}).get("regions", {})
+    if benchmarks:
+        strongest = sorted(
+            (
+                (region, payload.get("average_change_pct"))
+                for region, payload in benchmarks.items()
+                if payload.get("average_change_pct") is not None
+            ),
+            key=lambda item: float(item[1]),
+            reverse=True,
+        )
+        if strongest:
+            learnings.append(
+                f"Benchmark context: strongest region was {strongest[0][0]} "
+                f"at {float(strongest[0][1]) * 100:.2f}% average index move."
+            )
     return learnings
 
 
@@ -169,13 +220,17 @@ def generate_strategy_journal_entry(
     journal_date = now.date().isoformat()
     if _journal_exists(connection, journal_date=journal_date, cadence=cadence):
         return {"status": "skipped", "reason": f"{cadence} journal already exists for {journal_date}"}
-    metrics = _decision_metrics(connection, since_date=journal_date)
+    metrics = _decision_metrics(connection, config, since_date=journal_date, reference_time=now)
     learnings = _learning_points(metrics)
+    week = metrics.get("goal_tracking", {}).get("periods", {}).get("week", {})
+    month = metrics.get("goal_tracking", {}).get("periods", {}).get("month", {})
     summary = (
         f"{cadence.title()} strategy journal: {metrics['report_count']} report(s), "
         f"{metrics['suggested_trade_count']} suggested trade(s), "
         f"{metrics['swing_order_count']} swing order(s), "
-        f"{metrics['trade_count']} closed trade(s)."
+        f"{metrics['trade_count']} closed trade(s). "
+        f"Week {float(week.get('pnl_dkk') or 0.0):.0f}/{float(week.get('target_dkk') or 0.0):.0f} DKK, "
+        f"month {float(month.get('pnl_dkk') or 0.0):.0f}/{float(month.get('target_dkk') or 0.0):.0f} DKK before tax."
     )
     entry_id = record_strategy_journal_entry(
         connection,

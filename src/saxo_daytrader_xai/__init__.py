@@ -8,6 +8,7 @@ __all__ = [
     "identifier_lookup",
     "importer",
     "market_data",
+    "market_benchmarks",
     "market_news",
     "market_schedule",
     "market_symbols",

@@ -18,6 +18,7 @@ import type {
   PositionsResponse,
   SaxoAuthStatus,
   SchedulerResponse,
+  StrategyJournalResponse,
   WatchlistCategory,
   WatchlistsResponse,
 } from "@/lib/types";
@@ -711,6 +712,11 @@ export function DashboardShell() {
     getFetcher,
     { refreshInterval: 60_000 },
   );
+  const strategyJournal = useSWR<StrategyJournalResponse>(
+    activeTab === "decision" ? "/api/strategy-journal?limit=5" : null,
+    getFetcher,
+    { refreshInterval: 300_000 },
+  );
   const execution = useSWR<ExecutionResponse>(
     activeTab === "execution" ? "/api/execution?limit=150" : null,
     getFetcher,
@@ -874,6 +880,9 @@ export function DashboardShell() {
   const swingOrders = Array.isArray(strategyPlan.swing_orders) ? (strategyPlan.swing_orders as Array<Record<string, unknown>>) : [];
   const ladderOrders = Array.isArray(strategyPlan.ladder_orders) ? (strategyPlan.ladder_orders as Array<Record<string, unknown>>) : [];
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
+  const goalTracking = (performance.data?.goal_tracking ?? overview.data?.goal_tracking ?? {}) as Record<string, any>;
+  const latestJournal = strategyJournal.data?.items?.[0] ?? null;
+  const latestJournalBenchmarks = (latestJournal?.metrics_json?.benchmark_indices?.regions ?? {}) as Record<string, any>;
   const tradingManager = (overview.data?.trading_manager ?? {}) as Record<string, any>;
   const tradingManagerStatus = (tradingManager.status ?? {}) as Record<string, any>;
   const latestTradingManagerRun = (tradingManager.latest_run ?? null) as Record<string, any> | null;
@@ -1184,7 +1193,10 @@ export function DashboardShell() {
           <div className="panel-header">
             <div>
               <h2>Performance</h2>
-              <p>Portfolio value history and progress against the DKK 500/day before-tax target.</p>
+              <p>
+                Portfolio value history and progress against the {formatDkk(performance.data?.goal_tracking?.weekly_target_dkk)} weekly /
+                {formatDkk(performance.data?.goal_tracking?.monthly_target_dkk)} monthly before-tax goals.
+              </p>
             </div>
             <div className="range-picker">
               {PERFORMANCE_RANGES.map((range) => (
@@ -1374,6 +1386,43 @@ export function DashboardShell() {
               <div className="label">Next Planned Report</div>
               <div className="value">{formatTimestamp(nextDecision?.next_report_at)}</div>
               <div className="subvalue">{String(nextDecision?.reason ?? "n/a")}</div>
+            </article>
+          </div>
+          <div className="mini-grid">
+            <article className="mini-card">
+              <div className="label">Weekly Goal</div>
+              <div className={`value ${signedClass(goalTracking?.periods?.week?.gap_dkk)}`}>
+                {formatDkk(goalTracking?.periods?.week?.pnl_dkk)}
+              </div>
+              <div className="subvalue">
+                Target-to-date {formatDkk(goalTracking?.periods?.week?.target_dkk)} · Full week{" "}
+                {formatDkk(goalTracking?.periods?.week?.full_period_target_dkk ?? goalTracking?.weekly_target_dkk)}
+              </div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Monthly Goal</div>
+              <div className={`value ${signedClass(goalTracking?.periods?.month?.gap_dkk)}`}>
+                {formatDkk(goalTracking?.periods?.month?.pnl_dkk)}
+              </div>
+              <div className="subvalue">
+                Target-to-date {formatDkk(goalTracking?.periods?.month?.target_dkk)} · Full month{" "}
+                {formatDkk(goalTracking?.periods?.month?.full_period_target_dkk ?? goalTracking?.monthly_target_dkk)}
+              </div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Latest EOD Journal</div>
+              <div className="value">{latestJournal ? String(latestJournal.journal_date ?? "n/a") : "n/a"}</div>
+              <div className="subvalue">{latestJournal ? String(latestJournal.summary ?? "n/a") : "No journal entry recorded yet."}</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Benchmark Context</div>
+              <div className="subvalue">
+                {Object.entries(latestJournalBenchmarks).length
+                  ? Object.entries(latestJournalBenchmarks)
+                      .map(([region, payload]) => `${region} ${formatPercent(Number(payload?.average_change_pct ?? 0))}`)
+                      .join(" · ")
+                  : "Available after the next end-of-day journal."}
+              </div>
             </article>
           </div>
           <div className="grid-2">

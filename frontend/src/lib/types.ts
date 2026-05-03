@@ -20,6 +20,7 @@ export interface OverviewResponse {
   };
   portfolio_summary: JsonObject;
   after_tax_summary: JsonObject;
+  goal_tracking?: JsonObject;
   integrity: {
     healthy: boolean;
     warnings: string[];
@@ -142,6 +143,10 @@ export interface DecisionResponse {
 }
 
 export interface DecisionHistoryResponse {
+  items: Array<Record<string, any>>;
+}
+
+export interface StrategyJournalResponse {
   items: Array<Record<string, any>>;
 }
 

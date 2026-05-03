@@ -1083,6 +1083,36 @@ def _period_stats(history_rows: list[dict[str, Any]], *, start_local: datetime |
     }
 
 
+def _goal_cfg(config: dict[str, Any]) -> dict[str, Any]:
+    return config.get("xai", {}).get("performance_goals", {})
+
+
+def _goal_float(config: dict[str, Any], key: str, default: float) -> float:
+    try:
+        return float(_goal_cfg(config).get(key, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _goal_weekdays(config: dict[str, Any]) -> list[int]:
+    cfg = _goal_cfg(config)
+    start = int(cfg.get("week_start_weekday", 0) or 0)
+    end = int(cfg.get("week_end_weekday", 4) or 4)
+    if start <= end:
+        return list(range(start, end + 1))
+    return list(range(start, 7)) + list(range(0, end + 1))
+
+
+def _count_goal_weekdays(start_date, end_date, weekdays: list[int]) -> int:
+    cursor = start_date
+    count = 0
+    while cursor <= end_date:
+        if cursor.weekday() in weekdays:
+            count += 1
+        cursor += timedelta(days=1)
+    return count
+
+
 def fetch_goal_tracking(
     connection: sqlite3.Connection,
     config: dict[str, Any],
@@ -1094,13 +1124,19 @@ def fetch_goal_tracking(
     now_local = (reference_time or datetime.now(UTC)).astimezone(timezone)
     goal_text = str(config.get("xai", {}).get("goal", ""))
     baseline_day_start = _session_start_local(config, _session_date_for_local_dt(config, now_local))
-    baseline_week_start = _session_start_local(config, baseline_day_start.date() - timedelta(days=baseline_day_start.weekday()))
+    goal_weekdays = _goal_weekdays(config)
+    first_weekday = goal_weekdays[0] if goal_weekdays else 0
+    days_since_week_start = (baseline_day_start.date().weekday() - first_weekday) % 7
+    baseline_week_start = _session_start_local(config, baseline_day_start.date() - timedelta(days=days_since_week_start))
     baseline_month_start = _session_start_local(config, baseline_day_start.replace(day=1).date())
     baseline_year_start = _session_start_local(config, baseline_day_start.replace(month=1, day=1).date())
 
-    daily_target_dkk = 500.0
-    stretch_daily_target_dkk = 1000.0
-    weekly_target_dkk = 3500.0
+    weekly_target_dkk = _goal_float(config, "weekly_target_dkk", 5000.0)
+    monthly_target_dkk = _goal_float(config, "monthly_target_dkk", 20000.0)
+    week_trading_days = max(len(goal_weekdays), 1)
+    daily_target_dkk = _goal_float(config, "daily_target_dkk", weekly_target_dkk / week_trading_days)
+    stretch_weekly_target_dkk = _goal_float(config, "stretch_weekly_target_dkk", weekly_target_dkk * 1.5)
+    stretch_daily_target_dkk = _goal_float(config, "stretch_daily_target_dkk", stretch_weekly_target_dkk / week_trading_days)
 
     periods = {
         "day": _period_stats(history_rows, start_local=baseline_day_start, end_local=now_local),
@@ -1109,13 +1145,25 @@ def fetch_goal_tracking(
         "year": _period_stats(history_rows, start_local=baseline_year_start, end_local=now_local),
         "all_time": _period_stats(history_rows, start_local=None, end_local=now_local),
     }
+    current_month_expected_days = _count_goal_weekdays(
+        baseline_month_start.date(),
+        (baseline_month_start.replace(day=1) + timedelta(days=32)).replace(day=1).date() - timedelta(days=1),
+        goal_weekdays,
+    )
 
     for name, period in periods.items():
         if name == "week":
-            target_dkk = weekly_target_dkk if period["observed_session_days"] >= 5 else daily_target_dkk * period["observed_session_days"]
+            target_dkk = min(weekly_target_dkk, daily_target_dkk * period["observed_session_days"])
+            full_period_target_dkk = weekly_target_dkk
+        elif name == "month":
+            month_progress = period["observed_session_days"] / max(current_month_expected_days, 1)
+            target_dkk = monthly_target_dkk * max(0.0, min(month_progress, 1.0))
+            full_period_target_dkk = monthly_target_dkk
         else:
             target_dkk = daily_target_dkk * period["observed_session_days"]
+            full_period_target_dkk = target_dkk
         period["target_dkk"] = target_dkk
+        period["full_period_target_dkk"] = full_period_target_dkk
         period["stretch_target_dkk"] = stretch_daily_target_dkk * period["observed_session_days"]
         period["gap_dkk"] = period["pnl_dkk"] - target_dkk
         period["pct_of_target"] = (period["pnl_dkk"] / target_dkk * 100.0) if abs(target_dkk) > 1e-9 else 0.0
@@ -1136,6 +1184,11 @@ def fetch_goal_tracking(
         "daily_target_dkk": daily_target_dkk,
         "stretch_daily_target_dkk": stretch_daily_target_dkk,
         "weekly_target_dkk": weekly_target_dkk,
+        "monthly_target_dkk": monthly_target_dkk,
+        "week_start_weekday": first_weekday,
+        "week_end_weekday": goal_weekdays[-1] if goal_weekdays else 4,
+        "week_trading_days": week_trading_days,
+        "current_month_expected_session_days": current_month_expected_days,
         "average_dkk_per_observed_day": average_per_observed_day,
         "projected_weekly_dkk_from_average": projected_weekly_from_average,
         "periods": periods,
