@@ -15,6 +15,7 @@ __all__ = [
     "saxo_openapi",
     "scheduler_service",
     "strategy_journal",
+    "trading_manager",
     "swing_indicators",
     "swing_strategy",
     "tax_engine",

@@ -19,6 +19,7 @@ from saxo_daytrader_xai.price_monitor import refresh_portfolio_price_state
 from saxo_daytrader_xai.runtime_settings import apply_runtime_settings
 from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token
 from saxo_daytrader_xai.strategy_journal import generate_due_strategy_journals
+from saxo_daytrader_xai.trading_manager import run_trading_manager_cycle
 from saxo_daytrader_xai.xai_decision import generate_decision_report, should_auto_run_decision_report
 
 
@@ -181,10 +182,20 @@ def run_scheduler_cycle(
                 force_mock=force_mock,
             )
 
-        queue_result = queue_and_maybe_execute_latest_report(
+        trading_manager_result = run_trading_manager_cycle(
             config=resolved_config,
             connection=resolved_connection,
+            market_status_rows=market_status,
         )
+        manager_runs = trading_manager_result.get("runs") if isinstance(trading_manager_result, dict) else None
+        if manager_runs:
+            queue_result = manager_runs[-1].get("queue") or {"status": "manager_completed_no_queue"}
+        else:
+            queue_result = queue_and_maybe_execute_latest_report(
+                config=resolved_config,
+                connection=resolved_connection,
+                create_report_orders=False,
+            )
         notification_result = dispatch_summaries_if_due(
             resolved_connection,
             resolved_config,
@@ -209,6 +220,7 @@ def run_scheduler_cycle(
             "active_markets": analysis_summary["active_markets"],
             "generated_decision": decision_result is not None,
             "decision": decision_result,
+            "trading_manager": trading_manager_result,
             "queue": queue_result,
             "notifications": notification_result,
             "broker_alerts": broker_alert_result,
@@ -312,19 +324,31 @@ def run_price_monitor_cycle(
     resolved_config = load_config(config_path)
     decision_result = None
     queue_result = None
+    trading_manager_result = None
     with connect(resolved_config["portfolio"]["database_path"]) as connection:
         init_db(connection)
         resolved_config = apply_runtime_settings(resolved_config, connection)
-        analysis_summary = summarize_analysis_window(get_market_status(resolved_config))
+        market_status = get_market_status(resolved_config)
+        analysis_summary = summarize_analysis_window(market_status)
         if should_auto_run_decision_report(connection, resolved_config, analysis_summary["analysis_window_active"]):
             decision_result = generate_decision_report(
                 config=resolved_config,
                 connection=connection,
                 force_mock=False,
             )
+        trading_manager_result = run_trading_manager_cycle(
+            config=resolved_config,
+            connection=connection,
+            market_status_rows=market_status,
+        )
+        manager_runs = trading_manager_result.get("runs") if isinstance(trading_manager_result, dict) else None
+        if manager_runs:
+            queue_result = manager_runs[-1].get("queue")
+        else:
             queue_result = queue_and_maybe_execute_latest_report(
                 config=resolved_config,
                 connection=connection,
+                create_report_orders=False,
             )
     broker_sync = None
     if (
@@ -356,6 +380,7 @@ def run_price_monitor_cycle(
         "analysis_window_active": analysis_summary["analysis_window_active"] if "analysis_summary" in locals() else False,
         "generated_decision": decision_result is not None,
         "decision": decision_result,
+        "trading_manager": trading_manager_result,
         "queue": queue_result,
         "price_monitor": price_result,
         "broker_sync": broker_sync,

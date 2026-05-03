@@ -39,6 +39,7 @@ export interface OverviewResponse {
   };
   scheduler_status: JsonObject | null;
   scheduler_health: JsonObject | null;
+  trading_manager?: JsonObject | null;
   saxo_auth?: SaxoAuthStatus;
   settings?: {
     cash_buffer?: CashBufferSettings;

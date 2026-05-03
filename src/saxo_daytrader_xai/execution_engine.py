@@ -940,12 +940,18 @@ def retry_failed_execution_orders(
             resolved_connection.close()
 
 
-def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str, Any]) -> list[dict[str, Any]]:
+def _create_or_fetch_orders(
+    connection,
+    config: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    strategy_orders_override: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     existing = connection.execute(
         "SELECT * FROM execution_orders WHERE report_id = ? ORDER BY id",
         (report["id"],),
     ).fetchall()
-    if existing:
+    if existing and strategy_orders_override is None:
         return [dict(row) for row in existing]
 
     report_json = report["report_json"] or {}
@@ -983,7 +989,9 @@ def _create_or_fetch_orders(connection, config: dict[str, Any], report: dict[str
     sell_reservations = _active_sell_reservations(connection)
     approval_required = _approval_required_for_order(config)
     desired_strategy_orders: list[dict[str, Any]] = []
-    if strategy_enabled(config):
+    if strategy_orders_override is not None:
+        desired_strategy_orders.extend(strategy_orders_override)
+    elif strategy_enabled(config):
         desired_strategy_orders.extend(list(strategy_plan.get("swing_orders") or []))
         desired_strategy_orders.extend(list(strategy_plan.get("ladder_orders") or []))
     active_strategy_by_key: dict[str, dict[str, Any]] = {}
@@ -3791,13 +3799,24 @@ def maintain_ladder_orders(*, config: dict[str, Any] | None = None, connection=N
             resolved_connection.close()
 
 
-def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
+def queue_and_maybe_execute_latest_report(
+    *,
+    config: dict[str, Any] | None = None,
+    connection=None,
+    create_report_orders: bool = True,
+    strategy_orders_override: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
         report = fetch_latest_decision_report(resolved_connection)
         orders = []
-        if report and report["status"] == "completed":
-            orders = _create_or_fetch_orders(resolved_connection, resolved_config, report)
+        if report and report["status"] == "completed" and create_report_orders:
+            orders = _create_or_fetch_orders(
+                resolved_connection,
+                resolved_config,
+                report,
+                strategy_orders_override=strategy_orders_override,
+            )
         flatten_result = enqueue_session_flatten_orders(config=resolved_config, connection=resolved_connection)
         executed = []
         executable_statuses = {
@@ -3838,7 +3857,7 @@ def queue_and_maybe_execute_latest_report(*, config: dict[str, Any] | None = Non
         broker_sync = sync_broker_order_statuses(config=resolved_config, connection=resolved_connection)
         alert_result = _dispatch_execution_alerts(resolved_connection, resolved_config)
         return {
-            "status": "ok" if report and report["status"] == "completed" else "processed_existing_queue",
+            "status": "ok" if create_report_orders and report and report["status"] == "completed" else "processed_existing_queue",
             "orders": orders,
             "flatten": flatten_result,
             "executed": executed,

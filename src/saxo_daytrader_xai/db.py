@@ -23,6 +23,7 @@ AUTOINCREMENT_TABLES = {
     "strategy_journal_entries",
     "swing_position_targets",
     "swing_sentiment_snapshots",
+    "trading_manager_runs",
     "trade_ledger",
 }
 
@@ -586,6 +587,29 @@ def init_db(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_analysis_pulses_created
         ON analysis_pulses(created_at DESC);
 
+        CREATE TABLE IF NOT EXISTS trading_manager_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            manager_key TEXT NOT NULL,
+            manager_kind TEXT NOT NULL,
+            manager_label TEXT NOT NULL,
+            target_at_utc TEXT NOT NULL,
+            report_id INTEGER,
+            status TEXT NOT NULL,
+            open_exchange_codes_json TEXT NOT NULL,
+            technical_json TEXT NOT NULL,
+            manager_json TEXT NOT NULL,
+            queue_result_json TEXT,
+            error_text TEXT,
+            FOREIGN KEY(report_id) REFERENCES decision_reports(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trading_manager_runs_key
+        ON trading_manager_runs(manager_key);
+
+        CREATE INDEX IF NOT EXISTS idx_trading_manager_runs_created
+        ON trading_manager_runs(created_at DESC);
+
         CREATE TABLE IF NOT EXISTS swing_sentiment_snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -1003,6 +1027,75 @@ def record_analysis_pulse(
     )
     connection.commit()
     return int(cursor.lastrowid) if cursor.lastrowid else None
+
+
+def has_trading_manager_run(connection: sqlite3.Connection, manager_key: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT id
+        FROM trading_manager_runs
+        WHERE manager_key = ?
+        LIMIT 1
+        """,
+        (manager_key,),
+    ).fetchone()
+    return row is not None
+
+
+def record_trading_manager_run(
+    connection: sqlite3.Connection,
+    *,
+    manager_pulse: dict[str, Any],
+    report_id: int | None,
+    status: str,
+    open_exchange_codes: list[str],
+    technical: dict[str, Any],
+    manager: dict[str, Any],
+    queue_result: dict[str, Any] | None = None,
+    error_text: str | None = None,
+) -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO trading_manager_runs (
+            created_at, manager_key, manager_kind, manager_label, target_at_utc,
+            report_id, status, open_exchange_codes_json, technical_json,
+            manager_json, queue_result_json, error_text
+        ) VALUES (CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(manager_pulse["key"]),
+            str(manager_pulse["kind"]),
+            str(manager_pulse["label"]),
+            str(manager_pulse["target_at_utc"]),
+            report_id,
+            status,
+            json.dumps(open_exchange_codes, ensure_ascii=False, sort_keys=True),
+            json.dumps(technical, ensure_ascii=False, sort_keys=True),
+            json.dumps(manager, ensure_ascii=False, sort_keys=True),
+            json.dumps(queue_result, ensure_ascii=False, sort_keys=True) if queue_result is not None else None,
+            error_text,
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid) if cursor.lastrowid else 0
+
+
+def fetch_latest_trading_manager_run(connection: sqlite3.Connection) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM trading_manager_runs
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    for key in ("open_exchange_codes_json", "technical_json", "manager_json", "queue_result_json"):
+        output_key = key.removesuffix("_json")
+        record[output_key] = json.loads(record[key]) if record.get(key) else None
+    return record
 
 
 def record_swing_plan_snapshot(

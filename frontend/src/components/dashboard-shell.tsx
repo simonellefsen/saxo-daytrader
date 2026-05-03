@@ -874,6 +874,9 @@ export function DashboardShell() {
   const swingOrders = Array.isArray(strategyPlan.swing_orders) ? (strategyPlan.swing_orders as Array<Record<string, unknown>>) : [];
   const ladderOrders = Array.isArray(strategyPlan.ladder_orders) ? (strategyPlan.ladder_orders as Array<Record<string, unknown>>) : [];
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
+  const tradingManager = (overview.data?.trading_manager ?? {}) as Record<string, any>;
+  const tradingManagerStatus = (tradingManager.status ?? {}) as Record<string, any>;
+  const latestTradingManagerRun = (tradingManager.latest_run ?? null) as Record<string, any> | null;
   const isSaxoAdapter = String(overview.data?.execution?.adapter ?? "").toLowerCase() === "saxo";
   const saxoEnvironment = String(saxoAuth.data?.environment ?? overview.data?.saxo_auth?.environment ?? "").toLowerCase();
   const isSaxoSim = isSaxoAdapter && saxoEnvironment === "sim";
@@ -1348,6 +1351,15 @@ export function DashboardShell() {
               <div className="label">Report Cadence</div>
               <div className="value">{overview.data?.refresh?.decision_cadence_label ?? "3 daily pulses"}</div>
               <div className="subvalue">Morning, pre-EU close, and pre-US close</div>
+            </article>
+            <article className="mini-card">
+              <div className="label">Trading Manager</div>
+              <div className={`value ${tradingManagerStatus.due ? "positive" : "neutral"}`}>
+                {tradingManagerStatus.due ? "Due now" : latestTradingManagerRun?.status ?? "Waiting"}
+              </div>
+              <div className="subvalue">
+                Next {String(tradingManagerStatus.next_pulse_label ?? "manager pulse")} · {formatTimestamp(tradingManagerStatus.next_pulse_at)}
+              </div>
             </article>
             <article className="mini-card">
               <div className="label">Cash Buffer</div>

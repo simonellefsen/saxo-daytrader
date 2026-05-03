@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from saxo_daytrader_xai.analysis_pulses import analysis_pulse_status
 from saxo_daytrader_xai.config import load_config
-from saxo_daytrader_xai.db import connect, fetch_scheduler_cycles, fetch_scheduler_status, init_db
+from saxo_daytrader_xai.db import connect, fetch_latest_trading_manager_run, fetch_scheduler_cycles, fetch_scheduler_status, init_db
 from saxo_daytrader_xai.execution_engine import (
     adopt_broker_holdings_into_local_ledger,
     fetch_execution_events,
@@ -60,6 +60,7 @@ from saxo_daytrader_xai.runtime_settings import (
     update_cash_buffer_settings,
 )
 from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
+from saxo_daytrader_xai.trading_manager import trading_manager_status
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import (
     estimate_next_decision_report,
@@ -766,6 +767,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
             market_status = get_market_status(config)
             analysis_summary = summarize_analysis_window(market_status)
             pulse_summary = analysis_pulse_status(config, market_status)
+            manager_status = trading_manager_status(config, market_status)
+            latest_manager_run = fetch_latest_trading_manager_run(connection)
             latest_decision = fetch_latest_decision_report(connection)
             scheduler_status = fetch_scheduler_status(connection)
             scheduler_health = assess_scheduler_worker_health(
@@ -798,6 +801,10 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 },
                 "scheduler_status": scheduler_status,
                 "scheduler_health": scheduler_health,
+                "trading_manager": {
+                    "status": manager_status,
+                    "latest_run": latest_manager_run,
+                },
                 "saxo_auth": get_auth_status(config, config.get("saxo", {}).get("session_path"), auto_refresh=True),
                 "settings": {
                     "cash_buffer": fetch_cash_buffer_settings(config, connection),

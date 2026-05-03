@@ -97,6 +97,23 @@ strategy:
       sample_count: 260
       min_confluences: 3
       min_reward_risk: 2.0
+    trading_manager:
+      enabled: true
+      use_ai: true
+      due_window_minutes: 20
+      max_symbols: 30
+      open_followup:
+        enabled: true
+        minutes_after_open: 60
+        exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XAMS, XMIL]
+      close_rotation:
+        enabled: true
+        minutes_before_tradable_close: 30
+        exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XAMS, XMIL]
+      us_open_followup:
+        enabled: true
+        minutes_after_open: 60
+        exchange_codes: [XNAS, XNYS]
     journal:
       enabled: true
       timezone: Europe/Copenhagen
