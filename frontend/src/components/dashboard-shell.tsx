@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 import useSWR, { mutate } from "swr";
 
@@ -92,6 +93,7 @@ function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | nul
   const cellRef = useRef<HTMLSpanElement | null>(null);
   const tooltipRef = useRef<HTMLSpanElement | null>(null);
   const [tooltipStyle, setTooltipStyle] = useState<CSSProperties | undefined>();
+  const [tooltipOpen, setTooltipOpen] = useState(false);
 
   function updateTooltipPosition() {
     const cell = cellRef.current;
@@ -100,23 +102,46 @@ function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | nul
       return;
     }
     const cellRect = cell.getBoundingClientRect();
-    const tooltipRect = tooltip.getBoundingClientRect();
     const gap = 10;
     const margin = 12;
-    const left = Math.min(
-      Math.max(cellRect.right + gap, margin),
-      Math.max(window.innerWidth - tooltipRect.width - margin, margin),
-    );
-    const defaultTop = cellRect.top;
+    const width = Math.min(420, Math.max(window.innerWidth - margin * 2, 280));
+    const tooltipHeight = tooltip.getBoundingClientRect().height;
+    const rightAlignedLeft = cellRect.right + gap;
+    const leftAlignedLeft = cellRect.left - width - gap;
+    const left =
+      rightAlignedLeft + width <= window.innerWidth - margin
+        ? rightAlignedLeft
+        : leftAlignedLeft >= margin
+          ? leftAlignedLeft
+          : window.innerWidth - width - margin;
     const top = Math.min(
-      Math.max(defaultTop, margin),
-      Math.max(window.innerHeight - tooltipRect.height - margin, margin),
+      Math.max(cellRect.top, margin),
+      Math.max(window.innerHeight - tooltipHeight - margin, margin),
     );
     setTooltipStyle({
       left,
       top,
-      width: Math.min(420, Math.max(window.innerWidth - margin * 2, 280)),
+      width,
     });
+  }
+
+  useEffect(() => {
+    if (!tooltipOpen) {
+      return;
+    }
+    const frame = window.requestAnimationFrame(updateTooltipPosition);
+    window.addEventListener("resize", updateTooltipPosition);
+    window.addEventListener("scroll", updateTooltipPosition, true);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updateTooltipPosition);
+      window.removeEventListener("scroll", updateTooltipPosition, true);
+    };
+  }, [tooltipOpen]);
+
+  function openTooltip() {
+    setTooltipStyle(undefined);
+    setTooltipOpen(true);
   }
 
   if (!decision) {
@@ -131,25 +156,37 @@ function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | nul
     <span
       className="decision-cell"
       ref={cellRef}
-      onFocus={updateTooltipPosition}
-      onMouseEnter={updateTooltipPosition}
+      onBlur={() => setTooltipOpen(false)}
+      onFocus={openTooltip}
+      onMouseEnter={openTooltip}
+      onMouseLeave={() => setTooltipOpen(false)}
     >
       <span className={`decision-chip ${decisionTone(sentiment)}`}>{sentiment}</span>
       <span className="decision-age">{age}</span>
-      <span className="decision-tooltip" ref={tooltipRef} role="tooltip" style={tooltipStyle}>
-        <strong>
-          {sentiment}
-          {action ? ` · ${action}` : ""}
-        </strong>
-        <span>
-          {priority ? `Priority ${priority} · ` : ""}
-          Confidence {formatNumber(decision.target_confidence ?? decision.confidence, 0)}
-        </span>
-        <span>Report #{String(decision.report_id ?? "n/a")} · {age}</span>
-        <span>{String(decision.target_rationale ?? decision.rationale ?? "No rationale recorded.")}</span>
-        <span>Catalysts: {listPreview(decision.catalysts)}</span>
-        <span>Risks: {listPreview(decision.risk_notes)}</span>
-      </span>
+      {tooltipOpen && typeof document !== "undefined"
+        ? createPortal(
+            <span
+              className="decision-tooltip visible"
+              ref={tooltipRef}
+              role="tooltip"
+              style={tooltipStyle ?? { left: -9999, top: -9999 }}
+            >
+              <strong>
+                {sentiment}
+                {action ? ` · ${action}` : ""}
+              </strong>
+              <span>
+                {priority ? `Priority ${priority} · ` : ""}
+                Confidence {formatNumber(decision.target_confidence ?? decision.confidence, 0)}
+              </span>
+              <span>Report #{String(decision.report_id ?? "n/a")} · {age}</span>
+              <span>{String(decision.target_rationale ?? decision.rationale ?? "No rationale recorded.")}</span>
+              <span>Catalysts: {listPreview(decision.catalysts)}</span>
+              <span>Risks: {listPreview(decision.risk_notes)}</span>
+            </span>,
+            document.body,
+          )
+        : null}
     </span>
   );
 }

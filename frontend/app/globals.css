@@ -711,8 +711,7 @@ th {
   margin-top: 0.35rem;
 }
 
-.decision-cell:hover .decision-tooltip,
-.decision-cell:focus-within .decision-tooltip {
+.decision-tooltip.visible {
   opacity: 1;
   visibility: visible;
 }
