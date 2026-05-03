@@ -756,7 +756,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 initial_cash_dkk=kwargs["initial_cash_dkk"],
                 use_broker_positions=kwargs["use_broker_positions"],
             )
-            integrity = fetch_portfolio_integrity_status(connection, initial_cash_dkk=kwargs["initial_cash_dkk"])
+            integrity = fetch_portfolio_integrity_status(
+                connection,
+                initial_cash_dkk=kwargs["initial_cash_dkk"],
+                use_broker_positions=kwargs["use_broker_positions"],
+            )
             market_status = get_market_status(config)
             analysis_summary = summarize_analysis_window(market_status)
             latest_decision = fetch_latest_decision_report(connection)

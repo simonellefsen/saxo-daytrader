@@ -22,7 +22,11 @@ from saxo_daytrader_xai.execution_engine import (
     reconcile_portfolio_to_broker,
     sync_saxo_sim_account_to_portfolio,
 )
-from saxo_daytrader_xai.portfolio import fetch_portfolio_positions, fetch_realised_daily_pnl_summary
+from saxo_daytrader_xai.portfolio import (
+    fetch_portfolio_integrity_status,
+    fetch_portfolio_positions,
+    fetch_realised_daily_pnl_summary,
+)
 from saxo_daytrader_xai.saxo_openapi import SaxoInstrument, build_order_payload, normalize_order_price
 from saxo_daytrader_xai.strategy_engine import CandidateMetrics, _build_entry_ladder_orders
 
@@ -131,6 +135,66 @@ def _seed_batch_and_local_lot(connection, *, symbol: str = "CEG:xnas", quantity:
         ),
     )
     connection.commit()
+
+
+def _assert_sim_integrity_ignores_non_authoritative_broker_snapshot() -> None:
+    connection = connect(":memory:")
+    init_db(connection)
+    try:
+        connection.execute(
+            """
+            INSERT INTO import_batches (
+                batch_id, imported_at, source_csv, source_position_count,
+                imported_position_count, excluded_position_count, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("sim-baseline", "2026-05-03T08:30:00+00:00", "", 1, 1, 0, "sim baseline"),
+        )
+        connection.execute(
+            """
+            INSERT INTO position_snapshots (
+                batch_id, imported_at, instrument_name, symbol, quantity, currency,
+                open_price_local, current_price_local, cost_basis_local, cost_basis_dkk,
+                market_value_local, market_value_dkk, unrealised_pnl_dkk, source_csv, raw_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "sim-baseline",
+                "2026-05-03T08:30:00+00:00",
+                "Analog Devices Inc",
+                "ADI:xnas",
+                9,
+                "USD",
+                210.0,
+                210.0,
+                1890.0,
+                12096.0,
+                1890.0,
+                12096.0,
+                0.0,
+                "",
+                "{}",
+            ),
+        )
+        connection.commit()
+
+        sim_integrity = fetch_portfolio_integrity_status(
+            connection,
+            initial_cash_dkk=9770.17,
+            use_broker_positions=False,
+        )
+        assert sim_integrity["healthy"], sim_integrity
+        assert sim_integrity["mismatches"] == [], sim_integrity
+
+        live_integrity = fetch_portfolio_integrity_status(
+            connection,
+            initial_cash_dkk=9770.17,
+            use_broker_positions=True,
+        )
+        assert not live_integrity["healthy"], live_integrity
+        assert live_integrity["mismatches"][0]["symbol"] == "ADI:xnas", live_integrity
+    finally:
+        connection.close()
 
 
 def _assert_price_normalization(config: dict) -> None:
@@ -750,6 +814,7 @@ def _assert_broker_adoption_is_blocked_in_sim(config: dict) -> None:
 
 def main() -> int:
     config = _config()
+    _assert_sim_integrity_ignores_non_authoritative_broker_snapshot()
     _assert_price_normalization(config)
     _assert_broker_payload_normalizes_all_prices(config)
     _assert_broker_payload_uses_saxo_tick_scheme(config)
@@ -765,7 +830,7 @@ def main() -> int:
     _assert_portfolio_sync_is_sim_only(config)
     _assert_broker_adoption_is_blocked_in_sim(config)
     print("Execution regression validation passed.")
-    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, SIM-only portfolio sync guards, and SIM broker-adoption blocking.")
+    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, SIM integrity warning suppression, SIM-only portfolio sync guards, and SIM broker-adoption blocking.")
     return 0
 
 

@@ -766,6 +766,7 @@ def fetch_portfolio_integrity_status(
     *,
     batch_id: str | None = None,
     initial_cash_dkk: float = 0.0,
+    use_broker_positions: bool = True,
 ) -> dict[str, Any]:
     batch_id = batch_id or fetch_latest_batch_id(connection)
     if not batch_id:
@@ -777,21 +778,26 @@ def fetch_portfolio_integrity_status(
         initial_cash_dkk=initial_cash_dkk,
         use_broker_positions=False,
     )
-    broker_positions = _broker_position_rows(connection)
     local_qty = {row["symbol"]: float(row["quantity"] or 0.0) for row in local_positions}
-    broker_qty = {row["symbol"]: float(row["quantity"] or 0.0) for row in broker_positions if float(row["quantity"] or 0.0) > 1e-9}
     mismatches: list[dict[str, Any]] = []
-    for symbol in sorted(set(local_qty) | set(broker_qty)):
-        local_value = float(local_qty.get(symbol, 0.0))
-        broker_value = float(broker_qty.get(symbol, 0.0))
-        if abs(local_value - broker_value) > 1e-9:
-            mismatches.append(
-                {
-                    "symbol": symbol,
-                    "local_quantity": local_value,
-                    "broker_quantity": broker_value,
-                }
-            )
+    if use_broker_positions:
+        broker_positions = _broker_position_rows(connection)
+        broker_qty = {
+            row["symbol"]: float(row["quantity"] or 0.0)
+            for row in broker_positions
+            if float(row["quantity"] or 0.0) > 1e-9
+        }
+        for symbol in sorted(set(local_qty) | set(broker_qty)):
+            local_value = float(local_qty.get(symbol, 0.0))
+            broker_value = float(broker_qty.get(symbol, 0.0))
+            if abs(local_value - broker_value) > 1e-9:
+                mismatches.append(
+                    {
+                        "symbol": symbol,
+                        "local_quantity": local_value,
+                        "broker_quantity": broker_value,
+                    }
+                )
     mismatch_symbols = {row["symbol"] for row in mismatches}
 
     candidate_rows = connection.execute(
@@ -827,7 +833,7 @@ def fetch_portfolio_integrity_status(
         )
         warnings.append(
             f"Broker holdings differ from local ledger/tax lots for {len(mismatches)} symbol(s): {sample}. "
-            "The portfolio table displays Saxo broker holdings when live broker snapshots are available."
+            "The portfolio table is using Saxo LIVE broker holdings because broker snapshots are authoritative."
         )
     if unreconciled_orders:
         sample = ", ".join(
