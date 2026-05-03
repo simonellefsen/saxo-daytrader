@@ -46,7 +46,11 @@ export interface OverviewResponse {
   refresh: {
     price_poll_interval_minutes: number;
     scheduler_poll_interval_minutes: number;
-    decision_interval_minutes: number;
+    decision_cadence?: string;
+    decision_cadence_label?: string;
+    decision_pulses?: Array<Record<string, any>>;
+    next_decision_pulse_at?: string | null;
+    next_decision_pulse_label?: string | null;
   };
 }
 

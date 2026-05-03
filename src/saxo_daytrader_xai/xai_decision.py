@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,6 @@ from saxo_daytrader_xai.portfolio import (
 from saxo_daytrader_xai.strategy_engine import (
     build_strategy_plan,
     strategy_capital_limits,
-    strategy_selection_interval_minutes,
 )
 from saxo_daytrader_xai.strategy_journal import fetch_recent_journal_learnings
 from saxo_daytrader_xai.watchlists import build_watchlists
@@ -470,7 +469,7 @@ Hard rules:
 - Only recommend symbols present in the supplied current Watchlist context.
 - Never short. Long-only portfolio.
 - Total holdings must stay between {int(swing_cfg.get('min_holdings', 10))} and {int(swing_cfg.get('max_holdings', 25))}; every target holding must be between {float(swing_cfg.get('min_holding_weight_pct', 0.05)) * 100:.0f}% and {float(swing_cfg.get('max_holding_weight_pct', 0.25)) * 100:.0f}% of total equity.
-- Respect the {float(swing_cfg.get('cash_buffer_pct', 0.10)) * 100:.0f}% cash buffer. If cash is below buffer, prefer SELL / FLATTEN recommendations over new BUY recommendations.
+- Respect the {float(swing_cfg.get('cash_buffer_pct', 0.10)) * 100:g}% cash buffer. If cash is below buffer, prefer SELL / FLATTEN recommendations over new BUY recommendations.
 - Treat all pnl, commission, and taxation impacts in DKK.
 - Prefer liquid, news-catalyst-driven names in Nordic, EU/Euronext, UK, and US markets.
 - Only propose holdings you would actually want to own tomorrow morning.
@@ -664,30 +663,6 @@ def _latest_report_row(connection) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def _slot_interval(config: dict[str, Any]) -> timedelta:
-    return timedelta(minutes=max(strategy_selection_interval_minutes(config), 1))
-
-
-def _floor_to_slot(moment: datetime, interval: timedelta) -> datetime:
-    minute_span = int(interval.total_seconds() // 60)
-    floored_minute = (moment.minute // minute_span) * minute_span
-    return moment.replace(minute=floored_minute, second=0, microsecond=0)
-
-
-def _ceil_to_slot(moment: datetime, interval: timedelta) -> datetime:
-    floored = _floor_to_slot(moment, interval)
-    if floored == moment.replace(second=0, microsecond=0):
-        return floored
-    return floored + interval
-
-
-def _latest_report_time(connection) -> datetime | None:
-    latest = _latest_report_row(connection)
-    if not latest or not latest.get("created_at"):
-        return None
-    return datetime.fromisoformat(str(latest["created_at"])).astimezone(UTC)
-
-
 def _has_report_for_pulse(connection, pulse_key: str) -> bool:
     row = connection.execute(
         """
@@ -838,7 +813,6 @@ def fetch_latest_symbol_decisions(connection) -> dict[str, dict[str, Any]]:
 def estimate_next_decision_report(connection, config: dict[str, Any], reference_time: datetime | None = None) -> dict[str, Any]:
     now = (reference_time or datetime.now(UTC)).astimezone(UTC)
     status_rows = get_market_status(config, reference_time=now)
-    analysis_summary = summarize_analysis_window(status_rows)
     pulse_summary = analysis_pulse_status(config, status_rows, reference_time=now)
     for pulse in pulse_summary["active_pulses"]:
         if not _has_report_for_pulse(connection, str(pulse["key"])):
@@ -846,57 +820,16 @@ def estimate_next_decision_report(connection, config: dict[str, Any], reference_
                 "next_report_at": pulse["target_at_utc"],
                 "reason": f"{pulse['label']} is due now",
             }
-    interval = _slot_interval(config)
-    latest_time = _latest_report_time(connection)
 
-    active_window_ends: list[datetime] = []
-    future_window_starts: list[tuple[datetime, str]] = []
-    for row in status_rows:
-        open_end = row.get("open_analysis_window_end_at_utc")
-        open_start = row.get("open_analysis_window_start_at_utc")
-        market_name = str(row.get("market") or row.get("code") or "market")
-        if row.get("open_analysis_window_active") and open_end:
-            active_window_ends.append(datetime.fromisoformat(str(open_end)))
-        if open_start:
-            parsed = datetime.fromisoformat(str(open_start))
-            slot_start = _ceil_to_slot(parsed, interval)
-            if slot_start > now:
-                future_window_starts.append((slot_start, f"{market_name} analysis slot"))
-
-    if analysis_summary["analysis_window_active"]:
-        active_until = max(active_window_ends) if active_window_ends else None
-        current_slot = _floor_to_slot(now, interval)
-        latest_slot = _floor_to_slot(latest_time, interval) if latest_time is not None else None
-        if active_until is None or current_slot <= active_until:
-            if latest_slot is None or latest_slot < current_slot:
-                return {
-                    "next_report_at": current_slot.isoformat(timespec="seconds"),
-                    "reason": "Current cadence slot is due inside active analysis window",
-                }
-        next_slot = _ceil_to_slot(now, interval)
-        if active_until is None or next_slot <= active_until:
-            return {
-                "next_report_at": next_slot.isoformat(timespec="seconds"),
-                "reason": "Next fixed cadence slot inside active analysis window",
-            }
-
-    if future_window_starts or pulse_summary.get("next_pulse_at"):
-        if pulse_summary.get("next_pulse_at"):
-            future_window_starts.append(
-                (
-                    datetime.fromisoformat(str(pulse_summary["next_pulse_at"])).astimezone(UTC),
-                    str(pulse_summary.get("next_pulse_label") or "analysis pulse"),
-                )
-            )
-        next_start_at, label = min(future_window_starts, key=lambda item: item[0])
+    if pulse_summary.get("next_pulse_at"):
         return {
-            "next_report_at": next_start_at.isoformat(timespec="seconds"),
-            "reason": f"Next {label}",
+            "next_report_at": pulse_summary["next_pulse_at"],
+            "reason": f"Next {pulse_summary.get('next_pulse_label') or 'analysis pulse'}",
         }
 
     return {
         "next_report_at": None,
-        "reason": "No upcoming analysis window found in the current calendar horizon",
+        "reason": "No upcoming decision pulse found in the current calendar horizon",
     }
 
 
@@ -907,15 +840,7 @@ def should_auto_run_decision_report(connection, config: dict[str, Any], analysis
     for pulse in pulse_summary["active_pulses"]:
         if not _has_report_for_pulse(connection, str(pulse["key"])):
             return True
-    if not analysis_window_active:
-        return False
-    interval = _slot_interval(config)
-    current_slot = _floor_to_slot(now, interval)
-    latest_time = _latest_report_time(connection)
-    if latest_time is None:
-        return True
-    latest_slot = _floor_to_slot(latest_time, interval)
-    return latest_slot < current_slot
+    return False
 
 
 def generate_decision_report(

@@ -72,8 +72,10 @@ def apply_runtime_settings(config: dict[str, Any], connection) -> dict[str, Any]
     adjusted = copy.deepcopy(config)
     strategy_cfg = adjusted.setdefault("strategy", {})
     capital_cfg = strategy_cfg.setdefault("capital", {})
+    swing_cfg = strategy_cfg.setdefault("swing", {})
     capital_cfg["min_cash_buffer_pct"] = min_cash_buffer_pct
     capital_cfg["max_deployment_pct"] = max(0.0, min(1.0 - min_cash_buffer_pct, 1.0))
+    swing_cfg["cash_buffer_pct"] = min_cash_buffer_pct
     return adjusted
 
 
@@ -98,8 +100,8 @@ def fetch_cash_buffer_settings(config: dict[str, Any], connection) -> dict[str, 
 
 def update_cash_buffer_settings(config: dict[str, Any], connection, *, min_cash_buffer_pct: float) -> dict[str, Any]:
     normalized = _normalized_pct(min_cash_buffer_pct, _base_cash_buffer_pct(config))
-    if normalized < 0.01 or normalized > 0.90:
-        raise ValueError("Cash buffer must be between 1% and 90%.")
+    if normalized < 0.0 or normalized > 0.90:
+        raise ValueError("Cash buffer must be between 0% and 90%.")
     upsert_runtime_setting(
         connection,
         CASH_BUFFER_KEY,

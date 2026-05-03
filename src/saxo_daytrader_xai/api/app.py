@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from saxo_daytrader_xai.analysis_pulses import analysis_pulse_status
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import connect, fetch_scheduler_cycles, fetch_scheduler_status, init_db
 from saxo_daytrader_xai.execution_engine import (
@@ -764,6 +765,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
             )
             market_status = get_market_status(config)
             analysis_summary = summarize_analysis_window(market_status)
+            pulse_summary = analysis_pulse_status(config, market_status)
             latest_decision = fetch_latest_decision_report(connection)
             scheduler_status = fetch_scheduler_status(connection)
             scheduler_health = assess_scheduler_worker_health(
@@ -803,7 +805,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 "refresh": {
                     "price_poll_interval_minutes": int(config.get("price_monitor", {}).get("poll_interval_minutes", 1)),
                     "scheduler_poll_interval_minutes": int(config.get("scheduler", {}).get("poll_interval_minutes", 10)),
-                    "decision_interval_minutes": int(config.get("strategy", {}).get("selection_interval_minutes", 15)),
+                    "decision_cadence": "three_daily_pulses",
+                    "decision_cadence_label": "3 daily pulses",
+                    "decision_pulses": pulse_summary.get("pulses", []),
+                    "next_decision_pulse_at": pulse_summary.get("next_pulse_at"),
+                    "next_decision_pulse_label": pulse_summary.get("next_pulse_label"),
                 },
             }
 

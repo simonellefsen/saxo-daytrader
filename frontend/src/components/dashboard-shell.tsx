@@ -89,6 +89,24 @@ function listPreview(value: unknown): string {
   return value.slice(0, 3).map((item) => String(item)).join("; ");
 }
 
+function cashBufferDecimals(value: number): number {
+  return value > 0 && value < 5 ? 1 : 0;
+}
+
+function normalizeCashBufferPct(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return value < 5 ? Math.round(value * 10) / 10 : Math.round(value);
+}
+
+function formatCashBufferPct(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "disabled";
+  }
+  return `${formatNumber(value, cashBufferDecimals(value))}%`;
+}
+
 function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | null | undefined; nowMs: number }) {
   const cellRef = useRef<HTMLSpanElement | null>(null);
   const tooltipRef = useRef<HTMLSpanElement | null>(null);
@@ -761,7 +779,7 @@ export function DashboardShell() {
         min_cash_buffer_pct: cashBufferTargetPct / 100,
       });
       setStatusTone("good");
-      setStatusMessage(`Cash buffer target updated to ${formatNumber(cashBufferTargetPct, 0)}%.`);
+      setStatusMessage(`Cash buffer target updated to ${formatCashBufferPct(cashBufferTargetPct)}.`);
       setStatusDetails(JSON.stringify(result, null, 2));
       setCashModalOpen(null);
       await Promise.all([
@@ -782,7 +800,7 @@ export function DashboardShell() {
   const summary = overview.data?.portfolio_summary ?? {};
   const afterTaxSummary = overview.data?.after_tax_summary ?? {};
   const cashBufferSettings = overview.data?.settings?.cash_buffer;
-  const effectiveCashBufferPct = Number(cashBufferSettings?.min_cash_buffer_pct ?? 0.25) * 100;
+  const effectiveCashBufferPct = Number(cashBufferSettings?.min_cash_buffer_pct ?? 0.1) * 100;
   const integrityWarnings = overview.data?.integrity?.warnings ?? [];
   const analysisSummary = overview.data?.analysis_summary;
   const backendError = [
@@ -903,9 +921,11 @@ export function DashboardShell() {
     Number(summary.total_market_value_dkk ?? 0) > 0
       ? (Number(summary.invested_market_value_dkk ?? 0) / Number(summary.total_market_value_dkk ?? 1)) * 100
       : 0;
+  const cashBufferDisabled = effectiveCashBufferPct <= 0;
+  const cashBufferShortfall = Number(cashManagement.cash_buffer_shortfall_dkk ?? 0);
 
   function openCashBufferModal(mode: "add" | "reduce") {
-    setCashBufferTargetPct(Math.round(effectiveCashBufferPct));
+    setCashBufferTargetPct(normalizeCashBufferPct(effectiveCashBufferPct));
     setCashModalOpen(mode);
   }
 
@@ -1013,7 +1033,7 @@ export function DashboardShell() {
         </section>
       ))}
 
-      {Number(cashManagement.cash_buffer_shortfall_dkk ?? 0) > 0 ? (
+      {!cashBufferDisabled && cashBufferShortfall > 0 ? (
         <section className="banner warn banner-with-actions">
           <span>Cash buffer is below target by {formatDkk(cashManagement.cash_buffer_shortfall_dkk)}. Add cash or reduce exposure.</span>
           <span className="banner-action-row">
@@ -1052,7 +1072,7 @@ export function DashboardShell() {
             Initial {formatDkk(summary.initial_cash_dkk)} · Trades {formatDkk(summary.cash_from_trades_dkk)}
           </div>
           <button className="ghost-button small metric-inline-action" type="button" onClick={() => openCashBufferModal("add")}>
-            Cash buffer {formatNumber(effectiveCashBufferPct, 0)}%
+            Cash buffer {formatCashBufferPct(effectiveCashBufferPct)}
           </button>
         </article>
         <article className="metric-card">
@@ -1326,16 +1346,16 @@ export function DashboardShell() {
             </article>
             <article className="mini-card">
               <div className="label">Report Cadence</div>
-              <div className="value">Every {formatNumber(overview.data?.refresh?.decision_interval_minutes ?? 15, 0)} min</div>
-              <div className="subvalue">While an analysis window is active</div>
+              <div className="value">{overview.data?.refresh?.decision_cadence_label ?? "3 daily pulses"}</div>
+              <div className="subvalue">Morning, pre-EU close, and pre-US close</div>
             </article>
             <article className="mini-card">
               <div className="label">Cash Buffer</div>
-              <div className={`value ${cashManagement.requires_cash_raise ? "negative" : "positive"}`}>
-                {cashManagement.requires_cash_raise ? "Below target" : "Healthy"}
+              <div className={`value ${cashBufferDisabled ? "neutral" : cashManagement.requires_cash_raise ? "negative" : "positive"}`}>
+                {cashBufferDisabled ? "Disabled" : cashManagement.requires_cash_raise ? "Below target" : "Healthy"}
               </div>
               <div className="subvalue">
-                Cash {formatDkk(cashManagement.cash_balance_dkk)} · Shortfall {formatDkk(cashManagement.cash_buffer_shortfall_dkk)}
+                Cash {formatDkk(cashManagement.cash_balance_dkk)} · Shortfall {formatDkk(cashBufferShortfall)}
               </div>
             </article>
             <article className="mini-card">
@@ -1652,13 +1672,14 @@ export function DashboardShell() {
               </button>
             </div>
             <label className="slider-label">
-              Cash buffer target: {formatNumber(cashBufferTargetPct, 0)}%
+              Cash buffer target: {formatCashBufferPct(cashBufferTargetPct)}
               <input
                 type="range"
-                min="1"
+                min="0"
                 max="50"
+                step="0.1"
                 value={cashBufferTargetPct}
-                onChange={(event) => setCashBufferTargetPct(Number(event.target.value))}
+                onChange={(event) => setCashBufferTargetPct(normalizeCashBufferPct(Number(event.target.value)))}
               />
             </label>
             <label className="slider-label">
@@ -1678,8 +1699,12 @@ export function DashboardShell() {
               </article>
               <article className="mini-card">
                 <div className="label">New Strategy Guardrail</div>
-                <div className="value">{formatNumber(cashBufferTargetPct, 0)}% cash</div>
-                <div className="muted">Deployment cap becomes {formatNumber(100 - cashBufferTargetPct, 0)}%.</div>
+                <div className="value">{cashBufferTargetPct <= 0 ? "Disabled" : `${formatCashBufferPct(cashBufferTargetPct)} cash`}</div>
+                <div className="muted">
+                  {cashBufferTargetPct <= 0
+                    ? "The strategy may deploy all available cash subject to other constraints."
+                    : `Deployment cap becomes ${formatNumber(100 - cashBufferTargetPct, cashBufferDecimals(cashBufferTargetPct))}%.`}
+                </div>
               </article>
             </div>
             <div className="button-row">

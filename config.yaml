@@ -71,7 +71,6 @@ scheduler:
 strategy:
   enabled: true
   mode: swing
-  selection_interval_minutes: 15
   max_candidates: 20
   min_selected_assets: 3
   max_selected_assets: 8

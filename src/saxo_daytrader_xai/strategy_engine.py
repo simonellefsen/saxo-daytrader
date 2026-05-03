@@ -80,10 +80,6 @@ def strategy_enabled(config: dict[str, Any]) -> bool:
     return bool(_strategy_cfg(config).get("enabled", True))
 
 
-def strategy_selection_interval_minutes(config: dict[str, Any]) -> int:
-    return int(_strategy_cfg(config).get("selection_interval_minutes", 15) or 15)
-
-
 def strategy_max_deployment_pct(config: dict[str, Any]) -> float:
     return _normalized_pct(_capital_cfg(config).get("max_deployment_pct", 0.75), 0.75)
 
