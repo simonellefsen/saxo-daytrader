@@ -57,7 +57,6 @@ const PERFORMANCE_RANGES = ["1D", "1W", "1M", "3M", "YTD", "1Y", "ALL"] as const
 
 const PORTFOLIO_COLUMN_HELP: Record<string, string> = {
   Symbol: "Trading symbol. Click to open the instrument on Yahoo Finance.",
-  Instrument: "Instrument or company name.",
   Decision: "Latest per-symbol decision sentiment from the most recent xAI analysis report.",
   "Ladder Status": "Current ladder strategy state for the symbol.",
   Trend: "Short intraday sparkline from the recent chart window.",
@@ -89,23 +88,6 @@ function listPreview(value: unknown): string {
   return value.slice(0, 3).map((item) => String(item)).join("; ");
 }
 
-function decisionTooltipText(decision: Record<string, any>): string {
-  const lines = [
-    `Sentiment: ${String(decision.sentiment ?? "n/a")}`,
-    `Age: ${timeAgo(String(decision.created_at ?? ""), Date.now())}`,
-    `Report: #${String(decision.report_id ?? "n/a")} ${String(decision.pulse_label ?? "")}`.trim(),
-    `Action: ${String(decision.action ?? "none")}`,
-    `Priority: ${String(decision.priority ?? "n/a")}`,
-    `Confidence: ${formatNumber(decision.target_confidence ?? decision.confidence, 0)}`,
-    `Macro bias: ${String(decision.macro_bias ?? "n/a")}`,
-    `Target weight: ${decision.target_weight_pct === undefined ? "n/a" : formatPercent(Number(decision.target_weight_pct) / 100)}`,
-    `Rationale: ${String(decision.target_rationale ?? decision.rationale ?? "n/a")}`,
-    `Catalysts: ${listPreview(decision.catalysts)}`,
-    `Risks: ${listPreview(decision.risk_notes)}`,
-  ];
-  return lines.join("\n");
-}
-
 function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | null | undefined; nowMs: number }) {
   if (!decision) {
     return <span className="muted">n/a</span>;
@@ -116,7 +98,7 @@ function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | nul
   const priority = decision.priority ? String(decision.priority) : null;
 
   return (
-    <span className="decision-cell" title={decisionTooltipText(decision)}>
+    <span className="decision-cell">
       <span className={`decision-chip ${decisionTone(sentiment)}`}>{sentiment}</span>
       <span className="decision-age">{age}</span>
       <span className="decision-tooltip" role="tooltip">
@@ -160,17 +142,17 @@ function PortfolioRow({
 
   return (
     <tr className="clickable-row" key={symbol} onClick={() => onOpen(symbol)}>
-      <td>
+      <td title={String(row.instrument_name ?? symbol)}>
         <a
           href={toYahooFinanceUrl(symbol)}
           target="_blank"
           rel="noreferrer"
+          title={String(row.instrument_name ?? symbol)}
           onClick={(event) => event.stopPropagation()}
         >
           {symbol}
         </a>
       </td>
-      <td>{String(row.instrument_name ?? symbol)}</td>
       <td>
         <DecisionCell decision={row.decision} nowMs={nowMs} />
       </td>
@@ -760,7 +742,6 @@ export function DashboardShell() {
   const portfolioColumns = useMemo(
     () => [
       "Symbol",
-      "Instrument",
       "Decision",
       "Ladder Status",
       "Trend",
