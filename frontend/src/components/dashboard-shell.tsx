@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import useSWR, { mutate } from "swr";
 
@@ -89,6 +89,36 @@ function listPreview(value: unknown): string {
 }
 
 function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | null | undefined; nowMs: number }) {
+  const cellRef = useRef<HTMLSpanElement | null>(null);
+  const tooltipRef = useRef<HTMLSpanElement | null>(null);
+  const [tooltipStyle, setTooltipStyle] = useState<CSSProperties | undefined>();
+
+  function updateTooltipPosition() {
+    const cell = cellRef.current;
+    const tooltip = tooltipRef.current;
+    if (!cell || !tooltip) {
+      return;
+    }
+    const cellRect = cell.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const gap = 10;
+    const margin = 12;
+    const left = Math.min(
+      Math.max(cellRect.right + gap, margin),
+      Math.max(window.innerWidth - tooltipRect.width - margin, margin),
+    );
+    const defaultTop = cellRect.top;
+    const top = Math.min(
+      Math.max(defaultTop, margin),
+      Math.max(window.innerHeight - tooltipRect.height - margin, margin),
+    );
+    setTooltipStyle({
+      left,
+      top,
+      width: Math.min(420, Math.max(window.innerWidth - margin * 2, 280)),
+    });
+  }
+
   if (!decision) {
     return <span className="muted">n/a</span>;
   }
@@ -98,10 +128,15 @@ function DecisionCell({ decision, nowMs }: { decision: Record<string, any> | nul
   const priority = decision.priority ? String(decision.priority) : null;
 
   return (
-    <span className="decision-cell">
+    <span
+      className="decision-cell"
+      ref={cellRef}
+      onFocus={updateTooltipPosition}
+      onMouseEnter={updateTooltipPosition}
+    >
       <span className={`decision-chip ${decisionTone(sentiment)}`}>{sentiment}</span>
       <span className="decision-age">{age}</span>
-      <span className="decision-tooltip" role="tooltip">
+      <span className="decision-tooltip" ref={tooltipRef} role="tooltip" style={tooltipStyle}>
         <strong>
           {sentiment}
           {action ? ` · ${action}` : ""}

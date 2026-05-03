@@ -685,12 +685,17 @@ th {
 }
 
 .decision-tooltip {
-  position: absolute;
-  left: calc(100% + 0.65rem);
+  position: fixed;
+  left: 0;
   top: 0;
-  z-index: 8;
-  display: none;
+  z-index: 30;
+  display: block;
   width: min(420px, 72vw);
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
   white-space: normal;
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -708,7 +713,8 @@ th {
 
 .decision-cell:hover .decision-tooltip,
 .decision-cell:focus-within .decision-tooltip {
-  display: block;
+  opacity: 1;
+  visibility: visible;
 }
 
 .ladder-status-cell {
