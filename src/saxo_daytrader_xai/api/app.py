@@ -24,7 +24,6 @@ from saxo_daytrader_xai.execution_engine import (
     fetch_execution_orders,
     manage_live_order,
     queue_and_maybe_execute_latest_report,
-    reconcile_portfolio_to_broker,
     retry_failed_execution_orders,
     sync_saxo_sim_account_to_portfolio,
     sync_broker_order_statuses,
@@ -96,10 +95,16 @@ def _initial_cash_dkk(config: dict[str, Any]) -> float:
 
 def _prefer_broker_state(config: dict[str, Any]) -> bool:
     execution_cfg = config.get("execution", {})
+    saxo_environment = str(config.get("saxo", {}).get("environment") or "").lower()
     return (
         str(execution_cfg.get("mode") or "").lower() == "live"
         and str(execution_cfg.get("adapter") or "").lower() == "saxo"
+        and saxo_environment == "live"
     )
+
+
+def _use_broker_positions(config: dict[str, Any]) -> bool:
+    return _prefer_broker_state(config)
 
 
 def _daily_order_capacity(connection, config: dict[str, Any]) -> dict[str, int]:
@@ -291,6 +296,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
         return {
             "initial_cash_dkk": _initial_cash_dkk(config),
             "prefer_broker_cash": _prefer_broker_state(config),
+            "use_broker_positions": _use_broker_positions(config),
         }
 
     def execution_counts(orders: list[dict[str, Any]]) -> dict[str, int]:
@@ -743,7 +749,12 @@ def create_app(config_path: str | None = None) -> FastAPI:
         with runtime() as (config, connection):
             kwargs = portfolio_kwargs(config)
             summary = fetch_portfolio_summary(connection, **kwargs)
-            after_tax = fetch_unrealised_after_tax_summary(connection, config, initial_cash_dkk=kwargs["initial_cash_dkk"])
+            after_tax = fetch_unrealised_after_tax_summary(
+                connection,
+                config,
+                initial_cash_dkk=kwargs["initial_cash_dkk"],
+                use_broker_positions=kwargs["use_broker_positions"],
+            )
             integrity = fetch_portfolio_integrity_status(connection, initial_cash_dkk=kwargs["initial_cash_dkk"])
             market_status = get_market_status(config)
             analysis_summary = summarize_analysis_window(market_status)
@@ -1065,7 +1076,7 @@ def create_app(config_path: str | None = None) -> FastAPI:
     @app.post("/api/actions/reconcile-broker")
     def action_reconcile_broker() -> dict[str, Any]:
         with runtime() as (config, connection):
-            return _run_action(reconcile_portfolio_to_broker, config=config, connection=connection)
+            return _run_action(sync_saxo_sim_account_to_portfolio, config=config, connection=connection)
 
     @app.post("/api/actions/sync-saxo-sim-portfolio")
     def action_sync_saxo_sim_portfolio() -> dict[str, Any]:

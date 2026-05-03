@@ -971,10 +971,16 @@ def fetch_unrealised_after_tax_summary(
     batch_id: str | None = None,
     *,
     initial_cash_dkk: float = 0.0,
+    use_broker_positions: bool = True,
     tax_year: int | None = None,
 ) -> dict[str, Any]:
     effective_tax_year = int(tax_year or datetime.now(UTC).year)
-    summary = fetch_portfolio_summary(connection, batch_id=batch_id, initial_cash_dkk=initial_cash_dkk)
+    summary = fetch_portfolio_summary(
+        connection,
+        batch_id=batch_id,
+        initial_cash_dkk=initial_cash_dkk,
+        use_broker_positions=use_broker_positions,
+    )
     total_unrealised_pnl_dkk = float(summary["total_unrealised_pnl_dkk"] or 0.0)
     realised_summary = fetch_realised_tax_summary(connection, tax_year=effective_tax_year)
     realised_gain_ytd = float(realised_summary["realised_gain_dkk"] or 0.0)
