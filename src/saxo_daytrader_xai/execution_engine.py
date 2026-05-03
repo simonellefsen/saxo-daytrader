@@ -2790,6 +2790,52 @@ def _market_value_for_quantity(row: dict[str, Any], quantity: float, fx_snapshot
     return price, float(price) * float(quantity) * fx_rate_to_dkk(currency, fx_snapshot)
 
 
+def adopt_broker_holdings_into_local_ledger(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
+    """Refresh Saxo broker snapshots and adjust local lots to match broker holdings."""
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        if str(resolved_config.get("execution", {}).get("adapter") or "").lower() != "saxo":
+            raise ValueError("Broker adoption requires execution.adapter=saxo.")
+        configured_environment = str(resolved_config.get("saxo", {}).get("environment") or "").strip().lower()
+        if configured_environment == "sim":
+            raise ValueError("Broker adoption is blocked in Saxo SIM. Use portfolio-to-Saxo-SIM reconciliation instead.")
+
+        session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+        session_environment = _saxo_environment_value(resolved_config, session)
+        if session_environment == "sim":
+            raise ValueError("Broker adoption is blocked because the active Saxo session is SIM.")
+
+        broker_positions = refresh_broker_position_snapshots(resolved_connection, resolved_config, session)
+        broker_balance = refresh_broker_balance_snapshot(resolved_connection, resolved_config, session)
+        broker_account = refresh_broker_account_snapshot(resolved_connection, resolved_config, session)
+        broker_exposures = refresh_broker_instrument_exposures(resolved_connection, resolved_config, session)
+        reconciliation = reconcile_portfolio_to_broker(connection=resolved_connection, config=resolved_config)
+        append_audit_log(
+            resolved_connection,
+            "broker_holdings_adopted_into_local_ledger",
+            {
+                "configured_environment": configured_environment,
+                "session_environment": session_environment,
+                "broker_positions": broker_positions,
+                "broker_balance": broker_balance,
+                "broker_account": broker_account,
+                "broker_exposures": broker_exposures,
+                "reconciliation": reconciliation,
+            },
+        )
+        resolved_connection.commit()
+        return {
+            **reconciliation,
+            "broker_positions": broker_positions,
+            "broker_balance": broker_balance,
+            "broker_account": broker_account,
+            "broker_exposures": broker_exposures,
+        }
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
 def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
     """Queue/submit SIM-only orders so Saxo SIM holdings match the local portfolio."""
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)

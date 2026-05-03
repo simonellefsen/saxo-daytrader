@@ -34,6 +34,16 @@ type AuthSession = {
   } | null;
 };
 
+type ReconciliationAction = {
+  path: string;
+  title: string;
+  buttonLabel: string;
+  confirmLabel: string;
+  direction: string;
+  details: string[];
+  warning: string;
+};
+
 const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
   { key: "portfolio", label: "Portfolio" },
   { key: "performance", label: "Performance" },
@@ -298,6 +308,7 @@ function isTodayTimestamp(value: unknown): boolean {
 function actionLabel(path: string): string {
   if (path.includes("/queue-process")) return "Queue processor";
   if (path.includes("/sync-saxo-sim-portfolio")) return "Saxo SIM portfolio sync";
+  if (path.includes("/adopt-broker-portfolio")) return "Broker holdings adoption";
   if (path.includes("/sync-broker")) return "Broker sync";
   if (path.includes("/retry-failed")) return "Retry failed orders";
   if (path.includes("/reconcile-broker")) return "Saxo SIM portfolio sync";
@@ -319,6 +330,10 @@ function summarizeActionResult(path: string, result: Record<string, unknown>): s
     const created = Number(result.created ?? 0);
     const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
     return `${label} completed. Created ${formatNumber(created, 0)} order${created === 1 ? "" : "s"}${skipped ? `, skipped ${skipped}` : ""}.`;
+  }
+  if (path.includes("/adopt-broker-portfolio")) {
+    const adjustments = Array.isArray(result.adjustments) ? result.adjustments.length : 0;
+    return `${label} completed. Applied ${adjustments} local ledger adjustment${adjustments === 1 ? "" : "s"}.`;
   }
   if (path.includes("/sync-saxo-sim-portfolio")) {
     const created = Number(result.created ?? 0);
@@ -451,6 +466,7 @@ export function DashboardShell() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [portfolioSort, setPortfolioSort] = useState<"unrealised" | "allocation">("allocation");
   const [cashModalOpen, setCashModalOpen] = useState<"add" | "reduce" | null>(null);
+  const [reconciliationAction, setReconciliationAction] = useState<ReconciliationAction | null>(null);
   const [cashAdjustmentPct, setCashAdjustmentPct] = useState(5);
   const [cashBufferTargetPct, setCashBufferTargetPct] = useState(25);
 
@@ -687,7 +703,38 @@ export function DashboardShell() {
   const ladderOrders = Array.isArray(strategyPlan.ladder_orders) ? (strategyPlan.ladder_orders as Array<Record<string, unknown>>) : [];
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
   const isSaxoAdapter = String(overview.data?.execution?.adapter ?? "").toLowerCase() === "saxo";
-  const isSaxoSim = isSaxoAdapter && String(saxoAuth.data?.environment ?? overview.data?.saxo_auth?.environment ?? "").toLowerCase() === "sim";
+  const saxoEnvironment = String(saxoAuth.data?.environment ?? overview.data?.saxo_auth?.environment ?? "").toLowerCase();
+  const isSaxoSim = isSaxoAdapter && saxoEnvironment === "sim";
+  const isSaxoBrokerMode = isSaxoAdapter && saxoEnvironment !== "" && saxoEnvironment !== "sim";
+  const simReconciliationAction: ReconciliationAction = {
+    path: "/api/actions/reconcile-broker",
+    title: "Reconcile Portfolio To Saxo SIM",
+    buttonLabel: "⇄ Reconcile Portfolio To Saxo SIM",
+    confirmLabel: "Reconcile To Saxo SIM",
+    direction: "Local imported portfolio → Saxo Developer SIM account",
+    details: [
+      "The imported/local portfolio remains the source of truth.",
+      "The backend compares local target quantities with Saxo SIM holdings.",
+      "It queues/submits SIM-only orders to buy missing shares or sell excess SIM-only shares.",
+      "It is blocked by the backend unless the configured and active Saxo session environment is SIM.",
+    ],
+    warning: "This can create Saxo SIM orders, but it must not alter Saxo Live holdings.",
+  };
+  const brokerAdoptionAction: ReconciliationAction = {
+    path: "/api/actions/adopt-broker-portfolio",
+    title: "Adopt Broker Holdings Into Local Ledger",
+    buttonLabel: "⇣ Adopt Broker Holdings Into Local Ledger",
+    confirmLabel: "Adopt Broker Holdings",
+    direction: "Saxo broker account → local ledger/tax lots",
+    details: [
+      "The Saxo broker account becomes the source of truth for held quantities.",
+      "The backend refreshes Saxo broker position, balance, account, and exposure snapshots first.",
+      "It writes reconciliation adjustments so local portfolio quantities match broker holdings.",
+      "It is blocked by the backend while the active Saxo session is SIM.",
+    ],
+    warning: "This can replace the imported/local portfolio view with broker holdings. Use it only when the broker account is authoritative.",
+  };
+  const visibleReconciliationAction = isSaxoSim ? simReconciliationAction : isSaxoBrokerMode ? brokerAdoptionAction : null;
   const friendlyDecisionMessage = decisionFriendlyMessage(displayedDecision ?? null, saxoAuth.data);
   const sortedPositions = useMemo(() => {
     const rows = [...(positions.data?.items ?? [])];
@@ -1316,16 +1363,21 @@ export function DashboardShell() {
             <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/retry-failed"} onClick={() => runAction("/api/actions/retry-failed")}>
               ↺ Retry Failed Orders
             </ActionButton>
-            {isSaxoSim ? (
-              <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/reconcile-broker"} onClick={() => runAction("/api/actions/reconcile-broker")}>
-                ⇄ Reconcile Portfolio To Saxo SIM
+            {visibleReconciliationAction ? (
+              <ActionButton
+                className="ghost-button"
+                disabled={pendingAction !== null}
+                loading={pendingAction === visibleReconciliationAction.path}
+                onClick={() => setReconciliationAction(visibleReconciliationAction)}
+              >
+                {visibleReconciliationAction.buttonLabel}
               </ActionButton>
             ) : null}
             <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/scheduler-cycle"} onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
               ⟳ Run Scheduler Cycle
             </ActionButton>
           </div>
-          {!isSaxoSim ? <p className="muted">Saxo SIM portfolio reconciliation is hidden unless the active Saxo adapter session is SIM.</p> : null}
+          {!visibleReconciliationAction ? <p className="muted">Portfolio reconciliation actions are hidden until a Saxo session environment is available.</p> : null}
           {dailyOrderCapacity ? (
             <div className="cap-progress-block">
               <div className="muted">
@@ -1486,6 +1538,60 @@ export function DashboardShell() {
                 Save Cash Buffer
               </ActionButton>
               <button className="ghost-button" type="button" onClick={() => setCashModalOpen(null)}>
+                Cancel
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {reconciliationAction ? (
+        <div className="modal-backdrop" role="presentation" onClick={() => setReconciliationAction(null)}>
+          <section className="modal-card" role="dialog" aria-modal="true" aria-label={reconciliationAction.title} onClick={(event) => event.stopPropagation()}>
+            <div className="panel-header">
+              <div>
+                <h2>{reconciliationAction.title}</h2>
+                <p>{reconciliationAction.direction}</p>
+              </div>
+              <button className="ghost-button small" type="button" onClick={() => setReconciliationAction(null)}>
+                Close
+              </button>
+            </div>
+            <div className="warning-box">
+              <strong>Confirm direction before running.</strong>
+              <span>{reconciliationAction.warning}</span>
+            </div>
+            <ul className="modal-list">
+              {reconciliationAction.details.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+            <div className="mini-grid">
+              <article className="mini-card">
+                <div className="label">Current UI Portfolio</div>
+                <div className="value">{formatNumber(summary.position_count ?? 0, 0)} positions</div>
+                <div className="muted">Cash {formatDkk(summary.cash_balance_dkk)}</div>
+              </article>
+              <article className="mini-card">
+                <div className="label">Saxo Session</div>
+                <div className="value">{String(saxoEnvironment || "n/a").toUpperCase()}</div>
+                <div className="muted">Adapter {String(overview.data?.execution?.adapter ?? "n/a")}</div>
+              </article>
+            </div>
+            <div className="button-row">
+              <ActionButton
+                className={reconciliationAction.path.includes("adopt-broker") ? "danger-button" : "button"}
+                disabled={pendingAction !== null}
+                loading={pendingAction === reconciliationAction.path}
+                onClick={async () => {
+                  const action = reconciliationAction;
+                  setReconciliationAction(null);
+                  await runAction(action.path);
+                }}
+              >
+                {reconciliationAction.confirmLabel}
+              </ActionButton>
+              <button className="ghost-button" type="button" onClick={() => setReconciliationAction(null)}>
                 Cancel
               </button>
             </div>

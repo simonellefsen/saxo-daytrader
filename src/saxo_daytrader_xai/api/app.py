@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import connect, fetch_scheduler_cycles, fetch_scheduler_status, init_db
 from saxo_daytrader_xai.execution_engine import (
+    adopt_broker_holdings_into_local_ledger,
     fetch_execution_events,
     fetch_execution_fills,
     fetch_execution_orders,
@@ -1077,6 +1078,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
     def action_reconcile_broker() -> dict[str, Any]:
         with runtime() as (config, connection):
             return _run_action(sync_saxo_sim_account_to_portfolio, config=config, connection=connection)
+
+    @app.post("/api/actions/adopt-broker-portfolio")
+    def action_adopt_broker_portfolio() -> dict[str, Any]:
+        with runtime() as (config, connection):
+            return _run_action(adopt_broker_holdings_into_local_ledger, config=config, connection=connection)
 
     @app.post("/api/actions/sync-saxo-sim-portfolio")
     def action_sync_saxo_sim_portfolio() -> dict[str, Any]:

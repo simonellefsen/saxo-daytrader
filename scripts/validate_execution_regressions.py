@@ -16,6 +16,7 @@ from saxo_daytrader_xai.execution_engine import (
     _defer_ladder_entry_bracket,
     _is_retryable_execution_failure,
     _sync_incremental_live_fill,
+    adopt_broker_holdings_into_local_ledger,
     enqueue_session_flatten_orders,
     execute_order,
     reconcile_portfolio_to_broker,
@@ -730,6 +731,23 @@ def _assert_portfolio_sync_is_sim_only(config: dict) -> None:
         connection.close()
 
 
+def _assert_broker_adoption_is_blocked_in_sim(config: dict) -> None:
+    sim_config = json.loads(json.dumps(config))
+    sim_config["saxo"]["environment"] = "sim"
+
+    connection = connect(":memory:")
+    init_db(connection)
+    try:
+        try:
+            adopt_broker_holdings_into_local_ledger(config=sim_config, connection=connection)
+        except ValueError as exc:
+            assert "SIM" in str(exc), exc
+        else:
+            raise AssertionError("Expected Saxo SIM broker adoption to be blocked")
+    finally:
+        connection.close()
+
+
 def main() -> int:
     config = _config()
     _assert_price_normalization(config)
@@ -745,8 +763,9 @@ def main() -> int:
     _assert_flatten_orders_are_capped_to_local_lots(config)
     _assert_scoped_reconciliation_restores_residual_broker_position(config)
     _assert_portfolio_sync_is_sim_only(config)
+    _assert_broker_adoption_is_blocked_in_sim(config)
     print("Execution regression validation passed.")
-    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, and SIM-only portfolio sync guards.")
+    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, SIM-only portfolio sync guards, and SIM broker-adoption blocking.")
     return 0
 
 
