@@ -151,7 +151,12 @@ def sync_portfolio(config: dict[str, Any]) -> ImportResult:
     portfolio_cfg = config["portfolio"]
     source_csv_value = str(portfolio_cfg.get("source_csv", "") or "").strip()
     source_csv = Path(source_csv_value).resolve() if source_csv_value else None
-    database_path = Path(portfolio_cfg["database_path"]).resolve()
+    database_path_value = str(portfolio_cfg["database_path"])
+    database_path: str | Path = (
+        database_path_value
+        if database_path_value.startswith(("postgresql://", "postgres://"))
+        else Path(database_path_value).resolve()
+    )
     excluded_symbols = set(config.get("risk", {}).get("excluded_symbols", []))
     detail_rows = _load_detail_rows(source_csv) if source_csv is not None else []
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]

@@ -17,7 +17,9 @@ from saxo_daytrader_xai.execution_engine import (
     _is_retryable_execution_failure,
     _sync_incremental_live_fill,
     enqueue_session_flatten_orders,
+    execute_order,
     reconcile_portfolio_to_broker,
+    sync_saxo_sim_account_to_portfolio,
 )
 from saxo_daytrader_xai.portfolio import fetch_portfolio_positions, fetch_realised_daily_pnl_summary
 from saxo_daytrader_xai.saxo_openapi import SaxoInstrument, build_order_payload, normalize_order_price
@@ -670,6 +672,64 @@ def _assert_scoped_reconciliation_restores_residual_broker_position(config: dict
         connection.close()
 
 
+def _assert_portfolio_sync_is_sim_only(config: dict) -> None:
+    live_config = json.loads(json.dumps(config))
+    live_config["saxo"]["environment"] = "live"
+
+    connection = connect(":memory:")
+    init_db(connection)
+    try:
+        try:
+            sync_saxo_sim_account_to_portfolio(config=live_config, connection=connection)
+        except ValueError as exc:
+            assert "SIM" in str(exc), exc
+        else:
+            raise AssertionError("Expected Saxo LIVE portfolio sync to be blocked")
+
+        cursor = connection.execute(
+            """
+            INSERT INTO execution_orders (
+                created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+                request_json, execution_result_json, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-05-01T10:00:00+00:00",
+                None,
+                "AMD:xnas",
+                "BUY",
+                "Market",
+                "live",
+                "pending_execution",
+                "saxo",
+                None,
+                1,
+                100.0,
+                None,
+                None,
+                "USD",
+                650.0,
+                0,
+                None,
+                "portfolio_sync",
+                "saxo_sim",
+                "portfolio_sync:AMD:xnas:test",
+                "increase_to_target",
+                "{}",
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+        result = execute_order(int(cursor.lastrowid), config=live_config, connection=connection, approved=True)
+        assert result["status"] == "execution_failed", result
+        assert "SIM-only" in result["error"], result
+    finally:
+        connection.close()
+
+
 def main() -> int:
     config = _config()
     _assert_price_normalization(config)
@@ -684,8 +744,9 @@ def main() -> int:
     _assert_oversized_broker_sell_fill_closes_local_lots(config)
     _assert_flatten_orders_are_capped_to_local_lots(config)
     _assert_scoped_reconciliation_restores_residual_broker_position(config)
+    _assert_portfolio_sync_is_sim_only(config)
     print("Execution regression validation passed.")
-    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, and residual broker-position reconciliation.")
+    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, and SIM-only portfolio sync guards.")
     return 0
 
 

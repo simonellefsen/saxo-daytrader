@@ -297,6 +297,7 @@ function isTodayTimestamp(value: unknown): boolean {
 
 function actionLabel(path: string): string {
   if (path.includes("/queue-process")) return "Queue processor";
+  if (path.includes("/sync-saxo-sim-portfolio")) return "Saxo SIM portfolio sync";
   if (path.includes("/sync-broker")) return "Broker sync";
   if (path.includes("/retry-failed")) return "Retry failed orders";
   if (path.includes("/reconcile-broker")) return "Portfolio reconciliation";
@@ -317,6 +318,11 @@ function summarizeActionResult(path: string, result: Record<string, unknown>): s
   if (path.includes("/reconcile-broker")) {
     const adjustments = Array.isArray(result.adjustments) ? result.adjustments.length : 0;
     return `${label} completed. Applied ${adjustments} adjustment${adjustments === 1 ? "" : "s"}.`;
+  }
+  if (path.includes("/sync-saxo-sim-portfolio")) {
+    const created = Number(result.created ?? 0);
+    const skipped = Array.isArray(result.skipped) ? result.skipped.length : 0;
+    return `${label} completed. Created ${formatNumber(created, 0)} order${created === 1 ? "" : "s"}${skipped ? `, skipped ${skipped}` : ""}.`;
   }
   if (path.includes("/sync-broker")) {
     const updated = Number(result.updated ?? 0);
@@ -679,6 +685,7 @@ export function DashboardShell() {
   const swingOrders = Array.isArray(strategyPlan.swing_orders) ? (strategyPlan.swing_orders as Array<Record<string, unknown>>) : [];
   const ladderOrders = Array.isArray(strategyPlan.ladder_orders) ? (strategyPlan.ladder_orders as Array<Record<string, unknown>>) : [];
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
+  const isSaxoSim = String(saxoAuth.data?.environment ?? overview.data?.saxo_auth?.environment ?? "").toLowerCase() === "sim";
   const friendlyDecisionMessage = decisionFriendlyMessage(displayedDecision ?? null, saxoAuth.data);
   const sortedPositions = useMemo(() => {
     const rows = [...(positions.data?.items ?? [])];
@@ -1310,10 +1317,19 @@ export function DashboardShell() {
             <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/reconcile-broker"} onClick={() => runAction("/api/actions/reconcile-broker")}>
               ≋ Reconcile Portfolio To Saxo
             </ActionButton>
+            <ActionButton
+              className="ghost-button"
+              disabled={pendingAction !== null || !isSaxoSim}
+              loading={pendingAction === "/api/actions/sync-saxo-sim-portfolio"}
+              onClick={() => runAction("/api/actions/sync-saxo-sim-portfolio")}
+            >
+              ⇄ Mirror Portfolio To Saxo SIM
+            </ActionButton>
             <ActionButton className="ghost-button" disabled={pendingAction !== null} loading={pendingAction === "/api/actions/scheduler-cycle"} onClick={() => runAction("/api/actions/scheduler-cycle", { mock: false })}>
               ⟳ Run Scheduler Cycle
             </ActionButton>
           </div>
+          {!isSaxoSim ? <p className="muted">Saxo SIM portfolio mirroring is disabled unless the active Saxo session is SIM.</p> : null}
           {dailyOrderCapacity ? (
             <div className="cap-progress-block">
               <div className="muted">

@@ -13,7 +13,7 @@ portfolio:
   source_csv: ""
   database_url: ENV:DATABASE_URL
   database_path: ledger.db
-  initial_cash_dkk: 250000.0
+  initial_cash_dkk: 9770.17
   virtual_cap_dkk: 250000.0
 
 market_data:

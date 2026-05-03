@@ -2752,6 +2752,240 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
             resolved_connection.close()
 
 
+def _saxo_environment_value(config: dict[str, Any], session: dict[str, Any] | None = None) -> str:
+    return str((session or {}).get("environment") or config.get("saxo", {}).get("environment") or "").strip().lower()
+
+
+def _fail_order(
+    connection,
+    *,
+    order_id: int,
+    status: str,
+    error_text: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    connection.execute(
+        """
+        UPDATE execution_orders
+        SET status = ?, approved_at = ?, error_text = ?, execution_result_json = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            datetime.now(UTC).isoformat(timespec="seconds"),
+            error_text,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            order_id,
+        ),
+    )
+    connection.commit()
+    return {"status": status, "order_id": order_id, "error": error_text}
+
+
+def _market_value_for_quantity(row: dict[str, Any], quantity: float, fx_snapshot: dict[str, float]) -> tuple[float | None, float]:
+    price = _coerce_float(row.get("current_price_local")) or _coerce_float(row.get("open_price_local")) or _coerce_float(row.get("open_price_including_costs_local"))
+    currency = str(row.get("currency") or "DKK")
+    if price is None:
+        return None, 0.0
+    return price, float(price) * float(quantity) * fx_rate_to_dkk(currency, fx_snapshot)
+
+
+def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
+    """Queue/submit SIM-only orders so Saxo SIM holdings match the local portfolio."""
+    resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
+    try:
+        if str(resolved_config.get("execution", {}).get("adapter") or "").lower() != "saxo":
+            raise ValueError("Saxo SIM portfolio sync requires execution.adapter=saxo.")
+        configured_environment = str(resolved_config.get("saxo", {}).get("environment") or "").strip().lower()
+        if configured_environment != "sim":
+            raise ValueError("Saxo SIM portfolio sync is blocked unless saxo.environment is SIM.")
+
+        session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+        session_environment = _saxo_environment_value(resolved_config, session)
+        if session_environment != "sim":
+            raise ValueError("Saxo SIM portfolio sync is blocked because the active Saxo session is not SIM.")
+        if bool(resolved_config.get("app", {}).get("dry_run", True)):
+            return {"status": "blocked_by_dry_run", "created_order_ids": [], "orders": []}
+
+        batch_id = fetch_latest_batch_id(resolved_connection)
+        local_rows = fetch_portfolio_positions(
+            resolved_connection,
+            batch_id=batch_id,
+            initial_cash_dkk=_initial_cash_dkk(resolved_config),
+            use_broker_positions=False,
+        )
+        target_by_symbol = {str(row["symbol"]): dict(row) for row in local_rows}
+
+        broker_positions = refresh_broker_position_snapshots(resolved_connection, resolved_config, session)
+        broker_balance = refresh_broker_balance_snapshot(resolved_connection, resolved_config, session)
+        broker_rows = resolved_connection.execute(
+            """
+            SELECT symbol, instrument_name, isin, currency, quantity, open_price_local, open_price_including_costs_local
+            FROM broker_position_snapshots
+            """
+        ).fetchall()
+        broker_by_symbol = {str(row["symbol"]): dict(row) for row in broker_rows}
+
+        active_rows = resolved_connection.execute(
+            """
+            SELECT symbol, id, status
+            FROM execution_orders
+            WHERE strategy_type = 'portfolio_sync'
+              AND status NOT IN ({})
+            """.format(",".join("?" for _ in TERMINAL_ORDER_STATUSES)),
+            tuple(TERMINAL_ORDER_STATUSES),
+        ).fetchall()
+        active_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for row in active_rows:
+            active_by_symbol.setdefault(str(row["symbol"]), []).append(dict(row))
+
+        fx_snapshot = fetch_ecb_fx_rates()
+        created_at = datetime.now(UTC).isoformat(timespec="seconds")
+        order_specs: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        for symbol in sorted(set(target_by_symbol) | set(broker_by_symbol)):
+            target = target_by_symbol.get(symbol)
+            broker = broker_by_symbol.get(symbol)
+            target_quantity = float((target or {}).get("quantity") or 0.0)
+            broker_quantity = float((broker or {}).get("quantity") or 0.0)
+            delta_quantity = target_quantity - broker_quantity
+            whole_delta = _whole_share_quantity(abs(delta_quantity))
+            if whole_delta <= 0:
+                continue
+            if active_by_symbol.get(symbol):
+                skipped.append(
+                    {
+                        "symbol": symbol,
+                        "status": "active_sync_order_exists",
+                        "active_order_ids": [int(row["id"]) for row in active_by_symbol[symbol]],
+                    }
+                )
+                continue
+
+            action = "BUY" if delta_quantity > 0 else "SELL"
+            source_row = target or broker or {"symbol": symbol, "currency": "DKK"}
+            price_local, estimated_value_dkk = _market_value_for_quantity(source_row, whole_delta, fx_snapshot)
+            currency = str(source_row.get("currency") or "DKK")
+            request_payload = {
+                "symbol": symbol,
+                "action": action,
+                "order_type": "Market",
+                "strategy_type": "portfolio_sync",
+                "strategy_role": "increase_to_target" if action == "BUY" else "reduce_to_target",
+                "target_quantity": target_quantity,
+                "broker_quantity": broker_quantity,
+                "delta_quantity": delta_quantity,
+                "saxo_environment": "sim",
+                "reason": "Mirror local imported portfolio into Saxo Developer SIM account.",
+            }
+            order_specs.append(
+                {
+                    "symbol": symbol,
+                    "action": action,
+                    "order_type": "Market",
+                    "mode": "live",
+                    "status": "pending_execution",
+                    "adapter": "saxo",
+                    "requested_weight_pct": None,
+                    "quantity": float(whole_delta),
+                    "price_local": price_local,
+                    "limit_price_local": None,
+                    "stop_price_local": None,
+                    "currency": currency,
+                    "estimated_value_dkk": estimated_value_dkk,
+                    "approval_required": 0,
+                    "parent_execution_order_id": None,
+                    "strategy_type": "portfolio_sync",
+                    "strategy_session": "saxo_sim",
+                    "strategy_key": f"portfolio_sync:{symbol}:{created_at}",
+                    "strategy_role": request_payload["strategy_role"],
+                    "request_json": json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+                    "execution_result_json": None,
+                    "error_text": None,
+                }
+            )
+
+        # Sell reductions first so SIM buying power is freed before increases are attempted.
+        order_specs.sort(key=lambda row: 0 if row["action"] == "SELL" else 1)
+        created_order_ids: list[int] = []
+        execution_results: list[dict[str, Any]] = []
+        for spec in order_specs:
+            cursor = resolved_connection.execute(
+                """
+                INSERT INTO execution_orders (
+                    created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                    requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                    approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+                    request_json, execution_result_json, error_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    created_at,
+                    None,
+                    spec["symbol"],
+                    spec["action"],
+                    spec["order_type"],
+                    spec["mode"],
+                    spec["status"],
+                    spec["adapter"],
+                    spec["requested_weight_pct"],
+                    spec["quantity"],
+                    spec["price_local"],
+                    spec["limit_price_local"],
+                    spec["stop_price_local"],
+                    spec["currency"],
+                    spec["estimated_value_dkk"],
+                    spec["approval_required"],
+                    spec["parent_execution_order_id"],
+                    spec["strategy_type"],
+                    spec["strategy_session"],
+                    spec["strategy_key"],
+                    spec["strategy_role"],
+                    spec["request_json"],
+                    spec["execution_result_json"],
+                    spec["error_text"],
+                ),
+            )
+            order_id = int(cursor.lastrowid)
+            created_order_ids.append(order_id)
+            resolved_connection.commit()
+            execution_results.append(
+                execute_order(
+                    order_id,
+                    config=resolved_config,
+                    connection=resolved_connection,
+                    approved=True,
+                )
+            )
+
+        append_audit_log(
+            resolved_connection,
+            "saxo_sim_portfolio_sync_requested",
+            {
+                "created_at": created_at,
+                "batch_id": batch_id,
+                "created_order_ids": created_order_ids,
+                "skipped": skipped,
+                "broker_positions": broker_positions,
+                "broker_balance": broker_balance,
+            },
+        )
+        resolved_connection.commit()
+        return {
+            "status": "ok",
+            "created": len(created_order_ids),
+            "created_order_ids": created_order_ids,
+            "orders": execution_results,
+            "skipped": skipped,
+            "broker_positions": broker_positions,
+            "broker_balance": broker_balance,
+        }
+    finally:
+        if should_close:
+            resolved_connection.close()
+
+
 def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connection=None, approved: bool = False) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
@@ -2782,6 +3016,15 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
             return {"status": order["status"], "order_id": order_id}
         if order["mode"] == "live" and order["approval_required"] and not approved:
             return {"status": "approval_required", "order_id": order_id}
+        is_portfolio_sync = str(order.get("strategy_type") or "") == "portfolio_sync"
+        if is_portfolio_sync and str(resolved_config.get("saxo", {}).get("environment") or "").strip().lower() != "sim":
+            return _fail_order(
+                resolved_connection,
+                order_id=order_id,
+                status="execution_failed",
+                error_text="Portfolio sync orders are SIM-only and cannot execute while saxo.environment is LIVE.",
+                payload={"strategy_type": "portfolio_sync", "configured_environment": resolved_config.get("saxo", {}).get("environment")},
+            )
         market_row = _market_status_for_symbol(str(order["symbol"]), resolved_config)
         if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
             error_text = f"Exchange closed for {order['symbol']}: {market_row.get('status_reason')}"
@@ -2854,6 +3097,19 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
             order_request: dict[str, Any] = {}
             precheck: dict[str, Any] | None = None
             try:
+                session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
+                if is_portfolio_sync and _saxo_environment_value(resolved_config, session) != "sim":
+                    return _fail_order(
+                        resolved_connection,
+                        order_id=order_id,
+                        status="execution_failed",
+                        error_text="Portfolio sync orders are SIM-only and cannot execute with a non-SIM Saxo session.",
+                        payload={
+                            "strategy_type": "portfolio_sync",
+                            "configured_environment": resolved_config.get("saxo", {}).get("environment"),
+                            "session_environment": session.get("environment"),
+                        },
+                    )
                 if order["action"] == "SELL":
                     holdings = _current_holdings_map_for_retry(resolved_connection, resolved_config)
                     held_quantity = float((holdings.get(str(order["symbol"])) or {}).get("quantity") or 0.0)
@@ -2897,8 +3153,7 @@ def execute_order(order_id: int, *, config: dict[str, Any] | None = None, connec
                         resolved_connection.commit()
                         _dispatch_execution_failure_alerts(resolved_connection, resolved_config)
                         return {"status": "execution_failed", "order_id": order_id, "error": error_text}
-                session = ensure_access_token(resolved_config, resolved_config["saxo"].get("session_path"))
-                if order["action"] == "BUY" and _cash_gate_enabled(resolved_config):
+                if order["action"] == "BUY" and _cash_gate_enabled(resolved_config) and not is_portfolio_sync:
                     virtual_budget_gate = _evaluate_virtual_buy_budget_gate(order, resolved_config, resolved_connection)
                     if not virtual_budget_gate["allowed"]:
                         error_text = (

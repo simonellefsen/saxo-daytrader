@@ -26,6 +26,7 @@ from saxo_daytrader_xai.execution_engine import (
     queue_and_maybe_execute_latest_report,
     reconcile_portfolio_to_broker,
     retry_failed_execution_orders,
+    sync_saxo_sim_account_to_portfolio,
     sync_broker_order_statuses,
 )
 from saxo_daytrader_xai.market_schedule import get_market_status, summarize_analysis_window
@@ -1065,6 +1066,11 @@ def create_app(config_path: str | None = None) -> FastAPI:
     def action_reconcile_broker() -> dict[str, Any]:
         with runtime() as (config, connection):
             return _run_action(reconcile_portfolio_to_broker, config=config, connection=connection)
+
+    @app.post("/api/actions/sync-saxo-sim-portfolio")
+    def action_sync_saxo_sim_portfolio() -> dict[str, Any]:
+        with runtime() as (config, connection):
+            return _run_action(sync_saxo_sim_account_to_portfolio, config=config, connection=connection)
 
     @app.post("/api/actions/scheduler-cycle")
     def action_scheduler_cycle(request: SchedulerCycleRequest) -> dict[str, Any]:
