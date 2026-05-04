@@ -131,6 +131,20 @@ def _available_sell_quantity(
     return max(float(held_quantity or 0.0) - reserved_quantity, 0.0)
 
 
+def _broker_snapshot_quantity_map(connection) -> dict[str, float]:
+    try:
+        rows = connection.execute(
+            """
+            SELECT symbol, quantity
+            FROM broker_position_snapshots
+            WHERE quantity > 0
+            """
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    return {str(row["symbol"]): float(row["quantity"] or 0.0) for row in rows}
+
+
 def _get_live_price_map(symbols: list[str], config: dict[str, Any]) -> dict[str, dict[str, Any]]:
     quotes = fetch_live_prices(symbols, timeout_seconds=config["market_data"]["request_timeout_seconds"])
     return {row["symbol"]: row for row in quotes}
@@ -768,7 +782,7 @@ def _current_holdings_map_for_retry(connection, config: dict[str, Any]) -> dict[
     batch_id = fetch_latest_batch_id(connection)
     initial_cash_dkk = _initial_cash_dkk(config)
     prefer_broker_cash = _prefer_broker_state(config)
-    return {
+    holdings = {
         row["symbol"]: dict(row)
         for row in fetch_portfolio_positions(
             connection,
@@ -777,6 +791,19 @@ def _current_holdings_map_for_retry(connection, config: dict[str, Any]) -> dict[
             prefer_broker_cash=prefer_broker_cash,
         )
     }
+    if str(config.get("execution", {}).get("adapter") or "").lower() == "saxo":
+        broker_quantities = _broker_snapshot_quantity_map(connection)
+        if broker_quantities:
+            return {
+                symbol: {
+                    **holdings.get(symbol, {"symbol": symbol}),
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "quantity_open": quantity,
+                }
+                for symbol, quantity in broker_quantities.items()
+            }
+    return holdings
 
 
 def _retry_block_reason(
@@ -1368,10 +1395,33 @@ def enqueue_session_flatten_orders(*, config: dict[str, Any] | None = None, conn
             initial_cash_dkk=initial_cash_dkk,
             prefer_broker_cash=prefer_broker_cash,
         )
+        broker_quantities = _broker_snapshot_quantity_map(resolved_connection)
+        if broker_quantities:
+            active_statuses = tuple(SELL_RESERVATION_STATUSES)
+            status_placeholders = ",".join("?" for _ in active_statuses)
+            symbol_placeholders = ",".join("?" for _ in broker_quantities)
+            resolved_connection.execute(
+                f"""
+                UPDATE execution_orders
+                SET status = ?, error_text = ?
+                WHERE action = 'SELL'
+                  AND strategy_type = 'flatten'
+                  AND status IN ({status_placeholders})
+                  AND symbol NOT IN ({symbol_placeholders})
+                """,
+                (
+                    "cancelled",
+                    "Cancelled because latest Saxo broker snapshot has no held quantity for session flatten.",
+                    *active_statuses,
+                    *tuple(broker_quantities.keys()),
+                ),
+            )
         created: list[int] = []
         for position in positions:
             symbol = str(position["symbol"])
             broker_aligned_quantity = _whole_share_quantity(float(position["quantity"] or 0.0))
+            if broker_quantities:
+                broker_aligned_quantity = _whole_share_quantity(float(broker_quantities.get(symbol, 0.0)))
             local_lot_quantity = _whole_share_quantity(_local_open_lot_quantity(resolved_connection, symbol))
             quantity = min(broker_aligned_quantity, local_lot_quantity)
             if broker_aligned_quantity > local_lot_quantity:
@@ -1672,6 +1722,10 @@ def _record_execution_fill(
     return int(cursor.lastrowid)
 
 
+def _is_portfolio_sync_order(order: dict[str, Any]) -> bool:
+    return str(order.get("strategy_type") or "") == "portfolio_sync"
+
+
 def _coerce_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -1806,6 +1860,39 @@ def _sync_incremental_live_fill(
             "delta_quantity": 0.0,
             "cumulative_quantity": filled_quantity,
             "status": "no_new_fill",
+        }
+
+    if _is_portfolio_sync_order(order):
+        fill_payload = {
+            **activity,
+            "local_reconciliation": {
+                "status": "broker_only_portfolio_sync",
+                "note": (
+                    "Portfolio-sync orders mirror the existing local ledger into Saxo SIM; "
+                    "broker fills must not create additional local tax lots or cash movements."
+                ),
+            },
+        }
+        fill_id = _record_execution_fill(
+            connection,
+            order=order,
+            broker_order_id=broker_order_id,
+            fill_status=fill_status,
+            cumulative_quantity=filled_quantity,
+            delta_quantity=delta_quantity,
+            average_price_local=average_price,
+            currency=str(order["currency"]),
+            ledger_id=None,
+            payload=fill_payload,
+        )
+        connection.commit()
+        return {
+            "ledger_id": None,
+            "fill_id": fill_id,
+            "delta_quantity": delta_quantity,
+            "cumulative_quantity": filled_quantity,
+            "status": "portfolio_sync_broker_fill_synced",
+            "local_reconciliation": fill_payload["local_reconciliation"],
         }
 
     synced_order = {**order, "quantity": delta_quantity, "price_local": average_price}
@@ -2421,6 +2508,8 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                                 "broker_only_quantity": result.get("broker_only_quantity"),
                                 "note": result.get("reconciliation_note"),
                             }
+                        elif result.get("local_reconciliation"):
+                            payload["local_reconciliation"] = result["local_reconciliation"]
                         event_id = _record_execution_event(
                             resolved_connection,
                             order=order,
@@ -2523,6 +2612,8 @@ def sync_broker_order_statuses(*, config: dict[str, Any] | None = None, connecti
                                 "broker_only_quantity": result.get("broker_only_quantity"),
                                 "note": result.get("reconciliation_note"),
                             }
+                        elif result.get("local_reconciliation"):
+                            payload["local_reconciliation"] = result["local_reconciliation"]
                         event_id = _record_execution_event(
                             resolved_connection,
                             order=order,
@@ -4027,7 +4118,21 @@ def reconcile_portfolio_to_broker(
                 ("%NotOwned%", "%reconciled to Saxo broker holdings%"),
             ).fetchall()
         }
-        candidate_symbols = set(local_by_symbol) | set(broker_by_symbol) | not_owned_symbols
+        active_statuses = tuple(SELL_RESERVATION_STATUSES | {"waiting_for_market_open"})
+        active_status_placeholders = ",".join("?" for _ in active_statuses)
+        active_portfolio_sync_symbols = {
+            str(row["symbol"])
+            for row in resolved_connection.execute(
+                f"""
+                SELECT DISTINCT symbol
+                FROM execution_orders
+                WHERE strategy_type = 'portfolio_sync'
+                  AND status IN ({active_status_placeholders})
+                """,
+                active_statuses,
+            ).fetchall()
+        }
+        candidate_symbols = set(local_by_symbol) | set(broker_by_symbol) | not_owned_symbols | active_portfolio_sync_symbols
         if symbols is not None:
             requested_symbols = {str(symbol) for symbol in symbols}
             candidate_symbols = (candidate_symbols | requested_symbols) & requested_symbols
@@ -4126,6 +4231,23 @@ def reconcile_portfolio_to_broker(
                 """,
                 (*affected_symbols, "%NotOwned%"),
             )
+            active_statuses = tuple(SELL_RESERVATION_STATUSES | {"waiting_for_market_open"})
+            status_placeholders = ",".join("?" for _ in active_statuses)
+            resolved_connection.execute(
+                f"""
+                UPDATE execution_orders
+                SET status = ?, error_text = ?
+                WHERE symbol IN ({placeholders})
+                  AND strategy_type = 'portfolio_sync'
+                  AND status IN ({status_placeholders})
+                """,
+                (
+                    "cancelled",
+                    "Cancelled because local portfolio was reconciled to Saxo broker holdings.",
+                    *affected_symbols,
+                    *active_statuses,
+                ),
+            )
         aligned_symbols = tuple(symbols)
         if aligned_symbols:
             placeholders = ",".join("?" for _ in aligned_symbols)
@@ -4142,6 +4264,22 @@ def reconcile_portfolio_to_broker(
                   AND error_text NOT LIKE ?
                 """,
                 (*aligned_symbols, "%NotOwned%", "%reconciled to Saxo broker holdings%"),
+            )
+            active_status_placeholders = ",".join("?" for _ in active_statuses)
+            resolved_connection.execute(
+                f"""
+                UPDATE execution_orders
+                SET status = ?, error_text = ?
+                WHERE symbol IN ({placeholders})
+                  AND strategy_type = 'portfolio_sync'
+                  AND status IN ({active_status_placeholders})
+                """,
+                (
+                    "cancelled",
+                    "Cancelled because local portfolio was reconciled to Saxo broker holdings.",
+                    *aligned_symbols,
+                    *active_statuses,
+                ),
             )
 
         append_audit_log(

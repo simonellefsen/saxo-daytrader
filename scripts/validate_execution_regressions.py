@@ -641,6 +641,79 @@ def _assert_flatten_orders_are_capped_to_local_lots(config: dict) -> None:
         connection.close()
 
 
+def _assert_flatten_ignores_local_only_positions_when_broker_snapshot_exists(config: dict) -> None:
+    connection = connect(":memory:")
+    init_db(connection)
+    original_flatten_due = execution_engine._flatten_due_for_symbol
+    execution_engine._flatten_due_for_symbol = lambda _symbol, _config: True
+    try:
+        _seed_batch_and_local_lot(connection, symbol="ARKK:xmil", quantity=160.0)
+        connection.execute(
+            """
+            INSERT INTO broker_position_snapshots (
+                symbol, updated_at, instrument_name, quantity, currency,
+                open_price_local, open_price_including_costs_local, can_be_closed, raw_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "ADI:xnas",
+                "2026-05-04T14:48:00+00:00",
+                "Analog Devices Inc",
+                9,
+                "USD",
+                398.64,
+                398.64,
+                1,
+                "{}",
+            ),
+        )
+        stale_cursor = connection.execute(
+            """
+            INSERT INTO execution_orders (
+                created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+                request_json, execution_result_json, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-05-04T14:45:00+00:00",
+                None,
+                "ARKK:xmil",
+                "SELL",
+                "Market",
+                "live",
+                "pending_execution",
+                "saxo",
+                0.0,
+                160,
+                6.90,
+                None,
+                None,
+                "EUR",
+                8280.0,
+                0,
+                None,
+                "flatten",
+                "session_close",
+                "flatten:ARKK:xmil:test",
+                "flatten_close",
+                "{}",
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+        result = enqueue_session_flatten_orders(config=config, connection=connection)
+        assert result["created_order_ids"] == [], result
+        stale = connection.execute("SELECT status, error_text FROM execution_orders WHERE id = ?", (int(stale_cursor.lastrowid),)).fetchone()
+        assert stale["status"] == "cancelled", dict(stale)
+        assert "no held quantity" in stale["error_text"], dict(stale)
+    finally:
+        execution_engine._flatten_due_for_symbol = original_flatten_due
+        connection.close()
+
+
 def _assert_scoped_reconciliation_restores_residual_broker_position(config: dict) -> None:
     connection = connect(":memory:")
     init_db(connection)
@@ -720,6 +793,42 @@ def _assert_scoped_reconciliation_restores_residual_broker_position(config: dict
                 "{}",
             ),
         )
+        stale_sync_cursor = connection.execute(
+            """
+            INSERT INTO execution_orders (
+                created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+                request_json, execution_result_json, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-05-01T14:47:30+00:00",
+                None,
+                "GN:xcse",
+                "BUY",
+                "Market",
+                "live",
+                "waiting_for_market_open",
+                "saxo",
+                None,
+                87,
+                98.4,
+                None,
+                None,
+                "DKK",
+                8560.8,
+                0,
+                None,
+                "portfolio_sync",
+                "saxo_sim",
+                "portfolio_sync:GN:xcse:test",
+                "increase_to_target",
+                "{}",
+                None,
+                "Exchange closed",
+            ),
+        )
         connection.commit()
 
         before = fetch_portfolio_positions(connection, use_broker_positions=False)
@@ -733,6 +842,9 @@ def _assert_scoped_reconciliation_restores_residual_broker_position(config: dict
         gn_rows = [row for row in after if row["symbol"] == "GN:xcse"]
         assert len(gn_rows) == 1, after
         assert float(gn_rows[0]["quantity"]) == 87.0, gn_rows[0]
+        stale_sync = connection.execute("SELECT status, error_text FROM execution_orders WHERE id = ?", (int(stale_sync_cursor.lastrowid),)).fetchone()
+        assert stale_sync["status"] == "cancelled", dict(stale_sync)
+        assert "reconciled to Saxo broker holdings" in stale_sync["error_text"], dict(stale_sync)
     finally:
         connection.close()
 
@@ -795,6 +907,110 @@ def _assert_portfolio_sync_is_sim_only(config: dict) -> None:
         connection.close()
 
 
+def _assert_portfolio_sync_fills_do_not_mutate_local_ledger(config: dict) -> None:
+    connection = connect(":memory:")
+    init_db(connection)
+    try:
+        connection.execute(
+            """
+            INSERT INTO import_batches (
+                batch_id, imported_at, source_csv, source_position_count,
+                imported_position_count, excluded_position_count, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("sync-baseline", "2026-05-03T08:30:00+00:00", "", 1, 1, 0, "sync baseline"),
+        )
+        connection.execute(
+            """
+            INSERT INTO position_snapshots (
+                batch_id, imported_at, instrument_name, symbol, quantity, currency,
+                open_price_local, current_price_local, cost_basis_local, cost_basis_dkk,
+                market_value_local, market_value_dkk, unrealised_pnl_dkk, source_csv, raw_payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "sync-baseline",
+                "2026-05-03T08:30:00+00:00",
+                "Analog Devices Inc",
+                "ADI:xnas",
+                9,
+                "USD",
+                210.0,
+                210.0,
+                1890.0,
+                12096.0,
+                1890.0,
+                12096.0,
+                0.0,
+                "",
+                "{}",
+            ),
+        )
+        cursor = connection.execute(
+            """
+            INSERT INTO execution_orders (
+                created_at, report_id, symbol, action, order_type, mode, status, adapter,
+                requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+                approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+                request_json, execution_result_json, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "2026-05-03T08:50:16+00:00",
+                None,
+                "ADI:xnas",
+                "BUY",
+                "Market",
+                "live",
+                "broker_fill_unreconciled",
+                "saxo",
+                None,
+                9,
+                398.64,
+                None,
+                None,
+                "USD",
+                22914.0,
+                0,
+                None,
+                "portfolio_sync",
+                "saxo_sim",
+                "portfolio_sync:ADI:xnas:test",
+                "increase_to_target",
+                json.dumps({"strategy_type": "portfolio_sync"}),
+                None,
+                "Previous code failed here with insufficient local cash.",
+            ),
+        )
+        connection.commit()
+
+        order = dict(connection.execute("SELECT * FROM execution_orders WHERE id = ?", (int(cursor.lastrowid),)).fetchone())
+        before_positions = fetch_portfolio_positions(connection, use_broker_positions=False)
+        before_quantity = [row for row in before_positions if row["symbol"] == "ADI:xnas"][0]["quantity"]
+
+        result = _sync_incremental_live_fill(
+            connection,
+            config,
+            order,
+            {"Status": "FinalFill", "SubStatus": "Confirmed", "FilledAmount": 9, "AveragePrice": 398.64},
+            broker_order_id="5038088867",
+            fill_status="FinalFill",
+        )
+        assert result["status"] == "portfolio_sync_broker_fill_synced", result
+        assert result["ledger_id"] is None, result
+        assert result["delta_quantity"] == 9.0, result
+
+        trade_count = connection.execute("SELECT COUNT(*) AS count FROM trade_ledger").fetchone()["count"]
+        assert trade_count == 0, trade_count
+        fill_count = connection.execute("SELECT COUNT(*) AS count FROM execution_fills").fetchone()["count"]
+        assert fill_count == 1, fill_count
+        after_positions = fetch_portfolio_positions(connection, use_broker_positions=False)
+        after_quantity = [row for row in after_positions if row["symbol"] == "ADI:xnas"][0]["quantity"]
+        assert float(after_quantity) == float(before_quantity) == 9.0, after_positions
+    finally:
+        connection.close()
+
+
 def _assert_broker_adoption_is_blocked_in_sim(config: dict) -> None:
     sim_config = json.loads(json.dumps(config))
     sim_config["saxo"]["environment"] = "sim"
@@ -826,11 +1042,13 @@ def main() -> int:
     _assert_realised_daily_pnl_includes_commission()
     _assert_oversized_broker_sell_fill_closes_local_lots(config)
     _assert_flatten_orders_are_capped_to_local_lots(config)
+    _assert_flatten_ignores_local_only_positions_when_broker_snapshot_exists(config)
     _assert_scoped_reconciliation_restores_residual_broker_position(config)
     _assert_portfolio_sync_is_sim_only(config)
+    _assert_portfolio_sync_fills_do_not_mutate_local_ledger(config)
     _assert_broker_adoption_is_blocked_in_sim(config)
     print("Execution regression validation passed.")
-    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, SIM integrity warning suppression, SIM-only portfolio sync guards, and SIM broker-adoption blocking.")
+    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, broker-authoritative flatten guards, SIM integrity warning suppression, SIM-only portfolio sync guards, portfolio-sync fill ledger isolation, and SIM broker-adoption blocking.")
     return 0
 
 
