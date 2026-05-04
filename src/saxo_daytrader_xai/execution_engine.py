@@ -3896,10 +3896,11 @@ def queue_and_maybe_execute_latest_report(
     connection=None,
     create_report_orders: bool = True,
     strategy_orders_override: list[dict[str, Any]] | None = None,
+    report_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
-        report = fetch_latest_decision_report(resolved_connection)
+        report = report_override or fetch_latest_decision_report(resolved_connection)
         orders = []
         if report and report["status"] == "completed" and create_report_orders:
             orders = _create_or_fetch_orders(

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import requests
 
+from saxo_daytrader_xai.analysis_pulses import analysis_pulse_status
 from saxo_daytrader_xai.config import load_config
 from saxo_daytrader_xai.db import (
     append_audit_log,
@@ -23,10 +24,6 @@ from saxo_daytrader_xai.portfolio import fetch_goal_tracking, fetch_latest_batch
 from saxo_daytrader_xai.swing_indicators import fetch_daily_swing_indicators
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report
-
-
-DEFAULT_EU_CODES = {"XCSE", "XSTO", "XOSL", "XHEL", "XLON", "XETR", "XAMS", "XMIL"}
-DEFAULT_US_CODES = {"XNAS", "XNYS"}
 
 
 TRADING_MANAGER_SCHEMA: dict[str, Any] = {
@@ -69,128 +66,6 @@ def _enabled(config: dict[str, Any]) -> bool:
     return bool(_manager_cfg(config).get("enabled", True))
 
 
-def _due_window(config: dict[str, Any]) -> timedelta:
-    minutes = int(_manager_cfg(config).get("due_window_minutes", 20) or 20)
-    return timedelta(minutes=max(minutes, 1))
-
-
-def _exchange_codes(config: dict[str, Any], section: str, defaults: set[str]) -> set[str]:
-    cfg = _manager_cfg(config).get(section, {})
-    return {str(code).upper() for code in cfg.get("exchange_codes", sorted(defaults))}
-
-
-def _parse_utc(value: Any) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value)).astimezone(UTC)
-    except ValueError:
-        return None
-
-
-def _pulse_row(
-    *,
-    kind: str,
-    label: str,
-    target_at_utc: datetime,
-    now: datetime,
-    source_markets: list[str],
-    exchange_codes: list[str],
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    window_end = target_at_utc + _due_window(config)
-    return {
-        "key": f"{kind}:{target_at_utc.date().isoformat()}:{target_at_utc.strftime('%H%M')}",
-        "kind": kind,
-        "label": label,
-        "target_at_utc": target_at_utc.isoformat(timespec="seconds"),
-        "window_end_at_utc": window_end.isoformat(timespec="seconds"),
-        "due": target_at_utc <= now < window_end,
-        "source_markets": source_markets,
-        "exchange_codes": exchange_codes,
-    }
-
-
-def _group_targets(
-    *,
-    config: dict[str, Any],
-    market_status_rows: list[dict[str, Any]],
-    kind: str,
-    label: str,
-    codes: set[str],
-    offset_minutes: int,
-    anchor_key: str,
-    now: datetime,
-) -> list[dict[str, Any]]:
-    grouped: dict[datetime, list[dict[str, Any]]] = {}
-    for row in market_status_rows:
-        code = str(row.get("code") or "").upper()
-        if code not in codes or row.get("holiday_name"):
-            continue
-        anchor = _parse_utc(row.get(anchor_key))
-        tradable_close = _parse_utc(row.get("tradable_close_at_utc"))
-        if anchor is None or tradable_close is None:
-            continue
-        target = anchor + timedelta(minutes=offset_minutes)
-        if target >= tradable_close:
-            continue
-        if now >= target + _due_window(config):
-            continue
-        grouped.setdefault(target, []).append(row)
-    pulses: list[dict[str, Any]] = []
-    for target, rows in grouped.items():
-        pulses.append(
-            _pulse_row(
-                kind=kind,
-                label=label,
-                target_at_utc=target,
-                now=now,
-                source_markets=sorted({str(row.get("market") or row.get("code")) for row in rows}),
-                exchange_codes=sorted({str(row.get("code") or "").upper() for row in rows}),
-                config=config,
-            )
-        )
-    return pulses
-
-
-def _close_targets(
-    *,
-    config: dict[str, Any],
-    market_status_rows: list[dict[str, Any]],
-    now: datetime,
-) -> list[dict[str, Any]]:
-    cfg = _manager_cfg(config).get("close_rotation", {})
-    if not bool(cfg.get("enabled", True)):
-        return []
-    minutes_before = int(cfg.get("minutes_before_tradable_close", 30) or 30)
-    codes = _exchange_codes(config, "close_rotation", DEFAULT_EU_CODES)
-    grouped: dict[datetime, list[dict[str, Any]]] = {}
-    for row in market_status_rows:
-        code = str(row.get("code") or "").upper()
-        if code not in codes or row.get("holiday_name"):
-            continue
-        tradable_close = _parse_utc(row.get("tradable_close_at_utc"))
-        session_open = _parse_utc(row.get("session_open_at_utc"))
-        if tradable_close is None or session_open is None:
-            continue
-        target = tradable_close - timedelta(minutes=minutes_before)
-        if target <= session_open or now >= target + _due_window(config):
-            continue
-        grouped.setdefault(target, []).append(row)
-    return [
-        _pulse_row(
-            kind="close_rotation",
-            label="Pre-close Trading Manager",
-            target_at_utc=target,
-            now=now,
-            source_markets=sorted({str(row.get("market") or row.get("code")) for row in rows}),
-            exchange_codes=sorted({str(row.get("code") or "").upper() for row in rows}),
-            config=config,
-        )
-        for target, rows in grouped.items()
-    ]
-
-
 def trading_manager_status(
     config: dict[str, Any],
     market_status_rows: list[dict[str, Any]] | None = None,
@@ -209,36 +84,15 @@ def trading_manager_status(
             "next_pulse_label": None,
         }
     rows = market_status_rows or get_market_status(config, reference_time=now)
-    pulses: list[dict[str, Any]] = []
-    open_cfg = _manager_cfg(config).get("open_followup", {})
-    if bool(open_cfg.get("enabled", True)):
-        pulses.extend(
-            _group_targets(
-                config=config,
-                market_status_rows=rows,
-                kind="open_followup",
-                label="Open +1h Trading Manager",
-                codes=_exchange_codes(config, "open_followup", DEFAULT_EU_CODES),
-                offset_minutes=int(open_cfg.get("minutes_after_open", 60) or 60),
-                anchor_key="session_open_at_utc",
-                now=now,
-            )
-        )
-    pulses.extend(_close_targets(config=config, market_status_rows=rows, now=now))
-    us_cfg = _manager_cfg(config).get("us_open_followup", {})
-    if bool(us_cfg.get("enabled", True)):
-        pulses.extend(
-            _group_targets(
-                config=config,
-                market_status_rows=rows,
-                kind="us_open_followup",
-                label="US Open +1h Trading Manager",
-                codes=_exchange_codes(config, "us_open_followup", DEFAULT_US_CODES),
-                offset_minutes=int(us_cfg.get("minutes_after_open", 60) or 60),
-                anchor_key="session_open_at_utc",
-                now=now,
-            )
-        )
+    decision_pulse_summary = analysis_pulse_status(config, rows, reference_time=now)
+    pulses = [
+        {
+            **pulse,
+            "label": str(pulse.get("label") or "Decision Report").replace("Decision Report", "Trading Manager"),
+            "decision_pulse_key": pulse.get("key"),
+        }
+        for pulse in decision_pulse_summary.get("pulses", [])
+    ]
     pulses = sorted(pulses, key=lambda pulse: str(pulse["target_at_utc"]))
     active_pulses = [pulse for pulse in pulses if pulse["due"]]
     future_pulses = [
@@ -267,6 +121,44 @@ def should_auto_run_trading_manager(
 ) -> bool:
     status = trading_manager_status(config, market_status_rows, reference_time=reference_time)
     return any(not has_trading_manager_run(connection, str(pulse["key"])) for pulse in status["active_pulses"])
+
+
+def _decode_decision_report(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    item = dict(row)
+    item["request_json"] = json.loads(item["request_json"]) if item.get("request_json") else None
+    item["response_json"] = json.loads(item["response_json"]) if item.get("response_json") else None
+    item["report_json"] = json.loads(item["report_json"]) if item.get("report_json") else None
+    return item
+
+
+def _completed_decision_report_for_pulse(connection, pulse_key: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM decision_reports
+        WHERE analysis_pulse_key = ?
+          AND status = 'completed'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (pulse_key,),
+    ).fetchone()
+    return _decode_decision_report(dict(row) if row else None)
+
+
+def _manager_pulse_from_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    report_json = report.get("report_json") or {}
+    pulse = report_json.get("analysis_pulse") or {}
+    if not pulse.get("key"):
+        return None
+    return {
+        **pulse,
+        "label": str(pulse.get("label") or "Decision Report").replace("Decision Report", "Trading Manager"),
+        "decision_pulse_key": pulse.get("key"),
+        "due": True,
+    }
 
 
 def _extract_output_text(response_json: dict[str, Any]) -> str:
@@ -452,6 +344,7 @@ def run_trading_manager_cycle(
     config: dict[str, Any] | None = None,
     connection=None,
     market_status_rows: list[dict[str, Any]] | None = None,
+    reference_time: datetime | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     resolved_config = config or _load_default_config()
@@ -459,19 +352,29 @@ def run_trading_manager_cycle(
     init_db(resolved_connection)
     should_close = connection is None
     try:
-        market_rows = market_status_rows or get_market_status(resolved_config)
-        status = trading_manager_status(resolved_config, market_rows)
-        due_pulses = status["active_pulses"] if not force else (status["active_pulses"] or status["pulses"][:1])
-        runnable = [pulse for pulse in due_pulses if force or not has_trading_manager_run(resolved_connection, str(pulse["key"]))]
+        now = (reference_time or datetime.now(UTC)).astimezone(UTC)
+        market_rows = market_status_rows or get_market_status(resolved_config, reference_time=now)
+        status = trading_manager_status(resolved_config, market_rows, reference_time=now)
+        latest_report = fetch_latest_decision_report(resolved_connection)
+        if latest_report and str(latest_report.get("status") or "") != "completed":
+            latest_report = None
+        report_pulse = _manager_pulse_from_report(latest_report) if latest_report else None
+        due_pulses = list(status["active_pulses"])
+        if report_pulse and all(str(pulse.get("key")) != str(report_pulse.get("key")) for pulse in due_pulses):
+            due_pulses.append(report_pulse)
+        if force and not due_pulses:
+            due_pulses = [report_pulse] if report_pulse else status["pulses"][:1]
+        runnable = [pulse for pulse in due_pulses if pulse and (force or not has_trading_manager_run(resolved_connection, str(pulse["key"])))]
         if not runnable:
             return {"status": "not_due", "manager_status": status}
 
-        report = fetch_latest_decision_report(resolved_connection)
-        if not report or report.get("status") != "completed":
-            return {"status": "skipped_no_completed_report", "manager_status": status}
-
         results: list[dict[str, Any]] = []
         for pulse in runnable:
+            decision_pulse_key = str(pulse.get("decision_pulse_key") or pulse.get("key") or "")
+            report = _completed_decision_report_for_pulse(resolved_connection, decision_pulse_key) if decision_pulse_key else None
+            if not report:
+                results.append({"status": "skipped_no_completed_report", "pulse": pulse})
+                continue
             exchange_codes = {str(code).upper() for code in pulse.get("exchange_codes", [])}
             open_codes = {
                 str(row.get("code") or "").upper()
@@ -537,6 +440,7 @@ def run_trading_manager_cycle(
                 connection=resolved_connection,
                 create_report_orders=True,
                 strategy_orders_override=manager_decision["approved_orders"],
+                report_override=report,
             )
             manager_payload = {
                 "summary": (ai_payload or {}).get("summary") or "Trading Manager used deterministic technical execution gates.",
@@ -572,6 +476,12 @@ def run_trading_manager_cycle(
                     "queue": queue_result,
                 }
             )
+        if results and all(str(result.get("status")) == "skipped_no_completed_report" for result in results):
+            return {
+                "status": "skipped_no_completed_report",
+                "manager_status": status,
+                "skipped_pulses": [result["pulse"] for result in results],
+            }
         return {"status": "ok", "manager_status": status, "runs": results}
     finally:
         if should_close:

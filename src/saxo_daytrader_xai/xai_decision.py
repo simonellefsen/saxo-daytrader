@@ -232,9 +232,9 @@ def _exchange_holiday_codes(market_status_rows: list[dict[str, Any]]) -> set[str
 
 def _pulse_category_keys(active_pulse: dict[str, Any] | None) -> set[str]:
     kind = str((active_pulse or {}).get("kind") or "")
-    if kind == "morning_macro":
+    if kind == "europe_open_followup":
         return {"nordic", "uk", "eu"}
-    if kind in {"pre_eu_close", "pre_us_close"}:
+    if kind == "us_open_followup":
         return {"us"}
     return {"nordic", "uk", "us", "eu"}
 
@@ -285,7 +285,7 @@ def _filter_positions_for_pulse(
     positions: list[dict[str, Any]],
     active_pulse: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    if str((active_pulse or {}).get("kind") or "") != "morning_macro":
+    if str((active_pulse or {}).get("kind") or "") != "europe_open_followup":
         return positions
     return [
         row for row in positions
@@ -438,7 +438,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
             "pulse_kind": str((active_pulse or {}).get("kind") or "manual"),
             "included_categories": sorted(_pulse_category_keys(active_pulse)),
             "holiday_excluded_exchange_codes": sorted(_exchange_holiday_codes(market_status_rows)),
-            "portfolio_scope": "exclude_us" if str((active_pulse or {}).get("kind") or "") == "morning_macro" else "all",
+            "portfolio_scope": "exclude_us" if str((active_pulse or {}).get("kind") or "") == "europe_open_followup" else "all",
         },
         "goal_tracking": goal_tracking,
         "broker_account": broker_account,
@@ -473,7 +473,7 @@ Hard rules:
 - Treat all pnl, commission, and taxation impacts in DKK.
 - Prefer liquid, news-catalyst-driven names in Nordic, EU/Euronext, UK, and US markets.
 - Only propose holdings you would actually want to own tomorrow morning.
-- Respect the supplied analysis_universe constraints: morning macro excludes US watchlist/US portfolio exposure, US-focused pulses use the US watchlist, and holiday exchange codes are out of scope.
+- Respect the supplied analysis_universe constraints: the Nordic/EU open report excludes US watchlist/US portfolio exposure, the US open report uses the US watchlist, and holiday exchange codes are out of scope.
 
 Output requirements:
 - Return only structured data conforming to the provided schema.
@@ -517,7 +517,7 @@ Recent strategy journal learnings JSON:
 {json.dumps(context['journal_learnings'], ensure_ascii=False, indent=2)}
 
 Task:
-1. Identify whether this is the morning macro pulse, pre-EU close pulse, pre-US close pulse, or a manual analysis.
+1. Identify whether this is the Nordic/EU open +1h15 report, US open +1h15 report, or a manual analysis.
 2. Synthesize Asia, macro, geopolitical, earnings, commodities, crypto, and US setup into one actionable market view.
 3. Apply that view to the current Watchlist and current Portfolio using symbol_sentiment with exactly SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
 4. Return a candidate asset pool of high-conviction liquid names only; candidate_assets is the upstream idea list, not final execution.

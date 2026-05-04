@@ -123,16 +123,13 @@ strategy:
     analysis_pulses:
       timezone: Europe/Copenhagen
       due_window_minutes: 20
-      morning_macro:
+      europe_open_followup:
         enabled: true
-        time: "08:00"
-      pre_eu_close:
-        enabled: true
-        minutes_before_close: 120
+        minutes_after_open: 75
         exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XFRA, XMIL, XAMS]
-      pre_us_close:
+      us_open_followup:
         enabled: true
-        minutes_before_close: 60
+        minutes_after_open: 75
         exchange_codes: [XNAS, XNYS]
   ladder:
     rung_count: 5

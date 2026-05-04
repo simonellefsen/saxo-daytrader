@@ -102,18 +102,6 @@ strategy:
       use_ai: true
       due_window_minutes: 20
       max_symbols: 30
-      open_followup:
-        enabled: true
-        minutes_after_open: 60
-        exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XAMS, XMIL]
-      close_rotation:
-        enabled: true
-        minutes_before_tradable_close: 30
-        exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XAMS, XMIL]
-      us_open_followup:
-        enabled: true
-        minutes_after_open: 60
-        exchange_codes: [XNAS, XNYS]
     journal:
       enabled: true
       timezone: Europe/Copenhagen
@@ -138,16 +126,13 @@ strategy:
     analysis_pulses:
       timezone: Europe/Copenhagen
       due_window_minutes: 20
-      morning_macro:
+      europe_open_followup:
         enabled: true
-        time: "08:00"
-      pre_eu_close:
-        enabled: true
-        minutes_before_close: 120
+        minutes_after_open: 75
         exchange_codes: [XCSE, XSTO, XOSL, XHEL, XLON, XETR, XFRA, XMIL, XAMS]
-      pre_us_close:
+      us_open_followup:
         enabled: true
-        minutes_before_close: 60
+        minutes_after_open: 75
         exchange_codes: [XNAS, XNYS]
   ladder:
     rung_count: 5

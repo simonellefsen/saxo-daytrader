@@ -291,7 +291,7 @@ Example: with `offset_minutes_after_open: 30` and `duration_minutes: 0`, a marke
 - `swing.never_trade_symbols`: hard blacklist. Defaults include `NOVOb:xcse` and `TSLA:xnas`.
 - `swing.daily_indicators`: daily-chart MA/MACD/RSI/Bollinger/Stochastic/Volume confluence settings used to filter swing entries.
 - `swing.journal`: daily/weekly/monthly learning journal cadence used to feed recent lessons back into decision prompts.
-- `swing.analysis_pulses`: timezone-aware daily analysis triggers for morning macro, pre-EU close, and pre-US close.
+- `swing.analysis_pulses`: timezone-aware daily decision triggers for the Nordic/EU open +1h15 report and the US open +1h15 report.
 - `ladder.*`: legacy rung count, ATR spacing, stop/take-profit multiples, per-position weights, flatten timing, and trailing-stop behavior used only when `mode: ladder`.
 
 ### `execution`

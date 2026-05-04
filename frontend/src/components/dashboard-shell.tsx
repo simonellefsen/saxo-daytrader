@@ -1361,8 +1361,8 @@ export function DashboardShell() {
             </article>
             <article className="mini-card">
               <div className="label">Report Cadence</div>
-              <div className="value">{overview.data?.refresh?.decision_cadence_label ?? "3 daily pulses"}</div>
-              <div className="subvalue">Morning, pre-EU close, and pre-US close</div>
+              <div className="value">{overview.data?.refresh?.decision_cadence_label ?? "2 daily reports"}</div>
+              <div className="subvalue">Nordic/EU +1h15 and US +1h15</div>
             </article>
             <article className="mini-card">
               <div className="label">Trading Manager</div>

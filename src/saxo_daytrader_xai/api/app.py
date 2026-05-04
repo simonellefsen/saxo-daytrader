@@ -814,8 +814,8 @@ def create_app(config_path: str | None = None) -> FastAPI:
                 "refresh": {
                     "price_poll_interval_minutes": int(config.get("price_monitor", {}).get("poll_interval_minutes", 1)),
                     "scheduler_poll_interval_minutes": int(config.get("scheduler", {}).get("poll_interval_minutes", 10)),
-                    "decision_cadence": "three_daily_pulses",
-                    "decision_cadence_label": "3 daily pulses",
+                    "decision_cadence": "two_daily_open_followups",
+                    "decision_cadence_label": "2 daily reports",
                     "decision_pulses": pulse_summary.get("pulses", []),
                     "next_decision_pulse_at": pulse_summary.get("next_pulse_at"),
                     "next_decision_pulse_label": pulse_summary.get("next_pulse_label"),
