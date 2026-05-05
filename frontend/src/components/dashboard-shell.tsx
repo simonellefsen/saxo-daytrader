@@ -26,7 +26,7 @@ import { LadderVisualizer } from "@/components/ladder-visualizer";
 import { LineChart } from "@/components/line-chart";
 import { Sparkline } from "@/components/sparkline";
 
-type TabKey = "portfolio" | "performance" | "market" | "watchlist" | "decision" | "execution";
+type TabKey = "portfolio" | "performance" | "market" | "watchlist" | "decision" | "journal" | "execution";
 
 type AuthSession = {
   authenticated: boolean;
@@ -52,6 +52,7 @@ const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
   { key: "market", label: "Market Status" },
   { key: "watchlist", label: "Watchlist" },
   { key: "decision", label: "Decision Report" },
+  { key: "journal", label: "EOD Diary" },
   { key: "execution", label: "Execution" },
 ];
 
@@ -88,6 +89,11 @@ function listPreview(value: unknown): string {
     return "n/a";
   }
   return value.slice(0, 3).map((item) => String(item)).join("; ");
+}
+
+function stringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item)).filter(Boolean);
 }
 
 function cashBufferDecimals(value: number): number {
@@ -622,6 +628,7 @@ export function DashboardShell() {
   const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
   const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
   const [selectedDecisionId, setSelectedDecisionId] = useState<number | null>(null);
+  const [selectedJournalId, setSelectedJournalId] = useState<number | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string>("");
   const [statusDetails, setStatusDetails] = useState<string>("");
@@ -713,7 +720,7 @@ export function DashboardShell() {
     { refreshInterval: 60_000 },
   );
   const strategyJournal = useSWR<StrategyJournalResponse>(
-    activeTab === "decision" ? "/api/strategy-journal?limit=5" : null,
+    activeTab === "decision" || activeTab === "journal" ? "/api/strategy-journal?limit=20" : null,
     getFetcher,
     { refreshInterval: 300_000 },
   );
@@ -816,6 +823,7 @@ export function DashboardShell() {
     activeTab === "market" ? market.error : null,
     activeTab === "watchlist" ? watchlists.error : null,
     activeTab === "decision" ? decision.error || decisionHistory.error : null,
+    activeTab === "journal" ? strategyJournal.error : null,
     activeTab === "execution" ? execution.error || scheduler.error : null,
   ].find(Boolean);
   const backendErrorMessage =
@@ -859,6 +867,7 @@ export function DashboardShell() {
   const latestDecision = decision.data?.report;
   const nextDecision = decision.data?.next_report ?? null;
   const decisionHistoryItems = decisionHistory.data?.items ?? [];
+  const strategyJournalItems = strategyJournal.data?.items ?? [];
   const dailyOrderCapacity = overview.data?.execution?.daily_order_capacity;
   const displayedDecision = useMemo(() => {
     if (selectedDecisionId !== null) {
@@ -881,8 +890,20 @@ export function DashboardShell() {
   const ladderOrders = Array.isArray(strategyPlan.ladder_orders) ? (strategyPlan.ladder_orders as Array<Record<string, unknown>>) : [];
   const cashManagement = (displayedDecision?.report_json?.cash_management ?? {}) as Record<string, unknown>;
   const goalTracking = (performance.data?.goal_tracking ?? overview.data?.goal_tracking ?? {}) as Record<string, any>;
-  const latestJournal = strategyJournal.data?.items?.[0] ?? null;
+  const latestJournal = strategyJournalItems[0] ?? null;
   const latestJournalBenchmarks = (latestJournal?.metrics_json?.benchmark_indices?.regions ?? {}) as Record<string, any>;
+  const displayedJournal = useMemo(() => {
+    if (selectedJournalId !== null) {
+      const selected = strategyJournalItems.find((row) => Number(row.id) === selectedJournalId);
+      if (selected) return selected;
+    }
+    return latestJournal;
+  }, [latestJournal, selectedJournalId, strategyJournalItems]);
+  const displayedDiaryEnvelope = (displayedJournal?.diary_json ?? {}) as Record<string, any>;
+  const displayedDiary = (displayedDiaryEnvelope.diary ?? displayedDiaryEnvelope ?? {}) as Record<string, any>;
+  const displayedJournalMetrics = (displayedJournal?.metrics_json ?? {}) as Record<string, any>;
+  const displayedJournalBenchmarks = (displayedJournalMetrics.benchmark_indices?.regions ?? {}) as Record<string, any>;
+  const displayedJournalLearnings = stringList(displayedJournal?.learnings_json);
   const tradingManager = (overview.data?.trading_manager ?? {}) as Record<string, any>;
   const tradingManagerStatus = (tradingManager.status ?? {}) as Record<string, any>;
   const latestTradingManagerRun = (tradingManager.latest_run ?? null) as Record<string, any> | null;
@@ -957,6 +978,21 @@ export function DashboardShell() {
       setSelectedDecisionId(fallbackId || null);
     }
   }, [decisionHistoryItems, latestDecision, selectedDecisionId]);
+
+  useEffect(() => {
+    if (!strategyJournalItems.length) {
+      setSelectedJournalId(null);
+      return;
+    }
+    if (selectedJournalId === null) {
+      setSelectedJournalId(Number(strategyJournalItems[0]?.id ?? 0) || null);
+      return;
+    }
+    const existsInHistory = strategyJournalItems.some((row) => Number(row.id) === selectedJournalId);
+    if (!existsInHistory) {
+      setSelectedJournalId(Number(strategyJournalItems[0]?.id ?? 0) || null);
+    }
+  }, [selectedJournalId, strategyJournalItems]);
 
   const executionOrders = execution.data?.orders ?? [];
   const manageableOrders = executionOrders.filter((row) =>
@@ -1530,6 +1566,155 @@ export function DashboardShell() {
               <pre className="code-block">{JSON.stringify(displayedDecision?.report_json ?? {}, null, 2)}</pre>
             </details>
           </div>
+        </section>
+      ) : null}
+
+      {activeTab === "journal" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>End-of-Day Diary</h2>
+              <p>xAI performance review, benchmark comparison, and lessons carried into future Decision Reports.</p>
+            </div>
+          </div>
+          {displayedJournal ? (
+            <>
+              <div className="mini-grid">
+                <article className="mini-card">
+                  <div className="label">Journal Date</div>
+                  <div className="value">{String(displayedJournal.journal_date ?? "n/a")}</div>
+                  <div className="subvalue">{String(displayedJournal.cadence ?? "daily")} · {formatTimestamp(displayedJournal.created_at)}</div>
+                </article>
+                <article className="mini-card">
+                  <div className="label">Diary Status</div>
+                  <div className="value">{String(displayedJournalMetrics.diary_status ?? displayedDiaryEnvelope.status ?? "stored")}</div>
+                  <div className="subvalue">Source report #{String(displayedJournal.source_report_id ?? "n/a")}</div>
+                </article>
+                <article className="mini-card">
+                  <div className="label">Closed Trades</div>
+                  <div className="value">{formatNumber(displayedJournalMetrics.trade_count ?? 0, 0)}</div>
+                  <div className="subvalue">Realised {formatDkk(displayedJournalMetrics.realised_gain_dkk)}</div>
+                </article>
+                <article className="mini-card">
+                  <div className="label">Week / Month</div>
+                  <div className={`value ${signedClass(displayedJournalMetrics.goal_tracking?.periods?.week?.pnl_dkk)}`}>
+                    {formatDkk(displayedJournalMetrics.goal_tracking?.periods?.week?.pnl_dkk)}
+                  </div>
+                  <div className="subvalue">Month {formatDkk(displayedJournalMetrics.goal_tracking?.periods?.month?.pnl_dkk)}</div>
+                </article>
+              </div>
+              <div className="grid-2">
+                <div className="stack">
+                  <article className="mini-card">
+                    <div className="label">Diary</div>
+                    <div className="value">{String(displayedDiary.executive_summary ?? displayedJournal.summary ?? "n/a")}</div>
+                  </article>
+                  <div className="mini-grid">
+                    <article className="mini-card">
+                      <div className="label">What Went Well</div>
+                      {stringList(displayedDiary.what_went_well).length ? (
+                        stringList(displayedDiary.what_went_well).map((item) => <p className="muted" key={item}>{item}</p>)
+                      ) : (
+                        <p className="muted">No positives recorded.</p>
+                      )}
+                    </article>
+                    <article className="mini-card">
+                      <div className="label">What Did Not Work</div>
+                      {stringList(displayedDiary.what_went_wrong).length ? (
+                        stringList(displayedDiary.what_went_wrong).map((item) => <p className="muted" key={item}>{item}</p>)
+                      ) : (
+                        <p className="muted">No failures recorded.</p>
+                      )}
+                    </article>
+                    <article className="mini-card">
+                      <div className="label">Next Session Adjustments</div>
+                      {stringList(displayedDiary.next_session_adjustments).length ? (
+                        stringList(displayedDiary.next_session_adjustments).map((item) => <p className="muted" key={item}>{item}</p>)
+                      ) : (
+                        <p className="muted">No adjustments recorded.</p>
+                      )}
+                    </article>
+                    <article className="mini-card">
+                      <div className="label">Decision Report Memory</div>
+                      {displayedJournalLearnings.length ? (
+                        displayedJournalLearnings.map((item) => <p className="muted" key={item}>{item}</p>)
+                      ) : (
+                        <p className="muted">No learnings recorded.</p>
+                      )}
+                    </article>
+                  </div>
+                  <article className="mini-card">
+                    <div className="label">Benchmark Readthrough</div>
+                    <p>{String(displayedDiary.benchmark_readthrough ?? "n/a")}</p>
+                  </article>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Region</th>
+                          <th>Average</th>
+                          <th>Indices</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(displayedJournalBenchmarks).map(([region, payload]) => (
+                          <tr key={region}>
+                            <td>{region}</td>
+                            <td className={signedClass(payload?.average_change_pct)}>{formatPercent(payload?.average_change_pct)}</td>
+                            <td className="wrap-cell">
+                              {Array.isArray(payload?.items)
+                                ? payload.items
+                                    .map((item: Record<string, any>) => `${String(item.name ?? item.ticker)} ${formatPercent(item.change_pct)}`)
+                                    .join(" · ")
+                                : "n/a"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div className="stack">
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Date</th>
+                          <th>Cadence</th>
+                          <th>Summary</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {strategyJournalItems.map((row) => {
+                          const isActive = Number(row.id) === selectedJournalId;
+                          return (
+                            <tr
+                              key={String(row.id)}
+                              className={`history-row ${isActive ? "active" : ""}`}
+                              onClick={() => setSelectedJournalId(Number(row.id))}
+                            >
+                              <td>{String(row.journal_date ?? "")}</td>
+                              <td>{String(row.cadence ?? "")}</td>
+                              <td className="wrap-cell">{String(row.summary ?? "")}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <details className="json-details">
+                    <summary>Diary JSON</summary>
+                    <pre className="code-block">{JSON.stringify(displayedJournal ?? {}, null, 2)}</pre>
+                  </details>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="empty-state">
+              <strong>No end-of-day diary exists yet.</strong>
+              <span>The scheduler creates one after the configured daily journal time.</span>
+            </div>
+          )}
         </section>
       ) : null}
 

@@ -697,6 +697,7 @@ def init_db(connection: sqlite3.Connection) -> None:
     _ensure_column(connection, "execution_orders", "strategy_role", "TEXT")
     _ensure_column(connection, "decision_reports", "analysis_pulse_key", "TEXT")
     _ensure_column(connection, "decision_reports", "analysis_pulse_label", "TEXT")
+    _ensure_column(connection, "strategy_journal_entries", "diary_json", "TEXT")
     for table_name in (
         "import_batches",
         "position_snapshots",

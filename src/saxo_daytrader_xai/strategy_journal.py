@@ -6,8 +6,36 @@ from datetime import UTC, datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import requests
+
 from saxo_daytrader_xai.market_benchmarks import fetch_benchmark_index_snapshot
 from saxo_daytrader_xai.portfolio import fetch_goal_tracking
+
+
+DIARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "executive_summary": {"type": "string"},
+        "what_went_well": {"type": "array", "items": {"type": "string"}},
+        "what_went_wrong": {"type": "array", "items": {"type": "string"}},
+        "missed_opportunities": {"type": "array", "items": {"type": "string"}},
+        "risk_notes": {"type": "array", "items": {"type": "string"}},
+        "benchmark_readthrough": {"type": "string"},
+        "next_session_adjustments": {"type": "array", "items": {"type": "string"}},
+        "decision_report_instructions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "executive_summary",
+        "what_went_well",
+        "what_went_wrong",
+        "missed_opportunities",
+        "risk_notes",
+        "benchmark_readthrough",
+        "next_session_adjustments",
+        "decision_report_instructions",
+    ],
+    "additionalProperties": False,
+}
 
 
 def _journal_cfg(config: dict[str, Any]) -> dict[str, Any]:
@@ -53,6 +81,7 @@ def fetch_recent_journal_learnings(connection, limit: int = 6) -> list[dict[str,
         item = dict(row)
         item["metrics_json"] = json.loads(item["metrics_json"]) if item.get("metrics_json") else {}
         item["learnings_json"] = json.loads(item["learnings_json"]) if item.get("learnings_json") else []
+        item["diary_json"] = json.loads(item["diary_json"]) if item.get("diary_json") else None
         output.append(item)
     return output
 
@@ -72,6 +101,7 @@ def fetch_strategy_journal_entries(connection, limit: int = 20) -> list[dict[str
         item = dict(row)
         item["metrics_json"] = json.loads(item["metrics_json"]) if item.get("metrics_json") else {}
         item["learnings_json"] = json.loads(item["learnings_json"]) if item.get("learnings_json") else []
+        item["diary_json"] = json.loads(item["diary_json"]) if item.get("diary_json") else None
         output.append(item)
     return output
 
@@ -79,7 +109,7 @@ def fetch_strategy_journal_entries(connection, limit: int = 20) -> list[dict[str
 def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, reference_time: datetime | None = None) -> dict[str, Any]:
     report_rows = connection.execute(
         """
-        SELECT id, report_json
+        SELECT id, created_at, status, analysis_pulse_key, analysis_pulse_label, report_json
         FROM decision_reports
         WHERE report_date >= ?
         ORDER BY id DESC
@@ -90,6 +120,7 @@ def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, re
     suggested_trades = 0
     swing_orders = 0
     strategy_statuses: list[str] = []
+    report_summaries: list[dict[str, Any]] = []
     source_report_id = None
     for row in report_rows:
         source_report_id = source_report_id or int(row["id"])
@@ -99,6 +130,21 @@ def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, re
         swing_orders += len(strategy_plan.get("swing_orders") or [])
         if strategy_plan.get("status"):
             strategy_statuses.append(str(strategy_plan["status"]))
+        report_summaries.append(
+            {
+                "id": int(row["id"]),
+                "created_at": row.get("created_at"),
+                "status": row.get("status"),
+                "pulse_key": row.get("analysis_pulse_key"),
+                "pulse_label": row.get("analysis_pulse_label"),
+                "suggested_trade_count": len(report_json.get("suggested_trades") or []),
+                "swing_order_count": len(strategy_plan.get("swing_orders") or []),
+                "strategy_status": strategy_plan.get("status"),
+                "market_regime": report_json.get("market_regime"),
+                "portfolio_assessment": report_json.get("portfolio_assessment"),
+                "execution_notes": report_json.get("execution_notes"),
+            }
+        )
     execution_rows = connection.execute(
         """
         SELECT status, COUNT(*) AS count
@@ -118,6 +164,41 @@ def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, re
         """,
         (since_date,),
     ).fetchone()
+    trade_rows = connection.execute(
+        """
+        SELECT id, created_at, symbol, side, quantity, price_local, currency,
+               gross_amount_dkk, commission_dkk, tax_dkk, net_amount_dkk,
+               mode, status, notes
+        FROM trade_ledger
+        WHERE created_at >= ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 50
+        """,
+        (since_date,),
+    ).fetchall()
+    order_rows = connection.execute(
+        """
+        SELECT id, created_at, report_id, symbol, action, order_type, mode, status,
+               quantity, price_local, currency, estimated_value_dkk, strategy_type,
+               strategy_session, strategy_role, error_text
+        FROM execution_orders
+        WHERE created_at >= ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 80
+        """,
+        (since_date,),
+    ).fetchall()
+    manager_rows = connection.execute(
+        """
+        SELECT id, created_at, manager_key, manager_label, report_id, status,
+               open_exchange_codes_json, manager_json, error_text
+        FROM trading_manager_runs
+        WHERE created_at >= ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 20
+        """,
+        (since_date,),
+    ).fetchall()
     goal_tracking = fetch_goal_tracking(connection, config, reference_time=reference_time)
     benchmark_indices = fetch_benchmark_index_snapshot(
         config,
@@ -128,9 +209,20 @@ def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, re
         "suggested_trade_count": suggested_trades,
         "swing_order_count": swing_orders,
         "strategy_statuses": strategy_statuses[:5],
+        "decision_reports": report_summaries[:10],
         "execution_status_counts": {str(row["status"]): int(row["count"]) for row in execution_rows},
         "trade_count": int(ledger_row["trade_count"] if ledger_row else 0),
         "realised_gain_dkk": float(ledger_row["realised_gain_dkk"] if ledger_row else 0.0),
+        "trades": [dict(row) for row in trade_rows],
+        "execution_orders": [dict(row) for row in order_rows],
+        "trading_manager_runs": [
+            {
+                **dict(row),
+                "open_exchange_codes": json.loads(row["open_exchange_codes_json"]) if row.get("open_exchange_codes_json") else [],
+                "manager": json.loads(row["manager_json"]) if row.get("manager_json") else {},
+            }
+            for row in manager_rows
+        ],
         "goal_tracking": goal_tracking,
         "benchmark_indices": benchmark_indices,
         "source_report_id": source_report_id,
@@ -176,6 +268,97 @@ def _learning_points(metrics: dict[str, Any]) -> list[str]:
     return learnings
 
 
+def _extract_output_text(response_json: dict[str, Any]) -> str:
+    for item in response_json.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                return str(content.get("text") or "")
+    return ""
+
+
+def _request_xai_diary(config: dict[str, Any], *, cadence: str, metrics: dict[str, Any], fallback_learnings: list[str]) -> dict[str, Any]:
+    api_key = config.get("xai", {}).get("api_key")
+    if not api_key:
+        raise ValueError("XAI_API_KEY is missing")
+    prompt = {
+        "cadence": cadence,
+        "performance_metrics": metrics,
+        "deterministic_learnings": fallback_learnings,
+        "instruction": (
+            "Write an end-of-day trading diary for the operator and for future decision reports. "
+            "Be specific about what worked, what failed, whether trades aligned with the Decision Reports, "
+            "how the portfolio performed versus UK/EU/Nordic/US benchmark indices, and what the next "
+            "Decision Report should remember. Do not invent trades that are not in the metrics payload."
+        ),
+    }
+    request_json = {
+        "model": config["xai"]["model"],
+        "input": [
+            {
+                "role": "system",
+                "content": "You are the trading diary reviewer. Return strict JSON only.",
+            },
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, indent=2, default=str)},
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "strategy_diary",
+                "schema": DIARY_SCHEMA,
+                "strict": True,
+            }
+        },
+    }
+    response = requests.post(
+        f"{config['xai']['base_url'].rstrip('/')}/responses",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=request_json,
+        timeout=int(config["xai"].get("timeout_seconds", 120)),
+    )
+    response.raise_for_status()
+    response_json = response.json()
+    output_text = _extract_output_text(response_json)
+    if not output_text:
+        raise ValueError("xAI diary response did not contain structured output text")
+    return {
+        "status": "xai_completed",
+        "response_id": response_json.get("id"),
+        "diary": json.loads(output_text),
+    }
+
+
+def _fallback_diary(*, cadence: str, metrics: dict[str, Any], learnings: list[str], error: str | None = None) -> dict[str, Any]:
+    benchmarks = (metrics.get("benchmark_indices") or {}).get("regions", {})
+    benchmark_summary = ", ".join(
+        f"{region} {float(payload.get('average_change_pct') or 0.0) * 100:.2f}%"
+        for region, payload in benchmarks.items()
+    ) or "No benchmark data was available."
+    return {
+        "status": "deterministic_fallback" if error else "deterministic",
+        "error": error,
+        "diary": {
+            "executive_summary": (
+                f"{cadence.title()} diary: {metrics.get('report_count', 0)} report(s), "
+                f"{metrics.get('suggested_trade_count', 0)} suggested trade(s), "
+                f"{metrics.get('trade_count', 0)} closed trade(s), "
+                f"{float(metrics.get('realised_gain_dkk') or 0.0):.0f} DKK realised gain."
+            ),
+            "what_went_well": [item for item in learnings if "non-negative" in item or "preserve" in item] or learnings[:1],
+            "what_went_wrong": [item for item in learnings if "negative" in item or "No " in item] or [],
+            "missed_opportunities": [],
+            "risk_notes": [item for item in learnings if "goal progress" in item],
+            "benchmark_readthrough": benchmark_summary,
+            "next_session_adjustments": learnings,
+            "decision_report_instructions": learnings,
+        },
+    }
+
+
 def record_strategy_journal_entry(
     connection,
     *,
@@ -185,14 +368,15 @@ def record_strategy_journal_entry(
     summary: str,
     metrics: dict[str, Any],
     learnings: list[str],
+    diary: dict[str, Any],
     source_report_id: int | None,
 ) -> int:
     cursor = connection.execute(
         """
         INSERT INTO strategy_journal_entries (
             created_at, journal_date, cadence, status, summary,
-            metrics_json, learnings_json, source_report_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            metrics_json, learnings_json, diary_json, source_report_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             datetime.now(UTC).isoformat(timespec="seconds"),
@@ -202,6 +386,7 @@ def record_strategy_journal_entry(
             summary,
             json.dumps(metrics, ensure_ascii=False, sort_keys=True),
             json.dumps(learnings, ensure_ascii=False, sort_keys=True),
+            json.dumps(diary, ensure_ascii=False, sort_keys=True),
             source_report_id,
         ),
     )
@@ -222,6 +407,25 @@ def generate_strategy_journal_entry(
         return {"status": "skipped", "reason": f"{cadence} journal already exists for {journal_date}"}
     metrics = _decision_metrics(connection, config, since_date=journal_date, reference_time=now)
     learnings = _learning_points(metrics)
+    try:
+        diary_result = _request_xai_diary(config, cadence=cadence, metrics=metrics, fallback_learnings=learnings)
+    except Exception as exc:  # noqa: BLE001
+        diary_result = _fallback_diary(cadence=cadence, metrics=metrics, learnings=learnings, error=str(exc))
+    diary = dict(diary_result.get("diary") or {})
+    diary_instructions = [
+        str(item)
+        for item in diary.get("decision_report_instructions", [])
+        if str(item).strip()
+    ]
+    merged_learnings = [*learnings]
+    for item in diary_instructions:
+        if item not in merged_learnings:
+            merged_learnings.append(item)
+    metrics["diary_status"] = diary_result.get("status")
+    if diary_result.get("response_id"):
+        metrics["diary_response_id"] = diary_result.get("response_id")
+    if diary_result.get("error"):
+        metrics["diary_error"] = diary_result.get("error")
     week = metrics.get("goal_tracking", {}).get("periods", {}).get("week", {})
     month = metrics.get("goal_tracking", {}).get("periods", {}).get("month", {})
     summary = (
@@ -239,7 +443,8 @@ def generate_strategy_journal_entry(
         status="completed",
         summary=summary,
         metrics=metrics,
-        learnings=learnings,
+        learnings=merged_learnings,
+        diary=diary_result,
         source_report_id=metrics.get("source_report_id"),
     )
     return {"status": "completed", "id": entry_id, "cadence": cadence, "journal_date": journal_date}

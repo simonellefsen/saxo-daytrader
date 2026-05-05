@@ -474,6 +474,7 @@ Hard rules:
 - Prefer liquid, news-catalyst-driven names in Nordic, EU/Euronext, UK, and US markets.
 - Only propose holdings you would actually want to own tomorrow morning.
 - Respect the supplied analysis_universe constraints: the Nordic/EU open report excludes US watchlist/US portfolio exposure, the US open report uses the US watchlist, and holiday exchange codes are out of scope.
+- Treat recent strategy diary instructions as operational memory: avoid repeating documented execution, risk, or thesis mistakes unless current evidence clearly invalidates the lesson.
 
 Output requirements:
 - Return only structured data conforming to the provided schema.
@@ -513,12 +514,12 @@ Broker account JSON:
 Cash management JSON:
 {json.dumps(context['cash_management'], ensure_ascii=False, indent=2)}
 
-Recent strategy journal learnings JSON:
+Recent strategy journal diaries and learnings JSON:
 {json.dumps(context['journal_learnings'], ensure_ascii=False, indent=2)}
 
 Task:
 1. Identify whether this is the Nordic/EU open +1h15 report, US open +1h15 report, or a manual analysis.
-2. Synthesize Asia, macro, geopolitical, earnings, commodities, crypto, and US setup into one actionable market view.
+2. Synthesize Asia, macro, geopolitical, earnings, commodities, crypto, US setup, and the recent strategy diary into one actionable market view.
 3. Apply that view to the current Watchlist and current Portfolio using symbol_sentiment with exactly SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
 4. Return a candidate asset pool of high-conviction liquid names only; candidate_assets is the upstream idea list, not final execution.
 5. Suggest only practical BUY, SELL, or FLATTEN actions that respect watchlist-only, blacklist, 10-25 holdings, 5-25% weights, long-only, cash buffer, Danish tax drag, and commission drag.

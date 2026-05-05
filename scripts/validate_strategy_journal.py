@@ -35,6 +35,8 @@ def main() -> int:
     learnings = fetch_recent_journal_learnings(connection)
     assert len(learnings) == 1, learnings
     assert learnings[0]["learnings_json"], learnings
+    assert learnings[0]["diary_json"], learnings
+    assert learnings[0]["diary_json"]["diary"]["executive_summary"], learnings
     print("Strategy journal validation passed.")
     print(f"Journal entries: {len(learnings)}")
     print(f"First cadence: {learnings[0]['cadence']}")
