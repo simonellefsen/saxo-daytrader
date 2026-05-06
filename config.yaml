@@ -148,6 +148,7 @@ strategy:
     max_take_profit_atr_multiple: 8.0
     min_position_weight: 0.02
     max_position_weight: 0.04
+    session_flatten_enabled: false
     flatten_minutes_before_tradable_close: 15
     trail_stop_atr_multiple: 1.25
 

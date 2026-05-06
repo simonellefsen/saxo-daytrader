@@ -150,6 +150,13 @@ export interface StrategyJournalResponse {
   items: Array<Record<string, any>>;
 }
 
+export interface PromptsResponse {
+  generated_at: string;
+  items: Array<Record<string, any>>;
+  latest_decision_report?: Record<string, any> | null;
+  latest_trading_manager_run?: Record<string, any> | null;
+}
+
 export interface ExecutionResponse {
   orders: Array<Record<string, any>>;
   fills: Array<Record<string, any>>;

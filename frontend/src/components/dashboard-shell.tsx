@@ -16,6 +16,7 @@ import type {
   OverviewResponse,
   PerformanceResponse,
   PositionsResponse,
+  PromptsResponse,
   SaxoAuthStatus,
   SchedulerResponse,
   StrategyJournalResponse,
@@ -26,7 +27,7 @@ import { LadderVisualizer } from "@/components/ladder-visualizer";
 import { LineChart } from "@/components/line-chart";
 import { Sparkline } from "@/components/sparkline";
 
-type TabKey = "portfolio" | "performance" | "market" | "watchlist" | "decision" | "journal" | "execution";
+type TabKey = "portfolio" | "performance" | "market" | "watchlist" | "decision" | "prompts" | "journal" | "execution";
 
 type AuthSession = {
   authenticated: boolean;
@@ -52,6 +53,7 @@ const TAB_OPTIONS: Array<{ key: TabKey; label: string }> = [
   { key: "market", label: "Market Status" },
   { key: "watchlist", label: "Watchlist" },
   { key: "decision", label: "Decision Report" },
+  { key: "prompts", label: "AI Prompts" },
   { key: "journal", label: "EOD Diary" },
   { key: "execution", label: "Execution" },
 ];
@@ -624,6 +626,50 @@ function WatchlistCategoryPanel({ category, nowMs }: { category: WatchlistCatego
   );
 }
 
+function PromptPanel({ prompt }: { prompt: Record<string, any> }) {
+  const schema = prompt.schema ?? null;
+  return (
+    <article className="prompt-card">
+      <div className="panel-header prompt-header">
+        <div>
+          <h3>{String(prompt.title ?? prompt.kind ?? "AI Prompt")}</h3>
+          <p>{String(prompt.description ?? "Runtime prompt preview.")}</p>
+        </div>
+        <span className={`status-chip ${String(prompt.status ?? "ok") === "error" ? "bad" : "neutral"}`}>
+          {String(prompt.status ?? "ok")}
+        </span>
+      </div>
+      {prompt.error ? <div className="warning-box">{String(prompt.error)}</div> : null}
+      {prompt.instruction ? (
+        <section className="prompt-section">
+          <div className="label">Core Instruction</div>
+          <p>{String(prompt.instruction)}</p>
+        </section>
+      ) : null}
+      <div className="prompt-grid">
+        {prompt.system_prompt ? (
+          <details className="json-details" open>
+            <summary>System Prompt</summary>
+            <pre className="code-block prompt-block">{String(prompt.system_prompt)}</pre>
+          </details>
+        ) : null}
+        {prompt.user_prompt ? (
+          <details className="json-details">
+            <summary>User Prompt / Payload</summary>
+            <pre className="code-block prompt-block">{String(prompt.user_prompt)}</pre>
+          </details>
+        ) : null}
+      </div>
+      {schema ? (
+        <details className="json-details">
+          <summary>Structured Output Schema</summary>
+          <pre className="code-block prompt-block">{JSON.stringify(schema, null, 2)}</pre>
+        </details>
+      ) : null}
+    </article>
+  );
+}
+
 export function DashboardShell() {
   const [activeTab, setActiveTab] = useState<TabKey>("portfolio");
   const [performanceRange, setPerformanceRange] = useState<(typeof PERFORMANCE_RANGES)[number]>("1D");
@@ -724,6 +770,11 @@ export function DashboardShell() {
     getFetcher,
     { refreshInterval: 300_000 },
   );
+  const prompts = useSWR<PromptsResponse>(
+    activeTab === "prompts" ? "/api/prompts" : null,
+    getFetcher,
+    { refreshInterval: 300_000 },
+  );
   const execution = useSWR<ExecutionResponse>(
     activeTab === "execution" ? "/api/execution?limit=150" : null,
     getFetcher,
@@ -768,6 +819,7 @@ export function DashboardShell() {
         mutate("/api/execution?limit=150"),
         mutate("/api/decision/latest"),
         mutate("/api/decision/reports?limit=20"),
+        mutate("/api/prompts"),
         mutate("/api/scheduler?limit=10"),
         mutate("/api/saxo/auth/status"),
       ]).catch((error) => {
@@ -823,6 +875,7 @@ export function DashboardShell() {
     activeTab === "market" ? market.error : null,
     activeTab === "watchlist" ? watchlists.error : null,
     activeTab === "decision" ? decision.error || decisionHistory.error : null,
+    activeTab === "prompts" ? prompts.error : null,
     activeTab === "journal" ? strategyJournal.error : null,
     activeTab === "execution" ? execution.error || scheduler.error : null,
   ].find(Boolean);
@@ -867,6 +920,7 @@ export function DashboardShell() {
   const latestDecision = decision.data?.report;
   const nextDecision = decision.data?.next_report ?? null;
   const decisionHistoryItems = decisionHistory.data?.items ?? [];
+  const promptItems = prompts.data?.items ?? [];
   const strategyJournalItems = strategyJournal.data?.items ?? [];
   const dailyOrderCapacity = overview.data?.execution?.daily_order_capacity;
   const displayedDecision = useMemo(() => {
@@ -995,6 +1049,7 @@ export function DashboardShell() {
   }, [selectedJournalId, strategyJournalItems]);
 
   const executionOrders = execution.data?.orders ?? [];
+  const executionFills = execution.data?.fills ?? [];
   const manageableOrders = executionOrders.filter((row) =>
     [
       "submitted_to_broker",
@@ -1569,6 +1624,45 @@ export function DashboardShell() {
         </section>
       ) : null}
 
+      {activeTab === "prompts" ? (
+        <section className="panel stack">
+          <div className="panel-header">
+            <div>
+              <h2>AI Prompts</h2>
+              <p>
+                Runtime prompt previews for the Decision Report, Trading Manager, and end-of-day diary. Generated{" "}
+                {formatTimestamp(prompts.data?.generated_at)}.
+              </p>
+            </div>
+            <div className="pill-row">
+              <span className="pill">Decision #{String(prompts.data?.latest_decision_report?.id ?? "n/a")}</span>
+              <span className="pill">Manager run #{String(prompts.data?.latest_trading_manager_run?.id ?? "n/a")}</span>
+            </div>
+          </div>
+          <section className="friendly-status good">
+            <strong>Trading Manager objective</strong>
+            <span>
+              Pick and manage stocks with conviction for daily, weekly, and monthly horizons. It should not flatten all
+              positions just because the day is ending; selling requires thesis, technical, cash, risk, or opportunity evidence.
+            </span>
+          </section>
+          {promptItems.length ? (
+            promptItems.map((prompt) => <PromptPanel key={String(prompt.kind ?? prompt.title)} prompt={prompt} />)
+          ) : (
+            <div className="empty-state">
+              <strong>Prompt previews are loading.</strong>
+              <span>The backend builds these from the current runtime configuration and latest report context.</span>
+            </div>
+          )}
+          {prompts.data?.latest_decision_report?.stored_prompt_text ? (
+            <details className="json-details">
+              <summary>Latest Stored Decision Prompt Text</summary>
+              <pre className="code-block prompt-block">{String(prompts.data.latest_decision_report.stored_prompt_text)}</pre>
+            </details>
+          ) : null}
+        </section>
+      ) : null}
+
       {activeTab === "journal" ? (
         <section className="panel stack">
           <div className="panel-header">
@@ -1736,6 +1830,7 @@ export function DashboardShell() {
               <span className="pill">Queued {formatNumber(overview.data?.execution?.counts?.queued ?? 0, 0)}</span>
               <span className="pill">Broker Live {formatNumber(overview.data?.execution?.counts?.broker_live ?? 0, 0)}</span>
               <span className="pill">Failed {formatNumber(overview.data?.execution?.counts?.failed ?? 0, 0)}</span>
+              <span className="pill">Fills {formatNumber(executionFills.length, 0)}</span>
             </div>
           </div>
           <section className={`broker-status-card ${saxoTone(saxoAuth.data)}`}>
@@ -1822,6 +1917,63 @@ export function DashboardShell() {
               <div className="value">{formatNumber(dailyOrderCapacity?.remaining ?? 0, 0)}</div>
               <div className="muted">Daily cap {formatNumber(dailyOrderCapacity?.max ?? 0, 0)}</div>
             </article>
+          </div>
+          <div className="panel-header compact-header">
+            <div>
+              <h3>Recent Broker Fills</h3>
+              <p>Actual broker fill confirmations, separate from locally-created execution orders.</p>
+            </div>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Fill Time</th>
+                  <th>Order ID</th>
+                  <th>Symbol</th>
+                  <th>Side</th>
+                  <th>Source</th>
+                  <th>Status</th>
+                  <th>Delta Qty</th>
+                  <th>Cumulative Qty</th>
+                  <th>Average Price</th>
+                  <th>Ledger</th>
+                </tr>
+              </thead>
+              <tbody>
+                {executionFills.length ? (
+                  executionFills.map((row) => (
+                    <tr key={String(row.id)}>
+                      <td>{formatTimestamp(row.created_at)}</td>
+                      <td>{String(row.execution_order_id ?? "")}</td>
+                      <td>{String(row.symbol ?? "")}</td>
+                      <td>{String(row.side ?? "")}</td>
+                      <td>{String(row.strategy_type ?? "manual")}</td>
+                      <td>{String(row.fill_status ?? row.order_status ?? "")}</td>
+                      <td>{formatNumber(row.delta_quantity, 0)}</td>
+                      <td>{formatNumber(row.cumulative_quantity, 0)}</td>
+                      <td>{formatLocalMoney(row.average_price_local, row.currency)}</td>
+                      <td>{row.ledger_id ? String(row.ledger_id) : "broker-only"}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={10}>
+                      <div className="empty-state">
+                        <strong>No broker fills recorded yet.</strong>
+                        <span>Executed orders will appear here once Saxo confirms a fill.</span>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="panel-header compact-header">
+            <div>
+              <h3>Execution Orders</h3>
+              <p>Local order intents and their current broker state.</p>
+            </div>
           </div>
           <div className="table-wrap">
             <table>

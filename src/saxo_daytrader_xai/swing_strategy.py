@@ -10,6 +10,7 @@ from saxo_daytrader_xai.swing_indicators import fetch_daily_swing_indicators
 SENTIMENT_SCALE = ("SELL", "UNDERWEIGHT", "HOLD", "OVERWEIGHT", "BUY")
 ACTIONABLE_SENTIMENTS = {"SELL", "UNDERWEIGHT", "OVERWEIGHT", "BUY"}
 DEFAULT_NEVER_TRADE_SYMBOLS = {"novob:xcse", "tsla:xnas"}
+DEFAULT_SENTIMENT_SOURCES = {"portfolio_default", "watchlist_default", "watchlist_guardrail_fill"}
 
 
 def swing_strategy_enabled(config: dict[str, Any]) -> bool:
@@ -108,8 +109,13 @@ def _extract_sentiment_universe(report_json: dict[str, Any], context: dict[str, 
             return
         row = output.get(symbol_key)
         confidence_score = _confidence(confidence)
-        if row and _sentiment_rank(row["sentiment"]) > _sentiment_rank(sentiment):
-            return
+        if row:
+            incoming_default = source in DEFAULT_SENTIMENT_SOURCES
+            existing_default = str(row.get("source") or "") in DEFAULT_SENTIMENT_SOURCES
+            if incoming_default and not existing_default:
+                return
+            if not incoming_default and not existing_default and _sentiment_rank(row["sentiment"]) > _sentiment_rank(sentiment):
+                return
         output[symbol_key] = {
             "symbol": str(symbol).strip(),
             "sentiment": _normalize_sentiment(sentiment),
@@ -166,6 +172,19 @@ def _extract_sentiment_universe(report_json: dict[str, Any], context: dict[str, 
             confidence=50.0,
             rationale="Existing portfolio holding with no stronger model sentiment.",
             source="portfolio_default",
+        )
+    for row in _watchlist_rows(context).values():
+        daily_change = _safe_float(row.get("change_pct"), 0.0)
+        upsert(
+            row.get("symbol"),
+            sentiment="HOLD",
+            confidence=50.0 + max(min(daily_change * 100.0, 10.0), -10.0),
+            rationale="Watchlist symbol with no stronger model sentiment.",
+            source="watchlist_default",
+            extra={
+                "catalysts": ["Current watchlist membership"],
+                "risk_notes": ["No explicit AI catalyst; default HOLD until evidence improves."],
+            },
         )
     return output
 
@@ -248,6 +267,16 @@ def _merge_daily_technical_view(row: dict[str, Any], technical: dict[str, Any] |
         output["risk_notes"] = list(output.get("risk_notes") or []) + [
             "Daily indicator confluence filter blocked the long entry."
         ]
+    elif (
+        original_sentiment == "HOLD"
+        and str(output.get("source") or "") in {"watchlist_default", "watchlist_guardrail_fill"}
+        and technical_sentiment in {"BUY", "OVERWEIGHT"}
+    ):
+        output["sentiment"] = "OVERWEIGHT"
+        output["source"] = "watchlist_technical_candidate"
+        output["rationale"] = (
+            f"{output.get('rationale') or ''} Promoted from Watchlist HOLD because daily technicals show an actionable long setup."
+        ).strip()
     elif original_sentiment in {"SELL", "UNDERWEIGHT"} and technical_sentiment == "SELL":
         output["confidence"] = min(100.0, _confidence(output.get("confidence")) + 8.0)
     output["catalysts"] = list(output.get("catalysts") or []) + list(technical.get("confluences") or [])[:3]
@@ -330,7 +359,11 @@ def build_swing_strategy_plan(
         for symbol_key, row in sentiment_map.items()
         if symbol_key not in blocked
         and symbol_key in watchlist_map
-        and (row["sentiment"] in ACTIONABLE_SENTIMENTS or symbol_key in position_map)
+        and (
+            row["sentiment"] in ACTIONABLE_SENTIMENTS
+            or symbol_key in position_map
+            or str(row.get("source") or "") == "watchlist_default"
+        )
     ]
     technical_by_symbol = fetch_daily_swing_indicators(technical_symbols, config)
     fx_snapshot = fetch_ecb_fx_rates()
@@ -366,7 +399,9 @@ def build_swing_strategy_plan(
             blocked_positions.append(symbol)
         if position and not is_watchlist:
             non_watchlist_positions.append(symbol)
-        if is_blocked or not is_watchlist:
+        if is_blocked:
+            continue
+        if not is_watchlist and not position:
             continue
         if row["sentiment"] in ACTIONABLE_SENTIMENTS or position:
             eligible_rows.append(row)
@@ -517,6 +552,10 @@ def build_swing_strategy_plan(
         else:
             continue
 
+        if action == "BUY" and watchlist_row is None:
+            notes.append(f"{symbol}: skipped BUY because new capital can only be deployed into current Watchlist securities.")
+            continue
+
         delta_value_dkk = (desired_weight - current_weight) * total_equity_dkk
         if action == "HOLD" or abs(delta_value_dkk) < min_trade_value_dkk:
             _append_target(
@@ -596,7 +635,7 @@ def build_swing_strategy_plan(
         )
     if non_watchlist_positions:
         notes.append(
-            "Existing non-watchlist positions were not traded because the new strategy only trades current Watchlist securities: "
+            "Existing non-watchlist positions remain eligible for HOLD/SELL/FLATTEN, but not new BUY exposure: "
             + ", ".join(sorted(set(non_watchlist_positions)))
         )
     selected_assets = [

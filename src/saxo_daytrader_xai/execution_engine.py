@@ -1382,6 +1382,12 @@ def _flatten_due_for_symbol(symbol: str, config: dict[str, Any]) -> bool:
 def enqueue_session_flatten_orders(*, config: dict[str, Any] | None = None, connection=None) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
+        if not bool(resolved_config.get("strategy", {}).get("ladder", {}).get("session_flatten_enabled", False)):
+            return {
+                "status": "disabled",
+                "created_order_ids": [],
+                "message": "Session-close flattening is disabled by strategy configuration.",
+            }
         if str(resolved_config.get("execution", {}).get("mode")) != "live":
             return {"status": "skipped", "created_order_ids": []}
         if str(resolved_config.get("execution", {}).get("adapter")) != "saxo":
@@ -2977,6 +2983,7 @@ def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, 
             FROM execution_orders
             WHERE strategy_type = 'portfolio_sync'
               AND status NOT IN ({})
+            ORDER BY id ASC
             """.format(",".join("?" for _ in TERMINAL_ORDER_STATUSES)),
             tuple(TERMINAL_ORDER_STATUSES),
         ).fetchall()
@@ -3054,6 +3061,7 @@ def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, 
         # Sell reductions first so SIM buying power is freed before increases are attempted.
         order_specs.sort(key=lambda row: 0 if row["action"] == "SELL" else 1)
         created_order_ids: list[int] = []
+        resumed_order_ids: list[int] = []
         execution_results: list[dict[str, Any]] = []
         for spec in order_specs:
             cursor = resolved_connection.execute(
@@ -3103,6 +3111,24 @@ def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, 
                     approved=True,
                 )
             )
+        executable_sync_statuses = {
+            "pending_execution",
+            "pending_approval",
+            "waiting_for_market_open",
+            "waiting_for_virtual_cash_budget",
+        }
+        for row in active_rows:
+            if str(row["status"]) not in executable_sync_statuses:
+                continue
+            resumed_order_ids.append(int(row["id"]))
+            execution_results.append(
+                execute_order(
+                    int(row["id"]),
+                    config=resolved_config,
+                    connection=resolved_connection,
+                    approved=True,
+                )
+            )
 
         append_audit_log(
             resolved_connection,
@@ -3111,6 +3137,7 @@ def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, 
                 "created_at": created_at,
                 "batch_id": batch_id,
                 "created_order_ids": created_order_ids,
+                "resumed_order_ids": resumed_order_ids,
                 "skipped": skipped,
                 "broker_positions": broker_positions,
                 "broker_balance": broker_balance,
@@ -3121,6 +3148,8 @@ def sync_saxo_sim_account_to_portfolio(*, config: dict[str, Any] | None = None, 
             "status": "ok",
             "created": len(created_order_ids),
             "created_order_ids": created_order_ids,
+            "resumed": len(resumed_order_ids),
+            "resumed_order_ids": resumed_order_ids,
             "orders": execution_results,
             "skipped": skipped,
             "broker_positions": broker_positions,
@@ -3897,6 +3926,7 @@ def queue_and_maybe_execute_latest_report(
     create_report_orders: bool = True,
     strategy_orders_override: list[dict[str, Any]] | None = None,
     report_override: dict[str, Any] | None = None,
+    process_portfolio_sync_orders: bool = False,
 ) -> dict[str, Any]:
     resolved_config, resolved_connection, should_close = _get_connection_and_config(config, connection)
     try:
@@ -3938,6 +3968,8 @@ def queue_and_maybe_execute_latest_report(
                 (str(resolved_config["execution"]["mode"]), *tuple(executable_statuses)),
             ).fetchall()
             for order in queue_rows:
+                if str(order["strategy_type"] or "") == "portfolio_sync" and not process_portfolio_sync_orders:
+                    continue
                 executed.append(
                     execute_order(
                         int(order["id"]),
@@ -3977,9 +4009,16 @@ def fetch_execution_orders(connection, limit: int = 100) -> list[dict[str, Any]]
 def fetch_execution_fills(connection, limit: int = 100) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT *
-        FROM execution_fills
-        ORDER BY id DESC
+        SELECT
+            f.*,
+            o.action,
+            o.strategy_type,
+            o.strategy_role,
+            o.status AS order_status,
+            o.estimated_value_dkk
+        FROM execution_fills f
+        LEFT JOIN execution_orders o ON o.id = f.execution_order_id
+        ORDER BY f.id DESC
         LIMIT ?
         """,
         (limit,),

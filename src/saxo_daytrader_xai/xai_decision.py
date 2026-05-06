@@ -172,6 +172,7 @@ DECISION_REPORT_SCHEMA: dict[str, Any] = {
         "reasoning_steps",
         "risk_rules_check",
         "watchlist_focus",
+        "candidate_assets",
         "symbol_sentiment",
         "suggested_trades",
         "execution_notes",
@@ -292,6 +293,54 @@ def _filter_positions_for_pulse(
         if ":" not in str(row.get("symbol") or "")
         or str(row["symbol"]).split(":", 1)[1].lower() not in US_EXCHANGES
     ]
+
+
+def _decision_universe(
+    positions: list[dict[str, Any]],
+    watchlists: dict[str, Any],
+) -> dict[str, Any]:
+    symbols: dict[str, dict[str, Any]] = {}
+
+    def upsert(symbol: str, **values: Any) -> None:
+        if not symbol:
+            return
+        row = symbols.setdefault(symbol, {"symbol": symbol, "sources": []})
+        source = values.pop("source", None)
+        if source and source not in row["sources"]:
+            row["sources"].append(source)
+        row.update({key: value for key, value in values.items() if value not in (None, "")})
+
+    for row in positions:
+        upsert(
+            str(row.get("symbol") or ""),
+            source="portfolio",
+            name=row.get("instrument_name"),
+            currency=row.get("currency"),
+            current_weight_pct=row.get("allocation_pct"),
+            current_quantity=row.get("quantity"),
+        )
+
+    for category in watchlists.get("categories", []) or []:
+        category_key = str(category.get("key") or "")
+        for row in category.get("items", []) or []:
+            upsert(
+                str(row.get("symbol") or ""),
+                source="watchlist",
+                name=row.get("name"),
+                region=row.get("region") or category_key,
+                exchange=row.get("exchange"),
+                currency=row.get("currency"),
+                current_price=row.get("current_price"),
+                daily_change_pct=row.get("change_pct"),
+                quote_status=row.get("quote_status"),
+            )
+
+    return {
+        "count": len(symbols),
+        "portfolio_symbols": len([row for row in symbols.values() if "portfolio" in row.get("sources", [])]),
+        "watchlist_symbols": len([row for row in symbols.values() if "watchlist" in row.get("sources", [])]),
+        "symbols": list(symbols.values()),
+    }
 
 
 def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
@@ -440,6 +489,7 @@ def _build_context(config: dict[str, Any], connection) -> dict[str, Any]:
             "holiday_excluded_exchange_codes": sorted(_exchange_holiday_codes(market_status_rows)),
             "portfolio_scope": "exclude_us" if str((active_pulse or {}).get("kind") or "") == "europe_open_followup" else "all",
         },
+        "decision_universe": _decision_universe(analysis_positions, scoped_watchlists),
         "goal_tracking": goal_tracking,
         "broker_account": broker_account,
         "market_news": market_news,
@@ -466,20 +516,23 @@ Core goal for every decision:
 Hard rules:
 - Use exactly this per-symbol sentiment scale: SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
 - Never trade or recommend trading these symbols under any circumstances, even if already held: {excluded_symbols_text}.
-- Only recommend symbols present in the supplied current Watchlist context.
+- New BUY recommendations must be present in the supplied current Watchlist context; existing Portfolio symbols are also in scope for HOLD, SELL, or FLATTEN decisions.
 - Never short. Long-only portfolio.
 - Total holdings must stay between {int(swing_cfg.get('min_holdings', 10))} and {int(swing_cfg.get('max_holdings', 25))}; every target holding must be between {float(swing_cfg.get('min_holding_weight_pct', 0.05)) * 100:.0f}% and {float(swing_cfg.get('max_holding_weight_pct', 0.25)) * 100:.0f}% of total equity.
 - Respect the {float(swing_cfg.get('cash_buffer_pct', 0.10)) * 100:g}% cash buffer. If cash is below buffer, prefer SELL / FLATTEN recommendations over new BUY recommendations.
 - Treat all pnl, commission, and taxation impacts in DKK.
 - Prefer liquid, news-catalyst-driven names in Nordic, EU/Euronext, UK, and US markets.
-- Only propose holdings you would actually want to own tomorrow morning.
+- The strategy is not an end-of-day flattening strategy. Prefer positions you believe in across daily, weekly, and monthly horizons.
+- Only propose holdings you would actually want to own tomorrow morning and through the short foreseeable future if the thesis remains intact.
+- SELL or FLATTEN should mean the thesis is impaired, technical/risk evidence has deteriorated, cash/risk limits require de-risking, or capital should rotate into a clearly stronger open-market opportunity. Do not sell merely because a session is ending.
 - Respect the supplied analysis_universe constraints: the Nordic/EU open report excludes US watchlist/US portfolio exposure, the US open report uses the US watchlist, and holiday exchange codes are out of scope.
 - Treat recent strategy diary instructions as operational memory: avoid repeating documented execution, risk, or thesis mistakes unless current evidence clearly invalidates the lesson.
 
 Output requirements:
 - Return only structured data conforming to the provided schema.
 - Provide explicit step-by-step rationale in the reasoning_steps field.
-- Fill symbol_sentiment for the most relevant Watchlist and Portfolio symbols using the exact sentiment scale.
+- Fill symbol_sentiment for every symbol in the supplied Decision coverage universe using the exact sentiment scale. Use concise HOLD rationales when the symbol has no actionable edge, but do not omit Watchlist symbols just because they are not currently held.
+- Build candidate_assets from the combined Watchlist + Portfolio universe, not only from current holdings.
 - Suggested trades must use only BUY, SELL, or FLATTEN with confidence as a 0-100 number and priority high/medium.
 """.strip()
 
@@ -495,6 +548,9 @@ Analysis pulse JSON:
 
 Watchlist opportunities JSON:
 {json.dumps(context['watchlists'], ensure_ascii=False, indent=2)}
+
+Decision coverage universe JSON:
+{json.dumps(context['decision_universe'], ensure_ascii=False, indent=2)}
 
 Analysis universe constraints JSON:
 {json.dumps(context['analysis_universe'], ensure_ascii=False, indent=2)}
@@ -520,18 +576,45 @@ Recent strategy journal diaries and learnings JSON:
 Task:
 1. Identify whether this is the Nordic/EU open +1h15 report, US open +1h15 report, or a manual analysis.
 2. Synthesize Asia, macro, geopolitical, earnings, commodities, crypto, US setup, and the recent strategy diary into one actionable market view.
-3. Apply that view to the current Watchlist and current Portfolio using symbol_sentiment with exactly SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
-4. Return a candidate asset pool of high-conviction liquid names only; candidate_assets is the upstream idea list, not final execution.
+3. Apply that view to every symbol in the combined Watchlist + Portfolio decision universe using symbol_sentiment with exactly SELL, UNDERWEIGHT, HOLD, OVERWEIGHT, BUY.
+4. Return a candidate asset pool of high-conviction liquid names selected from the combined Watchlist + Portfolio universe; candidate_assets is the upstream idea list, not final execution.
 5. Suggest only practical BUY, SELL, or FLATTEN actions that respect watchlist-only, blacklist, 10-25 holdings, 5-25% weights, long-only, cash buffer, Danish tax drag, and commission drag.
-6. For each suggested trade, include a concise news/macro-driven rationale and concrete risk notes for swing holding.
-7. Explicitly assess progress versus the DKK 5,000 weekly and DKK 20,000 monthly pre-tax goals using the supplied goal_tracking JSON.
-8. If no high-conviction trade exists, keep suggested_trades empty and explain the constraint in execution_notes.
-9. Produce a concise but concrete Decision Report for the operator.
+6. Treat holding a strong position as an active decision. Do not recommend FLATTEN just to finish the day in cash.
+7. For each suggested trade, include a concise news/macro-driven rationale and concrete risk notes for swing holding.
+8. Explicitly assess progress versus the DKK 5,000 weekly and DKK 20,000 monthly pre-tax goals using the supplied goal_tracking JSON.
+9. If no high-conviction trade exists, keep suggested_trades empty and explain the constraint in execution_notes.
+10. Produce a concise but concrete Decision Report for the operator.
 """.strip()
 
     return {
         "system": system_prompt,
         "user": user_prompt,
+    }
+
+
+def build_decision_prompt_preview(config: dict[str, Any], connection) -> dict[str, Any]:
+    context = _build_context(config, connection)
+    prompt = build_trading_prompt(context, config)
+    return {
+        "kind": "decision_report",
+        "title": "Decision Report",
+        "description": "Prompt used to generate the two daily market/portfolio Decision Reports.",
+        "system_prompt": prompt["system"],
+        "user_prompt": prompt["user"],
+        "schema": DECISION_REPORT_SCHEMA,
+        "context_summary": {
+            "batch_id": context.get("batch_id"),
+            "analysis_pulse": context.get("analysis_pulse"),
+            "portfolio_positions": len(context.get("portfolio_positions") or []),
+            "decision_universe_symbols": (context.get("decision_universe") or {}).get("count"),
+            "watchlist_categories": [
+                {
+                    "key": category.get("key"),
+                    "items": len(category.get("items") or []),
+                }
+                for category in (context.get("watchlists") or {}).get("categories", [])
+            ],
+        },
     }
 
 

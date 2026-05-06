@@ -19,6 +19,7 @@ from saxo_daytrader_xai.execution_engine import (
     adopt_broker_holdings_into_local_ledger,
     enqueue_session_flatten_orders,
     execute_order,
+    queue_and_maybe_execute_latest_report,
     reconcile_portfolio_to_broker,
     sync_saxo_sim_account_to_portfolio,
 )
@@ -46,6 +47,7 @@ def _config() -> dict:
     config["strategy"]["ladder"]["submit_bracket_with_entry"] = False
     config["strategy"]["ladder"]["submit_stop_loss_after_fill"] = False
     config["strategy"]["ladder"]["submit_take_profit_after_fill"] = False
+    config["strategy"]["ladder"]["session_flatten_enabled"] = True
     return config
 
 
@@ -1028,6 +1030,95 @@ def _assert_broker_adoption_is_blocked_in_sim(config: dict) -> None:
         connection.close()
 
 
+def _insert_queue_order(connection, *, symbol: str, strategy_type: str | None, status: str = "waiting_for_market_open") -> int:
+    cursor = connection.execute(
+        """
+        INSERT INTO execution_orders (
+            created_at, report_id, symbol, action, order_type, mode, status, adapter,
+            requested_weight_pct, quantity, price_local, limit_price_local, stop_price_local, currency, estimated_value_dkk,
+            approval_required, parent_execution_order_id, strategy_type, strategy_session, strategy_key, strategy_role,
+            request_json, execution_result_json, error_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "2026-05-05T07:20:09+00:00",
+            None,
+            symbol,
+            "BUY",
+            "Market",
+            "live",
+            status,
+            "saxo",
+            None,
+            1,
+            100.0,
+            None,
+            None,
+            "USD",
+            650.0,
+            0,
+            None,
+            strategy_type,
+            "test",
+            f"{strategy_type or 'manual'}:{symbol}:test",
+            "entry",
+            json.dumps({"symbol": symbol, "strategy_type": strategy_type}),
+            None,
+            "Exchange closed for regression setup.",
+        ),
+    )
+    connection.commit()
+    return int(cursor.lastrowid)
+
+
+def _assert_scheduler_queue_skips_portfolio_sync_orders(config: dict) -> None:
+    connection = connect(":memory:")
+    init_db(connection)
+    original_execute_order = execution_engine.execute_order
+    original_sync = execution_engine.sync_broker_order_statuses
+    original_alerts = execution_engine._dispatch_execution_alerts
+    executed_ids: list[int] = []
+
+    def fake_execute_order(order_id: int, *, config=None, connection=None, approved: bool = False):  # noqa: ANN001
+        executed_ids.append(order_id)
+        connection.execute(
+            "UPDATE execution_orders SET status = ?, error_text = NULL WHERE id = ?",
+            ("executed", order_id),
+        )
+        connection.commit()
+        return {"status": "executed", "order_id": order_id}
+
+    try:
+        portfolio_sync_id = _insert_queue_order(connection, symbol="ADI:xnas", strategy_type="portfolio_sync")
+        manager_order_id = _insert_queue_order(connection, symbol="NVDA:xnas", strategy_type="swing")
+        execution_engine.execute_order = fake_execute_order
+        execution_engine.sync_broker_order_statuses = lambda **_kwargs: {"status": "mocked"}
+        execution_engine._dispatch_execution_alerts = lambda *_args, **_kwargs: {"status": "mocked"}
+
+        result = queue_and_maybe_execute_latest_report(
+            config=config,
+            connection=connection,
+            create_report_orders=False,
+        )
+        assert result["status"] == "processed_existing_queue", result
+        assert executed_ids == [manager_order_id], executed_ids
+        portfolio_sync_status = connection.execute(
+            "SELECT status FROM execution_orders WHERE id = ?",
+            (portfolio_sync_id,),
+        ).fetchone()["status"]
+        manager_status = connection.execute(
+            "SELECT status FROM execution_orders WHERE id = ?",
+            (manager_order_id,),
+        ).fetchone()["status"]
+        assert portfolio_sync_status == "waiting_for_market_open", portfolio_sync_status
+        assert manager_status == "executed", manager_status
+    finally:
+        execution_engine.execute_order = original_execute_order
+        execution_engine.sync_broker_order_statuses = original_sync
+        execution_engine._dispatch_execution_alerts = original_alerts
+        connection.close()
+
+
 def main() -> int:
     config = _config()
     _assert_sim_integrity_ignores_non_authoritative_broker_snapshot()
@@ -1047,8 +1138,9 @@ def main() -> int:
     _assert_portfolio_sync_is_sim_only(config)
     _assert_portfolio_sync_fills_do_not_mutate_local_ledger(config)
     _assert_broker_adoption_is_blocked_in_sim(config)
+    _assert_scheduler_queue_skips_portfolio_sync_orders(config)
     print("Execution regression validation passed.")
-    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, broker-authoritative flatten guards, SIM integrity warning suppression, SIM-only portfolio sync guards, portfolio-sync fill ledger isolation, and SIM broker-adoption blocking.")
+    print("Covered: Saxo tick-size rounding, sell reservations, realised daily P/L, deferred brackets, planned protection-order defaults, broker/local fill reconciliation, residual broker-position reconciliation, broker-authoritative flatten guards, SIM integrity warning suppression, SIM-only portfolio sync guards, portfolio-sync fill ledger isolation, SIM broker-adoption blocking, and scheduler queue isolation for portfolio-sync orders.")
     return 0
 
 

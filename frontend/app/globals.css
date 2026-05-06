@@ -406,6 +406,15 @@ select {
   font-size: 0.92rem;
 }
 
+.compact-header {
+  margin-bottom: 0.35rem;
+}
+
+.compact-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
 .help-header {
   cursor: help;
   text-decoration: underline dotted rgba(101, 114, 132, 0.85);
@@ -636,6 +645,12 @@ th {
   background: #f8fafc;
 }
 
+.status-chip.bad {
+  color: var(--bad);
+  background: var(--bad-soft);
+  border-color: rgba(180, 35, 24, 0.18);
+}
+
 .decision-cell {
   position: relative;
   display: inline-grid;
@@ -796,6 +811,56 @@ th {
 
 .friendly-status span {
   color: var(--muted);
+}
+
+.friendly-status.good {
+  border-color: rgba(15, 138, 75, 0.18);
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.prompt-card {
+  display: grid;
+  gap: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 1rem;
+  background:
+    radial-gradient(circle at top right, rgba(15, 92, 115, 0.08), transparent 18rem),
+    rgba(255, 255, 255, 0.82);
+}
+
+.prompt-header {
+  margin-bottom: 0;
+}
+
+.prompt-header h3 {
+  margin: 0;
+}
+
+.prompt-section {
+  display: grid;
+  gap: 0.35rem;
+  border: 1px solid rgba(15, 92, 115, 0.14);
+  border-radius: 14px;
+  padding: 0.85rem;
+  background: rgba(217, 237, 242, 0.48);
+}
+
+.prompt-section p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.prompt-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 0.9rem;
+}
+
+.prompt-block {
+  max-height: 520px;
+  white-space: pre-wrap;
 }
 
 .legend-row.compact {

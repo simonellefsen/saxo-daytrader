@@ -52,6 +52,20 @@ TRADING_MANAGER_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+TRADING_MANAGER_SYSTEM_PROMPT = "You are the Trading Manager execution gate. Return strict JSON only."
+
+TRADING_MANAGER_INSTRUCTION = (
+    "Your job is to curate a long-only swing portfolio, not to flatten the book at the end of each session. "
+    "Prefer stocks the Decision Report and daily technicals support for a daily, weekly, and monthly horizon. "
+    "Approve only trades that satisfy the swing rules: open exchange, watchlist-only, long-only, "
+    "MACD/RSI/Bollinger/Stochastic/OBV confluence, 1:2 reward-risk, and no blacklist symbols. "
+    "Account for progress versus the 5,000 DKK weekly and 20,000 DKK monthly pre-tax goals, "
+    "but do not approve low-confluence trades just to chase the target. "
+    "Reject marginal BUYs. SELL or FLATTEN is allowed only when the position thesis is invalidated, "
+    "technicals show clear deterioration, cash/risk limits require de-risking, or a clearly superior open-market opportunity "
+    "requires capital rotation. Do not sell merely because the trading day is ending."
+)
+
 
 def _load_default_config() -> dict[str, Any]:
     root = Path(__file__).resolve().parents[2]
@@ -171,19 +185,15 @@ def _extract_output_text(response_json: dict[str, Any]) -> str:
     return ""
 
 
-def _request_ai_manager(
+def build_trading_manager_prompt_payload(
     *,
-    config: dict[str, Any],
     manager_pulse: dict[str, Any],
     report: dict[str, Any],
     candidate_orders: list[dict[str, Any]],
     technical_by_symbol: dict[str, dict[str, Any]],
     goal_tracking: dict[str, Any],
 ) -> dict[str, Any]:
-    api_key = config.get("xai", {}).get("api_key")
-    if not api_key:
-        raise ValueError("XAI_API_KEY is missing")
-    prompt = {
+    return {
         "manager_pulse": manager_pulse,
         "decision_report": {
             "id": report.get("id"),
@@ -196,22 +206,19 @@ def _request_ai_manager(
         "candidate_orders": candidate_orders,
         "daily_technicals": technical_by_symbol,
         "goal_tracking": goal_tracking,
-        "instruction": (
-            "Approve only trades that satisfy the swing rules: open exchange, watchlist-only, long-only, "
-            "MACD/RSI/Bollinger/Stochastic/OBV confluence, 1:2 reward-risk, and no blacklist symbols. "
-            "Account for progress versus the 5,000 DKK weekly and 20,000 DKK monthly pre-tax goals, "
-            "but do not approve low-confluence trades just to chase the target. "
-            "Reject marginal BUYs. SELL/FLATTEN is allowed when technicals warn risk is deteriorating."
-        ),
+        "instruction": TRADING_MANAGER_INSTRUCTION,
     }
-    request_json = {
+
+
+def build_trading_manager_request_json(config: dict[str, Any], prompt_payload: dict[str, Any]) -> dict[str, Any]:
+    return {
         "model": config["xai"]["model"],
         "input": [
             {
                 "role": "system",
-                "content": "You are the Trading Manager execution gate. Return strict JSON only.",
+                "content": TRADING_MANAGER_SYSTEM_PROMPT,
             },
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, indent=2)},
+            {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False, indent=2)},
         ],
         "text": {
             "format": {
@@ -222,6 +229,82 @@ def _request_ai_manager(
             }
         },
     }
+
+
+def build_trading_manager_prompt_preview(config: dict[str, Any], connection) -> dict[str, Any]:
+    market_rows = get_market_status(config)
+    status = trading_manager_status(config, market_rows)
+    latest_report = fetch_latest_decision_report(connection)
+    if latest_report and str(latest_report.get("status") or "") != "completed":
+        latest_report = None
+    pulse = _manager_pulse_from_report(latest_report) if latest_report else None
+    if pulse is None:
+        active_pulses = status.get("active_pulses") or []
+        all_pulses = status.get("pulses") or []
+        pulse = (active_pulses or all_pulses or [{}])[0]
+    report = latest_report or {"id": None, "created_at": None, "status": "preview", "report_json": {}}
+    candidate_orders = _candidate_orders_for_pulse(report, pulse) if latest_report and pulse else []
+    exchange_codes = {str(code).upper() for code in pulse.get("exchange_codes", [])}
+    open_codes = {
+        str(row.get("code") or "").upper()
+        for row in market_rows
+        if str(row.get("code") or "").upper() in exchange_codes and bool(row.get("is_tradable"))
+    }
+    preview_codes = open_codes or exchange_codes
+    candidate_symbols = [str(order["symbol"]) for order in candidate_orders if order.get("symbol")]
+    if preview_codes:
+        technical_symbols = _ordered_unique_symbols(
+            candidate_symbols,
+            _portfolio_symbols_for_exchanges(connection, config, preview_codes),
+            _watchlist_symbols_for_exchanges(config, preview_codes),
+        )
+    else:
+        technical_symbols = _ordered_unique_symbols(candidate_symbols)
+    technical_symbols = technical_symbols[: int(_manager_cfg(config).get("max_symbols", 30) or 30)]
+    technical_preview = {
+        symbol: {"status": "preview_not_fetched", "note": "Live Trading Manager runs fetch full daily indicators before calling xAI."}
+        for symbol in technical_symbols
+    }
+    prompt_payload = build_trading_manager_prompt_payload(
+        manager_pulse=pulse,
+        report=report,
+        candidate_orders=candidate_orders,
+        technical_by_symbol=technical_preview,
+        goal_tracking=fetch_goal_tracking(connection, config),
+    )
+    return {
+        "kind": "trading_manager",
+        "title": "Trading Manager",
+        "description": "Execution-gate prompt. Preview uses the latest completed Decision Report and current pulse context; live runs fetch full technical indicators.",
+        "system_prompt": TRADING_MANAGER_SYSTEM_PROMPT,
+        "instruction": TRADING_MANAGER_INSTRUCTION,
+        "user_prompt": json.dumps(prompt_payload, ensure_ascii=False, indent=2, default=str),
+        "schema": TRADING_MANAGER_SCHEMA,
+        "latest_report_id": latest_report.get("id") if latest_report else None,
+        "manager_status": status,
+    }
+
+
+def _request_ai_manager(
+    *,
+    config: dict[str, Any],
+    manager_pulse: dict[str, Any],
+    report: dict[str, Any],
+    candidate_orders: list[dict[str, Any]],
+    technical_by_symbol: dict[str, dict[str, Any]],
+    goal_tracking: dict[str, Any],
+) -> dict[str, Any]:
+    api_key = config.get("xai", {}).get("api_key")
+    if not api_key:
+        raise ValueError("XAI_API_KEY is missing")
+    prompt = build_trading_manager_prompt_payload(
+        manager_pulse=manager_pulse,
+        report=report,
+        candidate_orders=candidate_orders,
+        technical_by_symbol=technical_by_symbol,
+        goal_tracking=goal_tracking,
+    )
+    request_json = build_trading_manager_request_json(config, prompt)
     response = requests.post(
         f"{config['xai']['base_url'].rstrip('/')}/responses",
         headers={
@@ -318,6 +401,19 @@ def _watchlist_symbols_for_exchanges(config: dict[str, Any], exchange_codes: set
     return symbols
 
 
+def _ordered_unique_symbols(*symbol_groups: list[str]) -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for group in symbol_groups:
+        for symbol in group:
+            normalized = str(symbol or "")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            symbols.append(normalized)
+    return symbols
+
+
 def _portfolio_symbols_for_exchanges(connection, config: dict[str, Any], exchange_codes: set[str]) -> list[str]:
     batch_id = fetch_latest_batch_id(connection)
     symbols: list[str] = []
@@ -400,11 +496,12 @@ def run_trading_manager_cycle(
                 for order in _candidate_orders_for_pulse(report, pulse)
                 if parse_exchange_code(str(order.get("symbol") or "")).upper() in open_codes
             ]
-            symbol_pool = set(order["symbol"] for order in candidate_orders if order.get("symbol"))
-            symbol_pool.update(_portfolio_symbols_for_exchanges(resolved_connection, resolved_config, open_codes))
-            symbol_pool.update(_watchlist_symbols_for_exchanges(resolved_config, open_codes))
             max_symbols = int(_manager_cfg(resolved_config).get("max_symbols", 30) or 30)
-            technical_symbols = sorted(symbol_pool)[:max_symbols]
+            technical_symbols = _ordered_unique_symbols(
+                [str(order["symbol"]) for order in candidate_orders if order.get("symbol")],
+                _portfolio_symbols_for_exchanges(resolved_connection, resolved_config, open_codes),
+                _watchlist_symbols_for_exchanges(resolved_config, open_codes),
+            )[:max_symbols]
             indicator_config = copy.deepcopy(resolved_config)
             indicator_config.setdefault("strategy", {}).setdefault("swing", {}).setdefault("daily_indicators", {})["max_symbols"] = max_symbols
             technical_by_symbol = fetch_daily_swing_indicators(technical_symbols, indicator_config)

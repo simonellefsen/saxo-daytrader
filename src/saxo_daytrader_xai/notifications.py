@@ -611,6 +611,21 @@ def _severity_rank(severity: str) -> int:
     return {"low": 1, "medium": 2, "high": 3}.get(severity, 2)
 
 
+def _execution_source_label(record: dict[str, Any]) -> str:
+    if str(record.get("strategy_type") or "") == "portfolio_sync":
+        return "SIM portfolio sync"
+    if str(record.get("strategy_type") or "") in {"swing", "ladder"}:
+        return "Trading Manager"
+    return "Execution"
+
+
+def _execution_success_prefix(record: dict[str, Any]) -> str:
+    source = _execution_source_label(record)
+    if str(record.get("status") or "") == "executed":
+        return f"{source} executed"
+    return f"{source} submitted to broker"
+
+
 def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     alerts_by_scope: dict[str, dict[str, Any]] = {}
@@ -634,7 +649,8 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
                 continue
             quantity = record.get("quantity")
             quantity_text = f"{float(quantity):.0f}" if quantity is not None else "n/a"
-            subject_prefix = "Trade executed" if record["status"] == "executed" else "Trade submitted to broker"
+            subject_prefix = _execution_success_prefix(record)
+            source_label = _execution_source_label(record)
             alerts_by_scope[scope_key] = {
                 "alert_key": alert_key,
                 "summary_kind": "alert_execution_success",
@@ -649,6 +665,7 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
                         f"Execution order ID: {record['id']}",
                         f"Mode: {record.get('mode') or 'n/a'}",
                         f"Action: {record.get('action') or 'n/a'}",
+                        f"Source: {source_label}",
                         f"Quantity: {quantity_text}",
                         f"Status: {record['status']}",
                         f"Estimated value DKK: {float(record.get('estimated_value_dkk') or 0.0):.2f}",
@@ -681,6 +698,7 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
             quantity = record.get("quantity")
             quantity_text = f"{float(quantity):.0f}" if quantity is not None else "n/a"
             warning_reason = record.get("error_text") or record["status"]
+            source_label = _execution_source_label(record)
             alerts_by_scope[scope_key] = {
                 "alert_key": alert_key,
                 "summary_kind": "alert_execution_warning",
@@ -695,6 +713,7 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
                         f"Execution order ID: {record['id']}",
                         f"Mode: {record.get('mode') or 'n/a'}",
                         f"Action: {record.get('action') or 'n/a'}",
+                        f"Source: {source_label}",
                         f"Quantity: {quantity_text}",
                         f"Status: {record['status']}",
                         f"Warning: {warning_reason}",
@@ -726,20 +745,23 @@ def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: in
             error_text = record.get("error_text") or "Unknown execution error"
             quantity = record.get("quantity")
             quantity_text = f"{float(quantity):.0f}" if quantity is not None else "n/a"
+            source_label = _execution_source_label(record)
+            subject_prefix = f"{source_label} failed" if source_label != "Execution" else "Execution failed"
             alerts_by_scope[scope_key] = {
                 "alert_key": alert_key,
                 "summary_kind": "alert_execution_failed",
                 "severity": _alert_severity("alert_execution_failed"),
                 "scope_key": scope_key,
                 "execution_order_id": record["id"],
-                "subject": f"Execution failed for {record['symbol']}",
+                "subject": f"{subject_prefix} for {record['symbol']}",
                 "message_text": "\n".join(
                     [
-                        f"Execution failed for {record['symbol']}",
+                        f"{subject_prefix} for {record['symbol']}",
                         "",
                         f"Execution order ID: {record['id']}",
                         f"Mode: {record.get('mode') or 'n/a'}",
                         f"Action: {record.get('action') or 'n/a'}",
+                        f"Source: {source_label}",
                         f"Quantity: {quantity_text}",
                         f"Broker Order ID: {record.get('broker_order_id') or 'n/a'}",
                         f"Error: {error_text}",

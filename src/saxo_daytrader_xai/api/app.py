@@ -60,10 +60,11 @@ from saxo_daytrader_xai.runtime_settings import (
     update_cash_buffer_settings,
 )
 from saxo_daytrader_xai.scheduler_service import assess_scheduler_worker_health, run_manual_scheduler_cycle
-from saxo_daytrader_xai.strategy_journal import fetch_strategy_journal_entries
-from saxo_daytrader_xai.trading_manager import trading_manager_status
+from saxo_daytrader_xai.strategy_journal import build_diary_prompt_preview, fetch_strategy_journal_entries
+from saxo_daytrader_xai.trading_manager import build_trading_manager_prompt_preview, trading_manager_status
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import (
+    build_decision_prompt_preview,
     estimate_next_decision_report,
     fetch_latest_decision_report,
     fetch_latest_symbol_decisions,
@@ -124,12 +125,10 @@ def _daily_order_capacity(connection, config: dict[str, Any]) -> dict[str, int]:
                 FROM execution_orders
                 WHERE substr(created_at, 1, 10) = ?
                   AND status = 'executed'
-                  AND ledger_id IS NOT NULL
                 UNION
                 SELECT execution_order_id
                 FROM execution_fills
                 WHERE substr(created_at, 1, 10) = ?
-                  AND ledger_id IS NOT NULL
             ) successful_orders
             """,
             (today, today),
@@ -1045,6 +1044,56 @@ def create_app(config_path: str | None = None) -> FastAPI:
             for key in ("nordic", "uk", "us", "eu", "global"):
                 attach_decisions(payload.get(key, []) or [])
             return payload
+
+    @app.get("/api/prompts")
+    def ai_prompts() -> dict[str, Any]:
+        with runtime() as (config, connection):
+            def safe_prompt(kind: str, title: str, builder) -> dict[str, Any]:
+                try:
+                    item = builder()
+                    item.setdefault("kind", kind)
+                    item.setdefault("title", title)
+                    item.setdefault("status", "ok")
+                    return item
+                except Exception as exc:  # noqa: BLE001
+                    return {
+                        "kind": kind,
+                        "title": title,
+                        "status": "error",
+                        "description": "Prompt preview could not be built from current runtime context.",
+                        "error": str(exc),
+                    }
+
+            latest_decision = fetch_latest_decision_report(connection)
+            latest_manager_run = fetch_latest_trading_manager_run(connection)
+            items = [
+                safe_prompt(
+                    "decision_report",
+                    "Decision Report",
+                    lambda: build_decision_prompt_preview(config, connection),
+                ),
+                safe_prompt(
+                    "trading_manager",
+                    "Trading Manager",
+                    lambda: build_trading_manager_prompt_preview(config, connection),
+                ),
+                safe_prompt(
+                    "eod_diary",
+                    "End-of-Day Diary",
+                    lambda: build_diary_prompt_preview(config),
+                ),
+            ]
+            return {
+                "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                "items": items,
+                "latest_decision_report": {
+                    "id": latest_decision.get("id") if latest_decision else None,
+                    "created_at": latest_decision.get("created_at") if latest_decision else None,
+                    "status": latest_decision.get("status") if latest_decision else None,
+                    "stored_prompt_text": latest_decision.get("prompt_text") if latest_decision else None,
+                },
+                "latest_trading_manager_run": latest_manager_run,
+            }
 
     @app.get("/api/decision/latest")
     def decision_latest() -> dict[str, Any]:

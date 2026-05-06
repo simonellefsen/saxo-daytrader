@@ -37,6 +37,15 @@ DIARY_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+DIARY_SYSTEM_PROMPT = "You are the trading diary reviewer. Return strict JSON only."
+
+DIARY_INSTRUCTION = (
+    "Write an end-of-day trading diary for the operator and for future decision reports. "
+    "Be specific about what worked, what failed, whether trades aligned with the Decision Reports, "
+    "how the portfolio performed versus UK/EU/Nordic/US benchmark indices, and what the next "
+    "Decision Report should remember. Do not invent trades that are not in the metrics payload."
+)
+
 
 def _journal_cfg(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("strategy", {}).get("swing", {}).get("journal", {})
@@ -286,19 +295,14 @@ def _request_xai_diary(config: dict[str, Any], *, cadence: str, metrics: dict[st
         "cadence": cadence,
         "performance_metrics": metrics,
         "deterministic_learnings": fallback_learnings,
-        "instruction": (
-            "Write an end-of-day trading diary for the operator and for future decision reports. "
-            "Be specific about what worked, what failed, whether trades aligned with the Decision Reports, "
-            "how the portfolio performed versus UK/EU/Nordic/US benchmark indices, and what the next "
-            "Decision Report should remember. Do not invent trades that are not in the metrics payload."
-        ),
+        "instruction": DIARY_INSTRUCTION,
     }
     request_json = {
         "model": config["xai"]["model"],
         "input": [
             {
                 "role": "system",
-                "content": "You are the trading diary reviewer. Return strict JSON only.",
+                "content": DIARY_SYSTEM_PROMPT,
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False, indent=2, default=str)},
         ],
@@ -329,6 +333,27 @@ def _request_xai_diary(config: dict[str, Any], *, cadence: str, metrics: dict[st
         "status": "xai_completed",
         "response_id": response_json.get("id"),
         "diary": json.loads(output_text),
+    }
+
+
+def build_diary_prompt_preview(config: dict[str, Any]) -> dict[str, Any]:
+    prompt = {
+        "cadence": "daily",
+        "performance_metrics": {
+            "preview": "Live end-of-day runs include realised trades, broker fills, decision reports, trading manager runs, goal tracking, and benchmark index moves.",
+        },
+        "deterministic_learnings": [],
+        "instruction": DIARY_INSTRUCTION,
+    }
+    return {
+        "kind": "eod_diary",
+        "title": "End-of-Day Diary",
+        "description": "Prompt used after US close to turn trading performance and benchmark context into lessons for future Decision Reports.",
+        "system_prompt": DIARY_SYSTEM_PROMPT,
+        "instruction": DIARY_INSTRUCTION,
+        "user_prompt": json.dumps(prompt, ensure_ascii=False, indent=2, default=str),
+        "schema": DIARY_SCHEMA,
+        "model": config.get("xai", {}).get("model"),
     }
 
 
