@@ -366,11 +366,21 @@ def _filter_candidate_orders(
         technical_ok, technical_reason = _technical_gate(order, technical_by_symbol.get(symbol))
         ai_item = ai_by_key.get(key)
         ai_approved = True if ai_result is None else bool(ai_item and ai_item.get("approve"))
-        if technical_ok and ai_approved:
+        action = str(order.get("action") or "").upper()
+        allow_ai_risk_reduction_without_technicals = (
+            ai_result is not None
+            and ai_approved
+            and action == "SELL"
+            and technical_reason == "No usable daily technical indicator result."
+        )
+        if (technical_ok or allow_ai_risk_reduction_without_technicals) and ai_approved:
+            approval_reason = technical_reason
+            if allow_ai_risk_reduction_without_technicals:
+                approval_reason = f"{technical_reason} AI-approved risk reduction allowed despite missing indicators."
             enriched = dict(order)
             metadata = dict(enriched.get("strategy_metadata") or {})
             metadata["trading_manager"] = {
-                "technical_gate": technical_reason,
+                "technical_gate": approval_reason,
                 "ai_rationale": ai_item.get("rationale") if ai_item else None,
                 "ai_confidence": ai_item.get("confidence") if ai_item else None,
             }

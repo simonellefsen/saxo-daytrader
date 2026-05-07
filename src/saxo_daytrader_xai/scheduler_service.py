@@ -313,7 +313,7 @@ def run_manual_scheduler_cycle(
         config_path=config_path,
         connection=connection,
         force_mock=mock,
-        force_decision=True,
+        force_decision=False,
     )
 
 

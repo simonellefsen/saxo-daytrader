@@ -1021,7 +1021,7 @@ def _create_or_fetch_orders(
     elif strategy_enabled(config):
         desired_strategy_orders.extend(list(strategy_plan.get("swing_orders") or []))
         desired_strategy_orders.extend(list(strategy_plan.get("ladder_orders") or []))
-    active_strategy_by_key: dict[str, dict[str, Any]] = {}
+    strategy_by_key: dict[str, dict[str, Any]] = {}
     if desired_strategy_orders:
         desired_keys = [str(item.get("strategy_key") or "") for item in desired_strategy_orders if item.get("strategy_key")]
         if desired_keys:
@@ -1031,12 +1031,11 @@ def _create_or_fetch_orders(
                 SELECT *
                 FROM execution_orders
                 WHERE strategy_key IN ({placeholders})
-                  AND status NOT IN ({",".join("?" for _ in TERMINAL_ORDER_STATUSES)})
                 ORDER BY id ASC
                 """,
-                (*desired_keys, *tuple(TERMINAL_ORDER_STATUSES)),
+                tuple(desired_keys),
             ).fetchall()
-            active_strategy_by_key = {
+            strategy_by_key = {
                 str(row["strategy_key"]): dict(row)
                 for row in rows
                 if row["strategy_key"]
@@ -1047,14 +1046,14 @@ def _create_or_fetch_orders(
             break
         strategy_key = str(desired.get("strategy_key") or "")
         symbol = str(desired["symbol"])
-        active_existing = active_strategy_by_key.get(strategy_key) if strategy_key else None
+        existing_strategy_order = strategy_by_key.get(strategy_key) if strategy_key else None
         requested_weight_pct = float(desired.get("requested_weight_pct") or 0.0)
         quantity = float(desired.get("quantity") or 0.0)
         limit_price = _coerce_float(desired.get("limit_price_local"))
         stop_price = _coerce_float(desired.get("stop_price_local"))
         price_local = limit_price or stop_price or _coerce_float(desired.get("price_local"))
-        if active_existing:
-            if active_existing["status"] in {
+        if existing_strategy_order:
+            if existing_strategy_order["status"] in {
                 "pending_execution",
                 "pending_approval",
                 "waiting_for_market_open",
@@ -1076,13 +1075,13 @@ def _create_or_fetch_orders(
                         stop_price,
                         requested_weight_pct,
                         json.dumps(desired, ensure_ascii=False, sort_keys=True),
-                        active_existing["id"],
+                        existing_strategy_order["id"],
                     ),
                 )
                 connection.commit()
-                result_orders.append(dict(connection.execute("SELECT * FROM execution_orders WHERE id = ?", (active_existing["id"],)).fetchone()))
+                result_orders.append(dict(connection.execute("SELECT * FROM execution_orders WHERE id = ?", (existing_strategy_order["id"],)).fetchone()))
             else:
-                result_orders.append(active_existing)
+                result_orders.append(existing_strategy_order)
             continue
         market_row = _market_status_for_symbol(symbol, config)
         if market_row is not None and not bool(market_row.get("is_tradable", market_row.get("is_open"))):
@@ -1345,7 +1344,7 @@ def _create_or_fetch_orders(
         created_orders.extend(
             [
                 row
-                for key, row in active_strategy_by_key.items()
+                for key, row in strategy_by_key.items()
                 if key in {str(item.get("strategy_key") or "") for item in desired_strategy_orders}
                 and row["id"] not in {created_row["id"] for created_row in created_orders}
             ]
