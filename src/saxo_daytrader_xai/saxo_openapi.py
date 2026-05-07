@@ -110,6 +110,12 @@ class SaxoOrderNotFoundError(SaxoSessionError):
     pass
 
 
+class SaxoRateLimitError(SaxoSessionError):
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
 def _response_json_or_none(response: requests.Response) -> dict[str, Any] | list[Any] | None:
     try:
         return response.json()
@@ -152,6 +158,13 @@ def _raise_for_saxo_response(response: requests.Response, *, action: str) -> dic
     status_code = int(getattr(response, "status_code", 200))
     response_text = str(getattr(response, "text", "") or "")
     if status_code >= 400:
+        if status_code == 429:
+            reset_seconds = _rate_limit_reset_seconds(response)
+            detail = error_text or response_text.strip()[:300] or "rate limit exceeded"
+            raise SaxoRateLimitError(
+                f"{action} rate limited: HTTP 429: {detail}",
+                retry_after_seconds=reset_seconds,
+            )
         if status_code == 404 and error_text and "OrderNotFound" in error_text:
             raise SaxoOrderNotFoundError(error_text)
         if error_text:
@@ -868,8 +881,8 @@ def lookup_instrument(symbol: str, config: dict[str, Any], session: dict[str, An
         headers=_auth_headers(session["access_token"]),
         timeout=30,
     )
-    response.raise_for_status()
-    candidates = response.json().get("Data", [])
+    payload = _raise_for_saxo_response(response, action="Instrument lookup")
+    candidates = payload.get("Data", [])
     selected = None
     if candidates:
         requested_symbol = _symbol_with_suffix(symbol)

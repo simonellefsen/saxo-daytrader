@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from saxo_daytrader_xai.execution_engine import queue_and_maybe_execute_latest_r
 from saxo_daytrader_xai.market_schedule import get_market_status
 from saxo_daytrader_xai.market_symbols import parse_exchange_code
 from saxo_daytrader_xai.portfolio import fetch_goal_tracking, fetch_latest_batch_id, fetch_portfolio_positions
+from saxo_daytrader_xai.saxo_openapi import SaxoRateLimitError
 from saxo_daytrader_xai.swing_indicators import fetch_daily_swing_indicators
 from saxo_daytrader_xai.watchlists import build_watchlists
 from saxo_daytrader_xai.xai_decision import fetch_latest_decision_report
@@ -76,8 +77,64 @@ def _manager_cfg(config: dict[str, Any]) -> dict[str, Any]:
     return config.get("strategy", {}).get("swing", {}).get("trading_manager", {})
 
 
+def _backoff_cfg(config: dict[str, Any]) -> dict[str, int]:
+    cfg = _manager_cfg(config)
+    return {
+        "initial_seconds": int(cfg.get("rate_limit_initial_backoff_seconds", 60) or 60),
+        "max_seconds": int(cfg.get("rate_limit_max_backoff_seconds", 900) or 900),
+    }
+
+
 def _enabled(config: dict[str, Any]) -> bool:
     return bool(_manager_cfg(config).get("enabled", True))
+
+
+def _latest_deferred_attempt_count(connection, manager_key: str) -> int:
+    row = connection.execute(
+        """
+        SELECT manager_json
+        FROM trading_manager_runs
+        WHERE manager_key = ?
+          AND status = 'deferred_rate_limited'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (manager_key,),
+    ).fetchone()
+    if not row:
+        return 0
+    try:
+        payload = json.loads(row["manager_json"]) if row["manager_json"] else {}
+    except ValueError:
+        return 0
+    return int((payload.get("backoff") or {}).get("attempt_count") or 0)
+
+
+def _rate_limit_backoff_payload(
+    *,
+    connection,
+    config: dict[str, Any],
+    pulse: dict[str, Any],
+    now: datetime,
+    retry_after_seconds: float | None,
+) -> dict[str, Any]:
+    manager_key = str(pulse.get("key") or "")
+    attempt_count = _latest_deferred_attempt_count(connection, manager_key) + 1
+    cfg = _backoff_cfg(config)
+    exponential_delay = min(
+        float(cfg["max_seconds"]),
+        float(cfg["initial_seconds"]) * (2 ** max(attempt_count - 1, 0)),
+    )
+    delay_seconds = max(exponential_delay, float(retry_after_seconds or 0.0))
+    next_attempt_at = now + timedelta(seconds=delay_seconds)
+    return {
+        "attempt_count": attempt_count,
+        "delay_seconds": round(delay_seconds, 3),
+        "initial_seconds": cfg["initial_seconds"],
+        "max_seconds": cfg["max_seconds"],
+        "retry_after_seconds": retry_after_seconds,
+        "next_attempt_at": next_attempt_at.astimezone(UTC).isoformat(timespec="seconds"),
+    }
 
 
 def trading_manager_status(
@@ -514,7 +571,69 @@ def run_trading_manager_cycle(
             )[:max_symbols]
             indicator_config = copy.deepcopy(resolved_config)
             indicator_config.setdefault("strategy", {}).setdefault("swing", {}).setdefault("daily_indicators", {})["max_symbols"] = max_symbols
-            technical_by_symbol = fetch_daily_swing_indicators(technical_symbols, indicator_config)
+            try:
+                technical_by_symbol = fetch_daily_swing_indicators(technical_symbols, indicator_config)
+            except SaxoRateLimitError as exc:
+                backoff = _rate_limit_backoff_payload(
+                    connection=resolved_connection,
+                    config=resolved_config,
+                    pulse=pulse,
+                    now=now,
+                    retry_after_seconds=exc.retry_after_seconds,
+                )
+                manager_payload = {
+                    "summary": "Trading Manager deferred because Saxo rate-limited daily indicator data.",
+                    "approved_order_count": 0,
+                    "skipped_order_count": len(candidate_orders),
+                    "approved_orders": [],
+                    "skipped_orders": [
+                        {
+                            "strategy_key": order.get("strategy_key"),
+                            "symbol": order.get("symbol"),
+                            "action": order.get("action"),
+                            "technical_gate": "Deferred until Saxo rate-limit backoff expires.",
+                            "ai_approved": None,
+                            "ai_rationale": None,
+                        }
+                        for order in candidate_orders
+                    ],
+                    "execution_notes": [
+                        "No orders were created. The same Trading Manager pulse will be retried after the backoff window."
+                    ],
+                    "backoff": backoff,
+                }
+                run_id = record_trading_manager_run(
+                    resolved_connection,
+                    manager_pulse=pulse,
+                    report_id=int(report["id"]),
+                    status="deferred_rate_limited",
+                    open_exchange_codes=sorted(open_codes),
+                    technical={},
+                    manager=manager_payload,
+                    queue_result={"status": "deferred_rate_limited", "orders": []},
+                    error_text=str(exc),
+                )
+                append_audit_log(
+                    resolved_connection,
+                    "trading_manager_deferred_rate_limited",
+                    {
+                        "manager_key": pulse["key"],
+                        "report_id": report["id"],
+                        "error": str(exc),
+                        "backoff": backoff,
+                    },
+                )
+                results.append(
+                    {
+                        "status": "deferred_rate_limited",
+                        "id": run_id,
+                        "pulse": pulse,
+                        "open_exchange_codes": sorted(open_codes),
+                        "backoff": backoff,
+                        "queue": {"status": "deferred_rate_limited", "orders": []},
+                    }
+                )
+                continue
 
             ai_payload = None
             ai_error = None

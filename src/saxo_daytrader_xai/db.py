@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1030,17 +1031,51 @@ def record_analysis_pulse(
     return int(cursor.lastrowid) if cursor.lastrowid else None
 
 
+def _parse_utc_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
 def has_trading_manager_run(connection: sqlite3.Connection, manager_key: str) -> bool:
     row = connection.execute(
         """
         SELECT id
         FROM trading_manager_runs
         WHERE manager_key = ?
+          AND status NOT LIKE 'deferred_%'
         LIMIT 1
         """,
         (manager_key,),
     ).fetchone()
-    return row is not None
+    if row is not None:
+        return True
+
+    row = connection.execute(
+        """
+        SELECT status, manager_json
+        FROM trading_manager_runs
+        WHERE manager_key = ?
+          AND status LIKE 'deferred_%'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (manager_key,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        manager_json = json.loads(row["manager_json"]) if row["manager_json"] else {}
+    except ValueError:
+        manager_json = {}
+    next_attempt_at = _parse_utc_datetime((manager_json.get("backoff") or {}).get("next_attempt_at"))
+    return bool(next_attempt_at and next_attempt_at > datetime.now(UTC))
 
 
 def record_trading_manager_run(

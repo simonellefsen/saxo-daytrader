@@ -4,7 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-from saxo_daytrader_xai.saxo_openapi import SaxoSessionError, ensure_access_token, get_chart_samples, lookup_instrument
+from saxo_daytrader_xai.saxo_openapi import SaxoRateLimitError, SaxoSessionError, ensure_access_token, get_chart_samples, lookup_instrument
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -287,6 +287,8 @@ def fetch_daily_swing_indicators(symbols: list[str], config: dict[str, Any]) -> 
                 "asset_type": instrument.asset_type,
                 "currency": instrument.currency_code,
             }
+        except SaxoRateLimitError:
+            raise
         except Exception as exc:  # noqa: BLE001
             output[symbol] = {
                 "status": "error",
