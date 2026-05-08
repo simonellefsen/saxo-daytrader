@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -740,6 +740,94 @@ def request_decision_report(prompt: dict[str, str], config: dict[str, Any]) -> t
     return request_json, {"raw": response_json, "parsed": json.loads(report_text)}
 
 
+def _parse_utc_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _is_retryable_xai_error(exc: Exception) -> bool:
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        status_code = getattr(exc.response, "status_code", None)
+        return status_code == 429 or (isinstance(status_code, int) and 500 <= status_code < 600)
+    return False
+
+
+def _xai_retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    raw_value = response.headers.get("Retry-After") if getattr(response, "headers", None) else None
+    if raw_value in (None, ""):
+        return None
+    try:
+        return max(float(raw_value), 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _xai_backoff_cfg(config: dict[str, Any]) -> dict[str, int]:
+    cfg = config.get("xai", {})
+    return {
+        "initial_seconds": int(cfg.get("retry_initial_backoff_seconds", 60) or 60),
+        "max_seconds": int(cfg.get("retry_max_backoff_seconds", 600) or 600),
+    }
+
+
+def _latest_deferred_xai_attempt_count(connection, pulse_key: str | None) -> int:
+    if not pulse_key:
+        return 0
+    row = connection.execute(
+        """
+        SELECT report_json
+        FROM decision_reports
+        WHERE analysis_pulse_key = ?
+          AND status = 'xai_deferred'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (pulse_key,),
+    ).fetchone()
+    if not row:
+        return 0
+    payload = _loads_json_field(row["report_json"], {})
+    return int((payload.get("xai_retry") or {}).get("attempt_count") or 0)
+
+
+def _xai_backoff_payload(
+    *,
+    connection,
+    config: dict[str, Any],
+    pulse_key: str | None,
+    now: datetime,
+    retry_after_seconds: float | None,
+) -> dict[str, Any]:
+    attempt_count = _latest_deferred_xai_attempt_count(connection, pulse_key) + 1
+    cfg = _xai_backoff_cfg(config)
+    exponential_delay = min(
+        float(cfg["max_seconds"]),
+        float(cfg["initial_seconds"]) * (2 ** max(attempt_count - 1, 0)),
+    )
+    delay_seconds = max(exponential_delay, float(retry_after_seconds or 0.0))
+    next_attempt_at = now.astimezone(UTC) + timedelta(seconds=delay_seconds)
+    return {
+        "attempt_count": attempt_count,
+        "delay_seconds": round(delay_seconds, 3),
+        "initial_seconds": cfg["initial_seconds"],
+        "max_seconds": cfg["max_seconds"],
+        "retry_after_seconds": retry_after_seconds,
+        "next_attempt_at": next_attempt_at.isoformat(timespec="seconds"),
+    }
+
+
 def _latest_report_row(connection) -> dict[str, Any] | None:
     row = connection.execute(
         """
@@ -755,14 +843,22 @@ def _latest_report_row(connection) -> dict[str, Any] | None:
 def _has_report_for_pulse(connection, pulse_key: str) -> bool:
     row = connection.execute(
         """
-        SELECT id
+        SELECT status, report_json
         FROM decision_reports
         WHERE analysis_pulse_key = ?
+        ORDER BY created_at DESC, id DESC
         LIMIT 1
         """,
         (pulse_key,),
     ).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    status = str(row["status"] or "")
+    if status == "xai_deferred":
+        report_json = _loads_json_field(row["report_json"], {})
+        next_attempt_at = _parse_utc_datetime((report_json.get("xai_retry") or {}).get("next_attempt_at"))
+        return bool(next_attempt_at and next_attempt_at > datetime.now(UTC))
+    return True
 
 
 def fetch_latest_decision_report(connection) -> dict[str, Any] | None:
@@ -950,6 +1046,7 @@ def generate_decision_report(
         error_text = None
         status = "completed"
         response_id = None
+        active_pulse = context.get("analysis_pulse") or {}
 
         try:
             if force_mock or not resolved_config["xai"]["api_key"]:
@@ -962,32 +1059,63 @@ def generate_decision_report(
                 report_json = response_bundle["parsed"]
                 response_id = response_json.get("id")
         except Exception as exc:  # noqa: BLE001
-            status = "xai_fallback"
             error_text = str(exc)
             report_json = _mock_decision_report(context, resolved_config)
+            if _is_retryable_xai_error(exc):
+                status = "xai_deferred"
+                backoff = _xai_backoff_payload(
+                    connection=resolved_connection,
+                    config=resolved_config,
+                    pulse_key=active_pulse.get("key"),
+                    now=datetime.now(UTC),
+                    retry_after_seconds=_xai_retry_after_seconds(exc),
+                )
+                request_json = {
+                    "mode": "xai_deferred",
+                    "retryable_error": type(exc).__name__,
+                    "backoff": backoff,
+                }
+                response_json = {"mode": "xai_deferred", "error": error_text, "backoff": backoff}
+                report_json["xai_retry"] = backoff
+                report_json["execution_notes"] = [
+                    f"xAI request did not complete; retry scheduled at {backoff['next_attempt_at']}.",
+                    "No deterministic strategy output will be executed for this deferred report.",
+                ]
+            else:
+                status = "xai_fallback"
 
-        try:
-            strategy_plan = build_strategy_plan(
-                report_json=report_json,
-                context=context,
-                config=resolved_config,
-            )
-            report_json["strategy_plan"] = strategy_plan
-            if strategy_plan.get("mode") == "swing":
-                report_json["suggested_trades"] = list(strategy_plan.get("suggested_trades") or [])
-        except Exception as exc:  # noqa: BLE001
+        if status == "xai_deferred":
             report_json["strategy_plan"] = {
-                "status": "failed",
+                "status": "xai_deferred",
                 "selected_assets": [],
                 "ladder_orders": [],
-                "notes": [f"Strategy plan generation failed: {exc}"],
+                "swing_orders": [],
+                "suggested_trades": [],
+                "notes": ["Strategy planning deferred until xAI returns a completed Decision Report."],
             }
+            report_json["suggested_trades"] = []
+        else:
+            try:
+                strategy_plan = build_strategy_plan(
+                    report_json=report_json,
+                    context=context,
+                    config=resolved_config,
+                )
+                report_json["strategy_plan"] = strategy_plan
+                if strategy_plan.get("mode") == "swing":
+                    report_json["suggested_trades"] = list(strategy_plan.get("suggested_trades") or [])
+            except Exception as exc:  # noqa: BLE001
+                report_json["strategy_plan"] = {
+                    "status": "failed",
+                    "selected_assets": [],
+                    "ladder_orders": [],
+                    "notes": [f"Strategy plan generation failed: {exc}"],
+                }
         report_json["created_at"] = created_at
         report_json["analysis_summary"] = context["analysis_summary"]
         report_json["analysis_pulse"] = context.get("analysis_pulse")
         report_json["analysis_pulses"] = context.get("analysis_pulses")
         report_json["cash_management"] = context["cash_management"]
-        active_pulse = context.get("analysis_pulse") or {}
 
         cursor = resolved_connection.execute(
             """

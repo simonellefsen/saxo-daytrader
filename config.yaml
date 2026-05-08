@@ -224,7 +224,9 @@ xai:
     Target DKK 5,000 per Monday-Friday trading week and DKK 20,000 per
     calendar month before tax. Maximise portfolio value while keeping risk
     reasonable for a disciplined swing/day-trading horizon.
-  timeout_seconds: 120
+  timeout_seconds: 240
+  retry_initial_backoff_seconds: 60
+  retry_max_backoff_seconds: 600
   auto_run_interval_minutes: 240
   include_encrypted_reasoning: false
 
