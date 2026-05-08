@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import smtplib
 from datetime import UTC, date, datetime, time, timedelta
@@ -510,6 +511,7 @@ def _alert_severity(summary_kind: str) -> str:
         "alert_broker_grouped": "medium",
         "alert_execution_failed": "high",
         "alert_broker_management_failed": "high",
+        "alert_saxo_session_failed": "high",
     }.get(summary_kind, "medium")
 
 
@@ -603,6 +605,7 @@ def _alerts_enabled(config: dict[str, Any]) -> bool:
             "broker_cancel_enabled",
             "execution_failure_enabled",
             "broker_management_failure_enabled",
+            "saxo_session_failure_enabled",
         )
     )
 
@@ -629,6 +632,56 @@ def _execution_success_prefix(record: dict[str, Any]) -> str:
 def _build_broker_alert_candidates(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:
     alerts_cfg = config.get("notifications", {}).get("alerts", {})
     alerts_by_scope: dict[str, dict[str, Any]] = {}
+
+    if alerts_cfg.get("saxo_session_failure_enabled", False):
+        session_failure_rows = connection.execute(
+            """
+            SELECT *
+            FROM audit_log
+            WHERE event_type = 'saxo_session_keepalive_failed'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        for row in session_failure_rows:
+            record = dict(row)
+            try:
+                payload = json.loads(record.get("event_json") or "{}")
+            except ValueError:
+                payload = {}
+            error_text = str(payload.get("error") or "Unknown Saxo session error")
+            environment = str(payload.get("environment") or "unknown")
+            event_date = str(record.get("created_at") or "")[:10] or datetime.now(UTC).date().isoformat()
+            fingerprint = hashlib.sha1(f"{environment}:{error_text}".encode("utf-8")).hexdigest()[:12]
+            alert_key = f"saxo_session_failed:{event_date}:{fingerprint}"
+            scope_key = f"alert_saxo_session_failed:{environment}:{fingerprint}"
+            if scope_key in alerts_by_scope:
+                continue
+            alerts_by_scope[scope_key] = {
+                "alert_key": alert_key,
+                "summary_kind": "alert_saxo_session_failed",
+                "severity": _alert_severity("alert_saxo_session_failed"),
+                "scope_key": scope_key,
+                "execution_order_id": None,
+                "subject": f"Saxo session connection failed ({environment})",
+                "message_text": "\n".join(
+                    [
+                        f"Saxo session connection failed ({environment})",
+                        "",
+                        f"Audit event ID: {record['id']}",
+                        f"Detected at: {record.get('created_at') or 'n/a'}",
+                        f"Error: {error_text}",
+                        "",
+                        "Trading actions that require Saxo access will not be able to refresh session state until this is fixed.",
+                    ]
+                ),
+                "payload": {
+                    "alert_type": "saxo_session_failed",
+                    "record": record,
+                    "session_error": payload,
+                },
+            }
 
     if alerts_cfg.get("execution_success_enabled", False):
         success_rows = connection.execute(
@@ -881,7 +934,11 @@ def _group_broker_alert_candidates(config: dict[str, Any], alerts: list[dict[str
         return alerts
 
     grouped_by_order: dict[int, list[dict[str, Any]]] = {}
+    non_order_alerts: list[dict[str, Any]] = []
     for alert in alerts:
+        if alert.get("execution_order_id") is None:
+            non_order_alerts.append(alert)
+            continue
         grouped_by_order.setdefault(int(alert["execution_order_id"]), []).append(alert)
 
     max_items = int(grouping_cfg.get("max_items_per_group", 5))
@@ -933,7 +990,7 @@ def _group_broker_alert_candidates(config: dict[str, Any], alerts: list[dict[str
             }
         )
     output.sort(key=lambda item: item["alert_key"])
-    return output
+    return sorted([*non_order_alerts, *output], key=lambda item: item["alert_key"])
 
 
 def _pending_broker_alerts(connection, config: dict[str, Any], limit: int = 25) -> list[dict[str, Any]]:

@@ -166,6 +166,16 @@ def run_scheduler_cycle(
                 }
             except SaxoSessionError as exc:
                 session_keepalive = {"status": "error", "error": str(exc)}
+                append_audit_log(
+                    resolved_connection,
+                    "saxo_session_keepalive_failed",
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "environment": resolved_config.get("saxo", {}).get("environment"),
+                        "occurred_at": datetime.now(UTC).isoformat(timespec="seconds"),
+                    },
+                )
         market_status = get_market_status(resolved_config)
         analysis_summary = summarize_analysis_window(market_status)
         should_generate = force_decision or should_auto_run_decision_report(
