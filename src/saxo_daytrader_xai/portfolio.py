@@ -1041,6 +1041,57 @@ def _history_with_local_timestamps(connection: sqlite3.Connection, config: dict[
     return output
 
 
+def _prefer_broker_state_for_goal_tracking(config: dict[str, Any]) -> bool:
+    execution_cfg = config.get("execution", {})
+    saxo_environment = str(config.get("saxo", {}).get("environment") or "").lower()
+    return (
+        str(execution_cfg.get("mode") or "").lower() == "live"
+        and str(execution_cfg.get("adapter") or "").lower() == "saxo"
+        and saxo_environment == "live"
+    )
+
+
+def _reconcile_latest_history_row_with_current_summary(
+    connection: sqlite3.Connection,
+    config: dict[str, Any],
+    history_rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not history_rows:
+        return None
+    prefer_broker_state = _prefer_broker_state_for_goal_tracking(config)
+    current_summary = fetch_portfolio_summary(
+        connection,
+        initial_cash_dkk=float(config.get("portfolio", {}).get("initial_cash_dkk", 0.0) or 0.0),
+        prefer_broker_cash=prefer_broker_state,
+        use_broker_positions=prefer_broker_state,
+    )
+    current_value = float(current_summary.get("total_market_value_dkk") or 0.0)
+    latest_row = history_rows[-1]
+    latest_value = float(latest_row.get("total_market_value_dkk") or 0.0)
+    if current_value <= 0 or abs(current_value - latest_value) < 1.0:
+        return None
+    history_rows[-1] = {
+        **latest_row,
+        "total_market_value_dkk": current_value,
+        "invested_market_value_dkk": float(current_summary.get("invested_market_value_dkk") or 0.0),
+        "cash_balance_dkk": float(current_summary.get("cash_balance_dkk") or 0.0),
+        "total_cost_basis_dkk": float(current_summary.get("total_cost_basis_dkk") or 0.0),
+        "total_unrealised_pnl_dkk": float(current_summary.get("total_unrealised_pnl_dkk") or 0.0),
+        "total_daily_pnl_dkk": float(current_summary.get("total_daily_pnl_dkk") or 0.0),
+        "position_count": int(current_summary.get("position_count") or 0),
+        "source": "current_summary_reconciled",
+    }
+    return {
+        "applied": True,
+        "recorded_at": latest_row["recorded_at_local"].isoformat(timespec="seconds"),
+        "stored_value_dkk": latest_value,
+        "current_value_dkk": current_value,
+        "difference_dkk": current_value - latest_value,
+        "stored_position_count": int(latest_row.get("position_count") or 0),
+        "current_position_count": int(current_summary.get("position_count") or 0),
+    }
+
+
 def _period_stats(history_rows: list[dict[str, Any]], *, start_local: datetime | None, end_local: datetime) -> dict[str, Any]:
     eligible = [row for row in history_rows if row["recorded_at_local"] <= end_local]
     if not eligible:
@@ -1048,6 +1099,7 @@ def _period_stats(history_rows: list[dict[str, Any]], *, start_local: datetime |
             "available": False,
             "start_at": None,
             "end_at": end_local.isoformat(timespec="seconds"),
+            "current_valuation_at": None,
             "current_value_dkk": 0.0,
             "anchor_value_dkk": 0.0,
             "pnl_dkk": 0.0,
@@ -1065,6 +1117,7 @@ def _period_stats(history_rows: list[dict[str, Any]], *, start_local: datetime |
                 "available": False,
                 "start_at": start_local.isoformat(timespec="seconds"),
                 "end_at": end_local.isoformat(timespec="seconds"),
+                "current_valuation_at": current_row["recorded_at_local"].isoformat(timespec="seconds"),
                 "current_value_dkk": float(current_row["total_market_value_dkk"]),
                 "anchor_value_dkk": 0.0,
                 "pnl_dkk": 0.0,
@@ -1076,6 +1129,7 @@ def _period_stats(history_rows: list[dict[str, Any]], *, start_local: datetime |
         "available": True,
         "start_at": anchor_row["recorded_at_local"].isoformat(timespec="seconds"),
         "end_at": current_row["recorded_at_local"].isoformat(timespec="seconds"),
+        "current_valuation_at": current_row["recorded_at_local"].isoformat(timespec="seconds"),
         "current_value_dkk": float(current_row["total_market_value_dkk"]),
         "anchor_value_dkk": float(anchor_row["total_market_value_dkk"]),
         "pnl_dkk": pnl_dkk,
@@ -1120,6 +1174,7 @@ def fetch_goal_tracking(
     reference_time: datetime | None = None,
 ) -> dict[str, Any]:
     history_rows = _history_with_local_timestamps(connection, config)
+    current_summary_reconciliation = _reconcile_latest_history_row_with_current_summary(connection, config, history_rows)
     timezone = _price_monitor_timezone(config)
     now_local = (reference_time or datetime.now(UTC)).astimezone(timezone)
     goal_text = str(config.get("xai", {}).get("goal", ""))
@@ -1191,6 +1246,7 @@ def fetch_goal_tracking(
         "current_month_expected_session_days": current_month_expected_days,
         "average_dkk_per_observed_day": average_per_observed_day,
         "projected_weekly_dkk_from_average": projected_weekly_from_average,
+        "current_summary_reconciliation": current_summary_reconciliation,
         "periods": periods,
     }
 

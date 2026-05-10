@@ -43,7 +43,9 @@ DIARY_INSTRUCTION = (
     "Write an end-of-day trading diary for the operator and for future decision reports. "
     "Be specific about what worked, what failed, whether trades aligned with the Decision Reports, "
     "how the portfolio performed versus UK/EU/Nordic/US benchmark indices, and what the next "
-    "Decision Report should remember. Do not invent trades that are not in the metrics payload."
+    "Decision Report should remember. Do not invent trades that are not in the metrics payload. "
+    "If portfolio_valuation_warnings says a period has no fresh valuation, state that limitation "
+    "directly and do not describe that stale value as a gain or loss for the journal date."
 )
 
 
@@ -209,6 +211,7 @@ def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, re
         (since_date,),
     ).fetchall()
     goal_tracking = fetch_goal_tracking(connection, config, reference_time=reference_time)
+    portfolio_valuation_warnings = _portfolio_valuation_warnings(goal_tracking, journal_date=since_date)
     benchmark_indices = fetch_benchmark_index_snapshot(
         config,
         timeout_seconds=int(config.get("market_data", {}).get("request_timeout_seconds", 10) or 10),
@@ -233,13 +236,36 @@ def _decision_metrics(connection, config: dict[str, Any], *, since_date: str, re
             for row in manager_rows
         ],
         "goal_tracking": goal_tracking,
+        "portfolio_valuation_warnings": portfolio_valuation_warnings,
         "benchmark_indices": benchmark_indices,
         "source_report_id": source_report_id,
     }
 
 
+def _portfolio_valuation_warnings(goal_tracking: dict[str, Any], *, journal_date: str) -> list[str]:
+    periods = (goal_tracking or {}).get("periods") or {}
+    day = periods.get("day") or {}
+    warnings: list[str] = []
+    if not bool(day.get("available")):
+        current_value = float(day.get("current_value_dkk") or 0.0)
+        valuation_at = day.get("current_valuation_at")
+        if current_value > 0 and valuation_at:
+            warnings.append(
+                f"No fresh portfolio valuation was recorded for {journal_date}; "
+                f"the latest available valuation is {current_value:.2f} DKK from {valuation_at}. "
+                "Do not describe this as portfolio performance for the journal date."
+            )
+        else:
+            warnings.append(
+                f"No portfolio valuation was recorded for {journal_date}; "
+                "do not describe portfolio performance for the journal date."
+            )
+    return warnings
+
+
 def _learning_points(metrics: dict[str, Any]) -> list[str]:
     learnings: list[str] = []
+    learnings.extend(str(item) for item in metrics.get("portfolio_valuation_warnings") or [])
     if metrics["report_count"] == 0:
         learnings.append("No decision reports were available for this journal period; keep the next analysis conservative.")
     if metrics["suggested_trade_count"] == 0:
@@ -363,20 +389,24 @@ def _fallback_diary(*, cadence: str, metrics: dict[str, Any], learnings: list[st
         f"{region} {float(payload.get('average_change_pct') or 0.0) * 100:.2f}%"
         for region, payload in benchmarks.items()
     ) or "No benchmark data was available."
+    valuation_warnings = [str(item) for item in metrics.get("portfolio_valuation_warnings") or [] if str(item).strip()]
+    executive_bits = [
+        f"{cadence.title()} diary: {metrics.get('report_count', 0)} report(s)",
+        f"{metrics.get('suggested_trade_count', 0)} suggested trade(s)",
+        f"{metrics.get('trade_count', 0)} closed trade(s)",
+        f"{float(metrics.get('realised_gain_dkk') or 0.0):.0f} DKK realised gain",
+    ]
+    if valuation_warnings:
+        executive_bits.append(valuation_warnings[0])
     return {
         "status": "deterministic_fallback" if error else "deterministic",
         "error": error,
         "diary": {
-            "executive_summary": (
-                f"{cadence.title()} diary: {metrics.get('report_count', 0)} report(s), "
-                f"{metrics.get('suggested_trade_count', 0)} suggested trade(s), "
-                f"{metrics.get('trade_count', 0)} closed trade(s), "
-                f"{float(metrics.get('realised_gain_dkk') or 0.0):.0f} DKK realised gain."
-            ),
+            "executive_summary": ". ".join(executive_bits) + ".",
             "what_went_well": [item for item in learnings if "non-negative" in item or "preserve" in item] or learnings[:1],
             "what_went_wrong": [item for item in learnings if "negative" in item or "No " in item] or [],
             "missed_opportunities": [],
-            "risk_notes": [item for item in learnings if "goal progress" in item],
+            "risk_notes": [*valuation_warnings, *[item for item in learnings if "goal progress" in item]],
             "benchmark_readthrough": benchmark_summary,
             "next_session_adjustments": learnings,
             "decision_report_instructions": learnings,
